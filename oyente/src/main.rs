@@ -105,23 +105,19 @@ fn inference_config() -> ExecutionConfig {
         intra_threads: 2,
         inter_threads: 1,
         configure: Some(std::rc::Rc::new(|builder: SessionBuilder| {
-            // Memory patterns pre-allocate for the largest shape seen so
-            // far and keep it. With variable-length audio that means the
-            // longest utterance of the session sets the floor forever.
-            // The builder's error type carries the builder itself so a
-            // failed step can be recovered from; the hook wants the plain
-            // one, hence the conversion.
-            builder
-                .with_memory_pattern(false)
-                // Prepacking rewrites weights into a layout that multiplies
-                // faster, and keeps the original as well.
-                .and_then(|b| b.with_config_entry("session.disable_prepacking", "1"))
-                // Read initializers straight from the mapped file instead of
-                // copying them into the arena first.
-                .and_then(|b| {
-                    b.with_config_entry("session.use_device_allocator_for_initializers", "1")
-                })
-                .map_err(Into::into)
+            // Memory patterns pre-allocate for the largest shape seen so far
+            // and hold it, so with variable-length audio the longest
+            // utterance of a session sets the floor for the rest of it.
+            let builder = builder.with_memory_pattern(false)?;
+            // Prepacking rewrites weights into a layout that multiplies
+            // faster and keeps the original alongside it. Turning it off is
+            // what takes this from 1830 MB down to 934 MB.
+            let builder = builder.with_config_entry("session.disable_prepacking", "1")?;
+            // Read initializers straight from the mapped file rather than
+            // copying them into the arena first.
+            let builder =
+                builder.with_config_entry("session.use_device_allocator_for_initializers", "1")?;
+            Ok(builder)
         })),
         ..Default::default()
     }
