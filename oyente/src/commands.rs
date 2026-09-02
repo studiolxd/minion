@@ -185,11 +185,26 @@ const TERMINALS: &[&str] = &["com.apple.Terminal"];
 const FINDERS: &[&str] = &["com.apple.finder"];
 
 pub const CONTEXTUAL_COMMANDS: &[ContextualCommand] = &[
+    // --- The same phrase, read differently ---
+    //
+    // These share their wording with an entry in the global table. The
+    // contextual one wins where it applies, which is what lets a phrase
+    // mean the right thing in each place instead of needing a new name.
+    ContextualCommand { bundles: FINDERS, phrases: &["borra esto"],
+                        name: "a la papelera", action: Action::Key(key::DELETE, Mods::CMD) },
+    ContextualCommand { bundles: FINDERS, phrases: &["sube del todo", "sube"],
+                        name: "carpeta superior", action: Action::Key(key::UP, Mods::CMD) },
+    ContextualCommand { bundles: TERMINALS, phrases: &["cancela esto", "cancela"],
+                        name: "interrumpir", action: Action::Key(key::C, Mods::CTRL) },
+    ContextualCommand { bundles: TERMINALS, phrases: &["sube", "sube del todo"],
+                        name: "orden anterior", action: Action::Key(key::UP, Mods::NONE) },
+    ContextualCommand { bundles: TERMINALS, phrases: &["baja", "baja del todo"],
+                        name: "orden siguiente", action: Action::Key(key::DOWN, Mods::NONE) },
+
     // --- Terminal ---
     ContextualCommand { bundles: TERMINALS, phrases: &["limpia la pantalla", "limpia"],
                         name: "limpiar terminal", action: Action::Key(key::L, Mods::CTRL) },
-    ContextualCommand { bundles: TERMINALS, phrases: &["cancela esto", "cancela"],
-                        name: "cancelar", action: Action::Key(key::C, Mods::CTRL) },
+
     ContextualCommand { bundles: TERMINALS, phrases: &["principio de linea"],
                         name: "inicio de línea", action: Action::Key(key::A, Mods::CTRL) },
     ContextualCommand { bundles: TERMINALS, phrases: &["final de linea"],
@@ -228,6 +243,8 @@ pub const COMMANDS: &[Command] = &[
               action: Action::Key(key::A, Mods::CMD) },
     Command { phrases: &["borra esto"], name: "borrar",
               action: Action::Key(key::DELETE, Mods::NONE) },
+    Command { phrases: &["cancela esto", "cancela"], name: "cancelar",
+              action: Action::Key(key::ESCAPE, Mods::NONE) },
     Command { phrases: &["busca en la pagina", "busca aqui"], name: "buscar",
               action: Action::Key(key::F, Mods::CMD) },
 
@@ -330,8 +347,9 @@ pub enum Decision {
     Launch { name: &'static str, bundle_id: &'static str },
     /// Quit an application.
     Quit { name: &'static str, bundle_id: &'static str },
-    /// Open a web address in the default browser.
-    Browse(String),
+    /// Open a web address. `in_browser` names the browser to use when one
+    /// is already in front, so a link does not jump to a different app.
+    Browse { url: String, in_browser: Option<&'static str> },
     /// Run a command that only exists in the current application.
     RunHere(&'static str),
     /// Type text into whatever has focus.
@@ -376,25 +394,51 @@ fn dictation_text(transcript: &str) -> Option<String> {
     (text.chars().count() >= 4).then_some(text)
 }
 
+/// The browser in front, if the application in front is one.
+///
+/// Returns the entry from [`BROWSERS`] so the value is `'static` and can
+/// travel inside a `Decision`.
+fn browser_in_front(context: Option<&str>) -> Option<&'static str> {
+    let bundle = context?;
+    BROWSERS.iter().copied().find(|b| *b == bundle)
+}
+
 /// Finds a web address in the sentence.
 ///
 /// Two shapes: a spelled-out domain ("google com", "studiolxd punto es") or
 /// one of the sites in [`SITES`] named on its own.
-fn find_website(words: &[String]) -> Option<String> {
-    // A domain: some word followed by a top-level domain.
-    for (i, word) in words.iter().enumerate() {
-        if !TLDS.contains(&word.as_str()) || i == 0 {
+/// A web address found in the sentence, and how it was written.
+enum Website {
+    /// A spelled-out domain: unmistakable, so no verb is needed.
+    Domain(String),
+    /// One of the known sites, named on its own. Needs an opening verb, or
+    /// "youtube" in the middle of any sentence would navigate.
+    Named(String),
+}
+
+fn find_website(transcript: &str, words: &[String]) -> Option<Website> {
+    // A written domain, taken from the raw transcript so the dot survives.
+    // Normalising first would turn "hora.es" and "qué hora es" into the
+    // same three words, and the second is a question, not an address.
+    for token in transcript.split_whitespace() {
+        let cleaned = token
+            .trim_matches(|c: char| !c.is_alphanumeric())
+            .to_lowercase();
+        let Some((name, tld)) = cleaned.rsplit_once('.') else {
             continue;
-        }
-        let previous = words[i - 1].as_str();
-        let name = if previous == "punto" && i >= 2 {
-            words[i - 2].as_str()
-        } else {
-            previous
         };
-        // "punto" alone is not a domain, and neither is a lone verb.
-        if name != "punto" && !spanish::is_known_verb(name) {
-            return Some(format!("https://{name}.{word}"));
+        if TLDS.contains(&tld) && !name.is_empty() && !name.contains('.') {
+            return Some(Website::Domain(format!("https://{name}.{tld}")));
+        }
+    }
+
+    // A domain spoken aloud: "github punto com".
+    for (i, word) in words.iter().enumerate() {
+        if TLDS.contains(&word.as_str()) && i >= 2 && words[i - 1] == "punto" {
+            let name = words[i - 2].as_str();
+            if !spanish::is_known_verb(name) {
+                return Some(Website::Domain(format!("https://{name}.{word}")));
+            }
         }
     }
 
@@ -402,7 +446,7 @@ fn find_website(words: &[String]) -> Option<String> {
     words
         .iter()
         .find_map(|w| SITES.iter().find(|(name, _)| name == w))
-        .map(|(_, url)| (*url).to_string())
+        .map(|(_, url)| Website::Named((*url).to_string()))
 }
 
 /// Finds an application named in the sentence, with its match score.
@@ -441,7 +485,9 @@ pub fn decide_in(transcript: &str, context: Option<&str>) -> (Decision, f32) {
         return (Decision::Ignored, 0.0);
     };
     if rest.is_empty() {
-        return (Decision::Unrecognised, 0.0);
+        // Just the wake word. Not a failure to understand — nothing was
+        // asked — so it should not chirp or count as an error.
+        return (Decision::Ignored, 0.0);
     }
 
     // Dictation first: everything after the verb is content, not a command,
@@ -495,9 +541,19 @@ pub fn decide_in(transcript: &str, context: Option<&str>) -> (Decision, f32) {
 
     // A web address beats an application name: "abre github" means the site,
     // since there is no GitHub app in the table to confuse it with.
-    if asks_to_open && find_app(rest).is_none() {
-        if let Some(url) = find_website(&spoken_words) {
-            return (Decision::Browse(url), 0.9);
+    //
+    // A spelled-out domain does not need a verb in front. The recogniser
+    // runs words together — "abremarca.com", "iramarca.com" — and there is
+    // then no verb left to recognise, but the intent is unmistakable.
+    if find_app(rest).is_none() {
+        match find_website(transcript, &spoken_words) {
+            Some(Website::Domain(url)) => {
+                return (Decision::Browse { url, in_browser: browser_in_front(context) }, 0.9)
+            }
+            Some(Website::Named(url)) if asks_to_open => {
+                return (Decision::Browse { url, in_browser: browser_in_front(context) }, 0.9)
+            }
+            _ => {}
         }
     }
 
@@ -544,9 +600,18 @@ pub fn perform(decision: &Decision) -> Option<Done> {
             description: format!("cerrar {name}"),
             succeeded: actions::quit_app(bundle_id),
         }),
-        Decision::Browse(url) => Some(Done {
-            description: format!("abrir {url}"),
-            succeeded: actions::open_url(url),
+        Decision::Browse { url, in_browser } => Some(Done {
+            description: match in_browser {
+                Some(bundle_id) => {
+                    let name = APPS
+                        .iter()
+                        .find(|a| a.bundle_id == *bundle_id)
+                        .map_or(*bundle_id, |a| a.name);
+                    format!("abrir {url} en {name}")
+                }
+                None => format!("abrir {url}"),
+            },
+            succeeded: actions::open_url(url, *in_browser),
         }),
         Decision::Type(text) => Some(Done {
             description: format!("escribir «{text}»"),
@@ -741,8 +806,29 @@ mod tests {
 
     fn browses(phrase: &str, expected: &str) {
         match decision(phrase) {
-            Decision::Browse(url) => assert_eq!(url, expected, "for «{phrase}»"),
+            Decision::Browse { url, .. } => assert_eq!(url, expected, "for «{phrase}»"),
             other => panic!("«{phrase}» should open {expected}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_link_opens_where_you_are_working() {
+        // In a browser, the page belongs in that browser rather than in
+        // whichever one the system considers default.
+        match decide_in("ordenador abre youtube", Some("com.google.Chrome")).0 {
+            Decision::Browse { in_browser, .. } => {
+                assert_eq!(in_browser, Some("com.google.Chrome"));
+            }
+            other => panic!("expected a page, got {other:?}"),
+        }
+        // Outside a browser there is nothing to prefer, so the default wins.
+        for elsewhere in [None, Some("com.apple.Terminal"), Some("com.apple.finder")] {
+            match decide_in("ordenador abre youtube", elsewhere).0 {
+                Decision::Browse { in_browser, .. } => {
+                    assert_eq!(in_browser, None, "from {elsewhere:?}");
+                }
+                other => panic!("expected a page from {elsewhere:?}, got {other:?}"),
+            }
         }
     }
 
@@ -756,6 +842,20 @@ mod tests {
     }
 
     #[test]
+    fn a_domain_needs_no_verb() {
+        // From the log: the recogniser runs the words together, leaving no
+        // verb to recognise — but ".com" makes the intent unmistakable.
+        browses("Ordenador abremarca.com", "https://abremarca.com");
+        browses("Ordenador iramarca.com", "https://iramarca.com");
+        browses("Ordenador ir a Marca.com", "https://marca.com");
+    }
+
+    #[test]
+    fn the_wake_word_alone_is_not_an_error() {
+        assert_eq!(decision("Ordenador."), Decision::Ignored);
+    }
+
+    #[test]
     fn opens_well_known_sites_by_name() {
         browses("ordenador abre youtube", "https://www.youtube.com");
         browses("ordenador ve a wikipedia", "https://es.wikipedia.org");
@@ -766,6 +866,33 @@ mod tests {
         // Chrome is an app in the table; it must not become a web search.
         launches("ordenador abre chrome", "Chrome");
         launches("ordenador abre safari", "Safari");
+    }
+
+    #[test]
+    fn the_same_words_mean_different_things_in_different_places() {
+        // This is the point of the contextual table: one phrase, read
+        // according to where you are, rather than a separate name per app.
+        let cases: &[(&str, Option<&str>, &str)] = &[
+            // "borra esto": backspace normally, to the Trash in Finder.
+            ("borra esto", None, "borrar"),
+            ("borra esto", Some("com.google.Chrome"), "borrar"),
+            ("borra esto", Some("com.apple.finder"), "a la papelera"),
+            // "cancela": Escape normally, ⌃C in a terminal.
+            ("cancela esto", None, "cancelar"),
+            ("cancela esto", Some("com.apple.Terminal"), "interrumpir"),
+            // "sube del todo": scroll, folder up, or previous command.
+            ("sube del todo", None, "ir arriba"),
+            ("sube del todo", Some("com.apple.finder"), "carpeta superior"),
+            ("sube del todo", Some("com.apple.Terminal"), "orden anterior"),
+        ];
+        for (phrase, context, expected) in cases {
+            let spoken = format!("ordenador {phrase}");
+            let name = match decide_in(&spoken, *context).0 {
+                Decision::Run(name) | Decision::RunHere(name) => name,
+                other => panic!("«{spoken}» in {context:?} gave {other:?}"),
+            };
+            assert_eq!(name, *expected, "«{phrase}» in {context:?}");
+        }
     }
 
     #[test]

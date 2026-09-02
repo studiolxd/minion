@@ -122,6 +122,10 @@ netflix.
 An application always wins over a site: "abre Chrome" opens the browser,
 not a search for it.
 
+**The page opens where you are working.** Ask for a site while Chrome is in
+front and it opens in Chrome, not in whichever browser the system considers
+default. Ask from anywhere else and the default applies.
+
 ### Dictating text
 
 «ordenador, **escribe** hola qué tal» types the words that follow —
@@ -134,14 +138,24 @@ rather than the normalised form used for matching, and it is sent as a
 Unicode string rather than as keystrokes, so ñ and á do not depend on the
 keyboard layout.
 
-### Inside particular applications
+### The same words, read where you are
 
-Some phrases only exist where they mean something, and beat the global
-command of the same name:
+A phrase can mean the right thing in each place instead of needing a
+different name per application:
+
+| Say | Normally | In Finder | In Terminal |
+|---|---|---|---|
+| borra esto | ⌫ | to the Trash | ⌫ |
+| cancela | Escape | Escape | ⌃C |
+| sube del todo | scroll to top | enclosing folder | previous command |
+
+### Only where they exist
+
+Other phrases have no global meaning at all, and only work in one place:
 
 | In | Say |
 |---|---|
-| Terminal | limpia la pantalla · cancela · principio de línea · final de línea |
+| Terminal | limpia la pantalla · principio de línea · final de línea |
 | Chrome, Safari | abre los favoritos · abre el historial · ventana de incógnito |
 | Finder | crea una carpeta · muestra la información |
 

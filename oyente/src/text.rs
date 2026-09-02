@@ -114,12 +114,12 @@ fn words_match(a: &str, b: &str, strict: bool) -> bool {
     if a == b {
         return true;
     }
-    // One contains the other and both are substantial: "abrecrome"/"crome",
-    // which is what the recogniser produces when words run together.
-    if b.len() >= 4 && a.contains(b) {
-        return true;
-    }
-    if a.len() >= 4 && b.contains(a) {
+    // The heard word may swallow the expected one: the recogniser writes
+    // "abrecrome" when two words run together, and "crome" is still in
+    // there. The reverse is not allowed — an expected word containing what
+    // was heard means the heard word is merely a prefix of something else,
+    // and "marca" is not "marcadores".
+    if b.len() >= 4 && a.len() > b.len() && a.contains(b) {
         return true;
     }
 
@@ -168,6 +168,16 @@ mod tests {
         assert!(words_match("abrecrome", "crome", false));
         assert!(words_match("safaris", "safari", false));
         assert!(!words_match("safari", "terminal", false));
+    }
+
+    #[test]
+    fn a_short_word_is_not_a_longer_one() {
+        // From the log: "ir a marca.com" opened the bookmarks, because
+        // "marca" is a prefix of "marcadores".
+        assert!(!words_match("marca", "marcadores", false));
+        assert!(!words_match("pon", "ponme", false));
+        // But a run-together transcription still matches.
+        assert!(words_match("abrecrome", "crome", false));
     }
 
     #[test]

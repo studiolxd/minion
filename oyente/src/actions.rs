@@ -50,6 +50,7 @@ pub mod key {
     pub const TAB: u16 = 48;
     pub const SPACE: u16 = 49;
     pub const DELETE: u16 = 51;
+    pub const ESCAPE: u16 = 53;
     pub const LEFT: u16 = 123;
     pub const RIGHT: u16 = 124;
     pub const DOWN: u16 = 125;
@@ -191,9 +192,18 @@ pub fn frontmost_app() -> Option<String> {
     Some(app.bundleIdentifier()?.to_string())
 }
 
-/// Opens a web address in the default browser.
-pub fn open_url(url: &str) -> bool {
-    Command::new("/usr/bin/open").arg(url).spawn().is_ok()
+/// Opens a web address, optionally in a named browser.
+///
+/// With no browser given it goes to the system default. Passing one matters
+/// when a different browser is already in front: opening a link in the
+/// default browser while you are working in another is jarring, and leaves
+/// the page somewhere you were not looking.
+pub fn open_url(url: &str, browser_bundle_id: Option<&str>) -> bool {
+    let mut command = Command::new("/usr/bin/open");
+    if let Some(bundle_id) = browser_bundle_id {
+        command.arg("-b").arg(bundle_id);
+    }
+    command.arg(url).spawn().is_ok()
 }
 
 /// Runs an AppleScript snippet.
