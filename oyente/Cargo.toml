@@ -1,0 +1,12 @@
+[package]
+name = "oyente"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.104"
+cpal = "0.18.2"
+parakeet-rs = "0.3.7"
+
+[profile.release]
+opt-level = 3

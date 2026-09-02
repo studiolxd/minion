@@ -1,0 +1,9 @@
+# Compilación de Rust
+target/
+
+# Modelos de reconocimiento: 650 MB, se descargan con descargar-modelo.sh
+oyente/modelo/*.onnx
+oyente/modelo/*.onnx.data
+
+# Registros
+*.log
