@@ -196,9 +196,11 @@ pub const COMMANDS: &[Command] = &[
               action: Action::Key(key::H, Mods::CMD) },
 
     // --- Navigation ---
-    Command { phrases: &["vuelve atras", "pagina anterior", "pagina atras"], name: "atrás",
+    Command { phrases: &["vuelve atras", "pagina anterior", "pagina atras",
+                         "retrocede la pagina"], name: "atrás",
               action: Action::Key(key::LEFT, Mods::CMD) },
-    Command { phrases: &["ve hacia adelante", "ve adelante", "pagina siguiente"], name: "adelante",
+    Command { phrases: &["ve hacia adelante", "ve adelante", "pagina siguiente",
+                         "avanza la pagina"], name: "adelante",
               action: Action::Key(key::RIGHT, Mods::CMD) },
     Command { phrases: &["recarga la pagina", "recarga"], name: "recargar",
               action: Action::Key(key::R, Mods::CMD) },
@@ -530,6 +532,7 @@ mod tests {
             ("Ordenador página atrás.", "atrás"),
             ("Ordenador página anterior.", "atrás"),
             ("Ordenador página siguiente.", "adelante"),
+            ("Ordenador retroceder página.", "atrás"),
         ];
         for (spoken, expected) in cases {
             match decide(spoken).0 {

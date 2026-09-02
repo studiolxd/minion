@@ -52,6 +52,8 @@ const VERBS: &[(&str, &str)] = &[
     ("muestra", "mostrar"), ("muestrame", "mostrar"), ("mostrar", "mostrar"),
     ("deja", "dejar"), ("dejar", "dejar"),
     ("vuelve", "volver"), ("volver", "volver"),
+    ("retrocede", "volver"), ("retroceder", "volver"), ("atras", "atras"),
+    ("avanza", "avanzar"), ("avanzar", "avanzar"),
     ("ve", "ir"), ("vete", "ir"), ("ir", "ir"),
     ("trae", "traer"), ("traeme", "traer"), ("traer", "traer"),
     ("dame", "dar"), ("da", "dar"), ("dar", "dar"),

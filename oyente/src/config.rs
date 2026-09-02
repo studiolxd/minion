@@ -104,11 +104,11 @@ pub fn load() -> Config {
     };
     match toml::from_str(&contents) {
         Ok(config) => {
-            println!("Configuration read from {}", file.display());
+            crate::journal::write(&format!("Configuration read from {}", file.display()));
             config
         }
         Err(e) => {
-            eprintln!("Ignoring {}: {e}", file.display());
+            crate::journal::write(&format!("Ignoring {}: {e}", file.display()));
             Config::default()
         }
     }
