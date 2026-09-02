@@ -129,16 +129,6 @@ not a search for it.
 front and it opens in Chrome, not in whichever browser the system considers
 default. Ask from anywhere else and the default applies.
 
-### Doing it again, and doing several things
-
-«ordenador, **otra vez**» repeats the last command — also *repite*, *hazlo*.
-With a count: «ordenador, repite tres veces».
-
-Two instructions in one breath: «ordenador, cierra la pestaña **y luego**
-recarga» — also *y después*, *y ahora*, *y también*. Only those explicit
-joiners split a sentence; a bare "y" does not, or "pon la canción tú y yo"
-would become two commands.
-
 ### Dictating text
 
 «ordenador, **escribe** hola qué tal» types the words that follow —
@@ -234,9 +224,8 @@ Copy `config.example.toml` to
 optional, and it is read once at startup.
 
 It covers the wake words, the confidence threshold, the speech detection
-numbers, extra applications, aliases for existing commands, and commands of
-your own bound to a shortcut — so extending the vocabulary needs no Rust
-toolchain:
+numbers, and extra applications — so adding your own apps or retuning the
+listener needs no Rust toolchain:
 
 ```toml
 threshold = 0.75
@@ -248,11 +237,6 @@ silence_end_ms = 900
 name = "Notion"
 bundle_id = "notion.id"
 aliases = ["notion", "nocion"]
-
-[[commands]]
-name = "compilar"
-phrases = ["compila el proyecto"]
-keys = "cmd-shift-b"
 ```
 
 A typo in the file is reported at startup and then ignored; it will not
@@ -264,7 +248,7 @@ The defaults for speech detection, overridable in the config file:
 
 | Setting | Default | If it is wrong |
 |---|---|---|
-| `speech_threshold` | 0.015 | A floor, not a fixed level — see below |
+| `speech_threshold` | 0.015 | Too high: clips words. Too low: transcribes the fan |
 | `silence_end_ms` | 700 | Too low: splits sentences mid-thought. Too high: sluggish |
 | `min_speech_ms` | 300 | Filters out door slams and coughs |
 | `max_utterance_ms` | 12000 | Safety cut against continuous noise |
@@ -297,6 +281,34 @@ Spanish actually produces.
 once: app not running, running with no windows, and running with a window.
 The middle one is common on macOS, where closing the last window does not
 quit the app.
+
+## Answering only you
+
+By default Oyente obeys anyone who says the wake word, which is right for a
+machine with one user. If other voices reach the microphone — a video, a
+colleague, a call on speaker — teach it yours:
+
+```bash
+/Applications/Oyente.app/Contents/MacOS/oyente enroll
+```
+
+It asks for five sentences and stores the average. From then on, anything
+that does not sound like you is discarded **before being transcribed**, so
+other people's words never reach the recogniser or the log.
+
+Five sentences rather than one because a single phrase carries its own
+intonation as much as the voice. Enrolment refuses to save samples that
+disagree with each other, which is what a noisy room produces — saving
+those would filter out the very person they are meant to admit.
+
+Delete `~/Library/Application Support/Oyente/voice.txt` to undo it.
+
+The model is ECAPA-TDNN from wespeaker (24 MB, 192 numbers per voice).
+Its input is 80-bin mel filterbanks matching Kaldi's, which `fbank.rs`
+reproduces: the same pre-emphasis, the same Povey window, the same mel
+spacing. A frontend that is merely reasonable produces embeddings that look
+plausible and compare badly, which is a hard fault to see — hence the tests
+that check a tone lands in the right band.
 
 ## Learning from its own mistakes
 
@@ -358,8 +370,12 @@ rebuilding.
 
 ## Not done yet
 
-- **Real VAD.** Energy cannot tell speech from a door slam, and background
-  music keeps it triggering. Silero VAD is the next step.
+- **Real VAD.** The energy detector cannot tell speech from a door slam.
+  In practice it has not needed to: a two-minute test with a video playing
+  produced no false commands, and speaker recognition now covers the case
+  that mattered. Silero VAD would mainly save CPU.
 
+- **Custom key commands in the config file**: applications and aliases can
+  be added there, but not entirely new shortcuts.
 - **Developer ID signing**, so the app can be shared with other machines.
   The ad-hoc signature is enough for this one.

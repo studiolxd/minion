@@ -29,5 +29,15 @@ download nemo128.onnx nemo128.onnx
 download decoder_joint-model.int8.onnx decoder_joint-model.onnx
 download encoder-model.int8.onnx encoder-model.onnx
 
+# Speaker model: 24 MB, tells your voice from anyone else's. Optional —
+# without it, Oyente answers whoever speaks the wake word.
+echo "  ↓ speaker.onnx"
+if [ ! -f speaker.onnx ]; then
+  curl -fL --progress-bar -o speaker.onnx \
+    "https://huggingface.co/Wespeaker/wespeaker-ecapa-tdnn512-LM/resolve/main/voxceleb_ECAPA512_LM.onnx"
+else
+  echo "  ✓ speaker.onnx (already here)"
+fi
+
 echo
 echo "Done. Total: $(du -sh "$DIR" | cut -f1)"

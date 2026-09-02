@@ -14,6 +14,14 @@ use serde::Deserialize;
 /// Idle minutes before the model is released, when the file says nothing.
 const DEFAULT_UNLOAD_MINUTES: u64 = 5;
 
+/// Cosine similarity a voice must reach to be treated as yours.
+///
+/// ECAPA embeddings of the same person typically score well above this and
+/// different people well below, but rooms and microphones move both. It
+/// errs low: refusing to hear you is worse than hearing someone else say
+/// the wake word, which the vocabulary then has to accept anyway.
+const DEFAULT_VOICE_THRESHOLD: f32 = 0.45;
+
 use crate::audio;
 use crate::commands::App;
 
@@ -71,6 +79,13 @@ pub struct Config {
     #[serde(default)]
     pub aliases: Vec<AliasConfig>,
 
+    /// How alike a voice must sound to yours before Oyente listens to it.
+    ///
+    /// Only used once `oyente enroll` has recorded a voice. Higher rejects
+    /// more, including you on a bad day; lower lets others through. Zero to
+    /// one, default 0.45.
+    pub voice_threshold: Option<f32>,
+
     /// Entirely new commands, bound to a keyboard shortcut.
     #[serde(default)]
     pub commands: Vec<CommandConfig>,
@@ -127,6 +142,7 @@ impl Default for Config {
             apps: Vec::new(),
             aliases: Vec::new(),
             commands: Vec::new(),
+            voice_threshold: None,
             unload_after_minutes: None,
         }
     }
@@ -193,6 +209,11 @@ impl Config {
                 ),
             })
             .collect()
+    }
+
+    /// How alike a voice must sound before it is obeyed.
+    pub fn voice_threshold(&self) -> f32 {
+        self.voice_threshold.unwrap_or(DEFAULT_VOICE_THRESHOLD).clamp(0.0, 1.0)
     }
 
     /// How long to keep the model in memory with nothing to do.

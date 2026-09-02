@@ -15,6 +15,7 @@ objc2-app-kit = "0.3.2"
 objc2-foundation = { version = "0.3.2", features = ["NSTimer", "NSDate", "block2"] }
 ort = "2.0.0-rc.13"
 parakeet-rs = "0.3.7"
+rustfft = "6.4.1"
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.1.5"
 tray-icon = "0.24.2"

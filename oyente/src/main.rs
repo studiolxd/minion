@@ -11,9 +11,12 @@ mod actions;
 mod audio;
 mod commands;
 mod config;
+mod enroll;
+mod fbank;
 mod journal;
 mod learn;
 mod spanish;
+mod speaker;
 mod text;
 
 use std::cell::Cell;
@@ -162,12 +165,19 @@ fn load_model(model_path: &str) -> Result<ParakeetTDT> {
         .with_context(|| format!("loading the model from '{model_path}'"))
 }
 
+struct Voice {
+    model: speaker::Speaker,
+    profile: speaker::Embedding,
+    threshold: f32,
+}
+
 fn listen_and_obey(
     model_path: String,
     settings: audio::Settings,
     log_ignored_speech: bool,
     play_sounds: bool,
     idle_unload: Option<Duration>,
+    mut voice: Option<Voice>,
     active: Arc<AtomicBool>,
 ) -> Result<()> {
     // Held in an Option so it can be dropped while idle. It is loaded now
@@ -213,6 +223,18 @@ fn listen_and_obey(
         }
         let seconds = utterance.len() as f32 / audio::TARGET_HZ as f32;
         let started = Instant::now();
+
+        // Whose voice this is, decided before transcribing: someone else's
+        // speech should not reach the recogniser at all, let alone the log.
+        if let Some(voice) = voice.as_mut() {
+            if let Some(heard) = voice.model.embed(&utterance) {
+                let likeness = speaker::similarity(&heard, &voice.profile);
+                if likeness < voice.threshold {
+                    note!("heard    {seconds:.1}s in another voice ({likeness:.2})");
+                    continue;
+                }
+            }
+        }
 
         // Reload if it was released while idle. Costs about a second, once.
         if model.is_none() {
@@ -526,6 +548,10 @@ fn main() -> Result<()> {
     // before any of that is set up.
     let first_argument = std::env::args().nth(1);
     if let Some(argument) = first_argument.as_deref() {
+        if argument == "enroll" {
+            let model_path = locate_model(None)?;
+            return enroll::run(&model_path);
+        }
         if argument == "learn" {
             let apply = std::env::args().any(|a| a == "--apply");
             let config = config::load();
@@ -544,6 +570,23 @@ fn main() -> Result<()> {
     let play_sounds = config.sounds;
     let idle_unload = config.idle_unload();
 
+    // Voice recognition is opt-in: it exists only once someone has run
+    // `oyente enroll`. Without a profile Oyente answers anyone who says the
+    // wake word, which is the right default for a machine with one user.
+    let voice = match speaker::load_profile() {
+        Some(profile) => match speaker::Speaker::load(&model_path) {
+            Ok(model) => {
+                note!("Voice profile loaded — only your voice will be obeyed.");
+                Some(Voice { model, profile, threshold: config.voice_threshold() })
+            }
+            Err(e) => {
+                note!("Voice profile found but the speaker model would not load: {e:#}");
+                None
+            }
+        },
+        None => None,
+    };
+
     note!("Oyente starting — loading model…");
     if let Some(log) = journal::path() {
         println!("Log: {}", log.display());
@@ -559,6 +602,7 @@ fn main() -> Result<()> {
             log_ignored,
             play_sounds,
             idle_unload,
+            voice,
             worker_active,
         ) {
             eprintln!("Error: {e:#}");

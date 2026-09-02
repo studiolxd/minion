@@ -1772,6 +1772,7 @@ dependencies = [
  "objc2-foundation",
  "ort",
  "parakeet-rs",
+ "rustfft",
  "serde",
  "toml 1.1.5+spec-1.1.0",
  "tray-icon",
