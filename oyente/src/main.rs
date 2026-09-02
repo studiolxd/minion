@@ -12,6 +12,7 @@ mod audio;
 mod commands;
 mod config;
 mod journal;
+mod learn;
 mod spanish;
 mod text;
 
@@ -349,7 +350,21 @@ fn report_permissions() {
 }
 
 fn main() -> Result<()> {
-    let model_path = locate_model(std::env::args().nth(1))?;
+    // `oyente aprender` reads the log and turns its failures into
+    // vocabulary. It touches neither the microphone nor the model, so it
+    // is handled before any of that is set up.
+    let first_argument = std::env::args().nth(1);
+    if let Some(argument) = first_argument.as_deref() {
+        if argument == "aprender" || argument == "learn" {
+            let apply = std::env::args().any(|a| a == "--aplicar" || a == "--apply");
+            let config = config::load();
+            commands::configure(&config);
+            learn::run(&config, apply);
+            return Ok(());
+        }
+    }
+
+    let model_path = locate_model(first_argument)?;
 
     let config = config::load();
     commands::configure(&config);

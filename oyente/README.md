@@ -181,6 +181,14 @@ Other phrases have no global meaning at all, and only work in one place:
 | pon la música · para la música | deja de escuchar |
 | siguiente canción · canción anterior | (resume from the menu bar) |
 
+Naming something searches for it: «ordenador, pon la canción Vértigo» —
+also *el disco, el grupo, el artista, el tema*. It opens the results in
+Spotify rather than playing straight away; starting a specific track needs
+the Web API and an OAuth token, which is a different project.
+
+A known command always wins over a title, so "pon la canción anterior"
+goes back one rather than searching for a song called "anterior".
+
 ## The log
 
 `~/Library/Logs/oyente.log` records every utterance it heard and what it
@@ -271,6 +279,34 @@ once: app not running, running with no windows, and running with a window.
 The middle one is common on macOS, where closing the last window does not
 quit the app.
 
+## Learning from its own mistakes
+
+Every phrase Oyente failed to understand is in the log. `oyente aprender`
+reads them back, works out what each was probably meant to be, and offers
+to add it as an alias:
+
+```bash
+/Applications/Oyente.app/Contents/MacOS/oyente aprender
+```
+
+```
+Phrases that look like an existing command:
+
+  «Ordenador retroceder página.»  ×2
+      → atrás (100% similar)
+
+No command resembles these — they may need a new one:
+
+  «Ordenador reproduce la canción vértigo.»
+```
+
+`--aplicar` writes the first group into `config.toml` as aliases. The
+second group is the useful half: it is the list of things the vocabulary
+does not cover yet.
+
+Phrases the vocabulary has since learned are skipped, so the report shows
+what is still missing rather than everything that ever failed.
+
 ## Testing
 
 ```bash
@@ -301,6 +337,7 @@ rebuilding.
 - **Real VAD.** Energy cannot tell speech from a door slam, and background
   music keeps it triggering. Silero VAD is the next step.
 
-- **Custom key commands in the config file**, not just applications.
+- **Custom key commands in the config file**: applications and aliases can
+  be added there, but not entirely new shortcuts.
 - **Developer ID signing**, so the app can be shared with other machines.
   The ad-hoc signature is enough for this one.

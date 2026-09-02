@@ -73,6 +73,7 @@ impl Mods {
     pub const CTRL: Mods = Mods::new(false, false, false, true);
     pub const CTRL_CMD: Mods = Mods::new(true, false, false, true);
     pub const CTRL_SHIFT: Mods = Mods::new(false, true, false, true);
+    pub const OPTION: Mods = Mods::new(false, false, true, false);
 
     const fn new(command: bool, shift: bool, option: bool, control: bool) -> Self {
         Self { command, shift, option, control }
@@ -204,6 +205,32 @@ pub fn open_url(url: &str, browser_bundle_id: Option<&str>) -> bool {
         command.arg("-b").arg(bundle_id);
     }
     command.arg(url).spawn().is_ok()
+}
+
+/// Opens a search in Spotify.
+///
+/// Searching rather than playing: starting a specific track needs the Web
+/// API and an OAuth token, which is a different project. This lands on the
+/// results with the app in front, one click from playing.
+pub fn search_spotify(query: &str) -> bool {
+    let encoded: String = query
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_string()
+            } else if c == ' ' {
+                "%20".to_string()
+            } else {
+                // Percent-encode everything else, accents included.
+                let mut buffer = [0u8; 4];
+                c.encode_utf8(&mut buffer)
+                    .bytes()
+                    .map(|b| format!("%{b:02X}"))
+                    .collect()
+            }
+        })
+        .collect();
+    open_url(&format!("spotify:search:{encoded}"), None)
 }
 
 /// Runs an AppleScript snippet.

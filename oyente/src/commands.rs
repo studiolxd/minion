@@ -19,6 +19,7 @@ pub const DEFAULT_WAKE_WORDS: &[&str] =
 
 /// Set once at startup from the configuration file. Absent means defaults.
 static USER_APPS: OnceLock<Vec<App>> = OnceLock::new();
+static USER_ALIASES: OnceLock<Vec<(&'static str, &'static str)>> = OnceLock::new();
 static USER_WAKE_WORDS: OnceLock<Vec<&'static str>> = OnceLock::new();
 static USER_THRESHOLD: OnceLock<f32> = OnceLock::new();
 
@@ -27,6 +28,10 @@ pub fn configure(config: &Config) {
     let extra = config.extra_apps();
     if !extra.is_empty() {
         let _ = USER_APPS.set(extra);
+    }
+    let aliases = config.extra_aliases();
+    if !aliases.is_empty() {
+        let _ = USER_ALIASES.set(aliases);
     }
     if let Some(words) = config.wake_words() {
         let _ = USER_WAKE_WORDS.set(words);
@@ -69,6 +74,9 @@ const APP_VERBS: &[&str] = &[
 
 /// Verbs asking for an application to be closed.
 const QUIT_VERBS: &[&str] = &["cerrar", "salir", "matar", "terminar"];
+
+/// Words after which a song, album or artist name is expected.
+const MUSIC_NOUNS: &[&str] = &["cancion", "tema", "disco", "album", "grupo", "artista"];
 
 /// Verbs that introduce text to be typed out.
 ///
@@ -243,6 +251,11 @@ pub const COMMANDS: &[Command] = &[
               action: Action::Key(key::A, Mods::CMD) },
     Command { phrases: &["borra esto"], name: "borrar",
               action: Action::Key(key::DELETE, Mods::NONE) },
+    Command { phrases: &["borra la palabra"], name: "borrar palabra",
+              action: Action::Key(key::DELETE, Mods::OPTION) },
+    // From the log: "borra la frase hasta el inicio".
+    Command { phrases: &["borra hasta el inicio", "borra la frase"], name: "borrar hasta el inicio",
+              action: Action::Key(key::DELETE, Mods::CMD) },
     Command { phrases: &["cancela esto", "cancela"], name: "cancelar",
               action: Action::Key(key::ESCAPE, Mods::NONE) },
     Command { phrases: &["busca en la pagina", "busca aqui"], name: "buscar",
@@ -354,6 +367,8 @@ pub enum Decision {
     RunHere(&'static str),
     /// Type text into whatever has focus.
     Type(String),
+    /// Look something up in Spotify.
+    SearchMusic(String),
     /// Run a command from the table, identified by name.
     Run(&'static str),
     /// Started with the wake word, but nothing was recognised.
@@ -368,6 +383,25 @@ fn strip_wake_word(phrase: &str) -> Option<&str> {
     wake_words()
         .contains(&first)
         .then(|| phrase[first.len()..].trim())
+}
+
+/// Extracts a song, album or artist name from the sentence.
+///
+/// Taken from the raw transcript so the title keeps its accents and
+/// capitals — "Vértigo" is not "vertigo" when it reaches Spotify.
+fn music_query(transcript: &str) -> Option<String> {
+    let words: Vec<&str> = transcript.split_whitespace().collect();
+    let normalised: Vec<String> = words.iter().map(|w| normalise(w)).collect();
+
+    if normalised.first().is_none_or(|w| !wake_words().contains(&w.as_str())) {
+        return None;
+    }
+    let position = normalised
+        .iter()
+        .position(|w| MUSIC_NOUNS.contains(&w.as_str()))?;
+    let title = words.get(position + 1..)?.join(" ");
+    let title = title.trim_matches(|c: char| !c.is_alphanumeric()).to_string();
+    (!title.is_empty()).then_some(title)
 }
 
 /// Extracts text to be typed, if the sentence asks for dictation.
@@ -470,7 +504,6 @@ fn find_app(rest: &str) -> Option<(&'static App, f32)> {
 }
 
 /// Works out what a transcription means with no application context.
-#[cfg(test)]
 pub fn decide(transcript: &str) -> (Decision, f32) {
     decide_in(transcript, None)
 }
@@ -524,6 +557,26 @@ pub fn decide_in(transcript: &str, context: Option<&str>) -> (Decision, f32) {
             if score >= threshold() && best.is_none_or(|(_, b)| score > b) {
                 best = Some((command, score));
             }
+        }
+    }
+
+    // A named song, but only if nothing in the vocabulary fits. Otherwise
+    // "pon la canción anterior" would search for a track called "anterior"
+    // instead of going back one.
+    if best.is_none() {
+        if let Some(query) = music_query(transcript) {
+            return (Decision::SearchMusic(query), 1.0);
+        }
+    }
+
+    // Phrasings the user added, or that were learned from the log.
+    for (name, phrase) in USER_ALIASES.get().into_iter().flatten() {
+        let score = similarity(rest, phrase);
+        if score < threshold() || !best.is_none_or(|(_, b)| score > b) {
+            continue;
+        }
+        if let Some(command) = COMMANDS.iter().find(|c| c.name == *name) {
+            best = Some((command, score));
         }
     }
 
@@ -613,6 +666,10 @@ pub fn perform(decision: &Decision) -> Option<Done> {
             },
             succeeded: actions::open_url(url, *in_browser),
         }),
+        Decision::SearchMusic(query) => Some(Done {
+            description: format!("buscar «{query}» en Spotify"),
+            succeeded: actions::search_spotify(query),
+        }),
         Decision::Type(text) => Some(Done {
             description: format!("escribir «{text}»"),
             succeeded: actions::type_text(text),
@@ -648,6 +705,31 @@ fn run_action(action: Action) -> bool {
 /// Whether this decision asks Oyente to stop listening.
 pub fn is_sleep(decision: &Decision) -> bool {
     matches!(decision, Decision::Run(name) if *name == "dormir")
+}
+
+/// The command a phrase most resembles, ignoring the confidence threshold.
+///
+/// Used by `oyente aprender` to suggest what a misheard phrase was probably
+/// meant to be. Deliberately separate from [`decide_in`]: this one always
+/// answers, which is useful for a suggestion and dangerous for an action.
+pub fn closest_command(phrase: &str) -> Option<(&'static str, f32)> {
+    let normalised = normalise(phrase);
+    let rest = strip_wake_word(&normalised).unwrap_or(&normalised);
+    let mut best: Option<(&'static str, f32)> = None;
+    for command in COMMANDS {
+        for candidate in command.phrases {
+            let score = similarity(rest, candidate);
+            if best.is_none_or(|(_, b)| score > b) {
+                best = Some((command.name, score));
+            }
+        }
+    }
+    best
+}
+
+/// Whether a word is one of the wake words in force.
+pub fn is_wake_word(word: &str) -> bool {
+    wake_words().contains(&word)
 }
 
 /// Total number of distinct phrases understood, for the startup banner.
@@ -971,6 +1053,33 @@ mod tests {
         // much it looks like something in the vocabulary.
         types("Ordenador escribe cierra la ventana", "cierra la ventana");
         types("Ordenador escribe sube el volumen", "sube el volumen");
+    }
+
+    fn searches_music(phrase: &str, expected: &str) {
+        match decision(phrase) {
+            Decision::SearchMusic(query) => assert_eq!(query, expected, "for «{phrase}»"),
+            other => panic!("«{phrase}» should search «{expected}», got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn finds_music_by_name() {
+        // From the log, where it came back not understood.
+        searches_music("Ordenador reproduce la canción vértigo.", "vértigo");
+        searches_music("ordenador pon la canción Bohemian Rhapsody", "Bohemian Rhapsody");
+        searches_music("ordenador pon el disco Kind of Blue", "Kind of Blue");
+        searches_music("ordenador pon el grupo Radiohead", "Radiohead");
+    }
+
+    #[test]
+    fn plain_music_commands_are_not_searches() {
+        // No title follows, so these stay transport controls.
+        assert_eq!(decision("Ordenador pon la música."), Decision::Run("reproducir"));
+        assert_eq!(decision("Ordenador para la música."), Decision::Run("pausar"));
+        assert_eq!(
+            decision("Ordenador pon la siguiente canción."),
+            Decision::Run("canción siguiente")
+        );
     }
 
     #[test]

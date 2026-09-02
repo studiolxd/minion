@@ -52,6 +52,23 @@ pub struct Config {
     /// Extra applications, added to the built-in list.
     #[serde(default)]
     pub apps: Vec<AppConfig>,
+
+    /// Extra ways of saying commands that already exist.
+    ///
+    /// This is where `oyente aprender` writes what it learned from the log,
+    /// and where you add a phrasing the recogniser keeps producing.
+    #[serde(default)]
+    pub aliases: Vec<AliasConfig>,
+}
+
+/// Another way of saying an existing command.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AliasConfig {
+    /// Name of the command, exactly as it appears in the log.
+    pub command: String,
+    /// The phrase to accept for it.
+    pub phrase: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -81,6 +98,7 @@ impl Default for Config {
             sounds: true,
             audio: AudioConfig::default(),
             apps: Vec::new(),
+            aliases: Vec::new(),
         }
     }
 }
@@ -148,6 +166,20 @@ impl Config {
             .collect()
     }
 
+    /// User aliases as `(command name, phrase)`, both normalised.
+    pub fn extra_aliases(&self) -> Vec<(&'static str, &'static str)> {
+        self.aliases
+            .iter()
+            .map(|alias| {
+                let command: &'static str =
+                    Box::leak(alias.command.clone().into_boxed_str());
+                let phrase: &'static str =
+                    Box::leak(crate::text::normalise(&alias.phrase).into_boxed_str());
+                (command, phrase)
+            })
+            .collect()
+    }
+
     pub fn wake_words(&self) -> Option<Vec<&'static str>> {
         if self.wake_words.is_empty() {
             return None;
@@ -200,6 +232,19 @@ mod tests {
             settings.speech_threshold,
             audio::Settings::default().speech_threshold
         );
+    }
+
+    #[test]
+    fn aliases_are_read_and_normalised() {
+        let config: Config = toml::from_str(
+            r#"
+            [[aliases]]
+            command = "atrás"
+            phrase = "Retrocede la Página"
+            "#,
+        )
+        .expect("alias config should parse");
+        assert_eq!(config.extra_aliases(), vec![("atrás", "retrocede la pagina")]);
     }
 
     #[test]
