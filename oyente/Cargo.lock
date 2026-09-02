@@ -1770,6 +1770,7 @@ dependencies = [
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
+ "ort",
  "parakeet-rs",
  "serde",
  "toml 1.1.5+spec-1.1.0",

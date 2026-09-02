@@ -27,7 +27,8 @@ use block2::RcBlock;
 use objc2::MainThreadMarker;
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 use objc2_foundation::NSTimer;
-use parakeet_rs::{ParakeetTDT, Transcriber};
+use ort::session::builder::SessionBuilder;
+use parakeet_rs::{ExecutionConfig, ParakeetTDT, Transcriber};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::TrayIconBuilder;
 
@@ -90,6 +91,63 @@ fn locate_model(argument: Option<String>) -> Result<String> {
     ))
 }
 
+/// How ONNX Runtime should be set up.
+///
+/// The defaults are tuned for throughput on a server: four threads and a
+/// memory arena that reserves generously and never gives anything back.
+/// This is a menu bar app that spends almost all its time idle, so the
+/// trade runs the other way — a little slower per utterance in exchange
+/// for not holding on to memory between them.
+fn inference_config() -> ExecutionConfig {
+    ExecutionConfig {
+        // Utterances are a second or two; two threads keep the latency
+        // well under a person's reaction time.
+        intra_threads: 2,
+        inter_threads: 1,
+        configure: Some(std::rc::Rc::new(|builder: SessionBuilder| {
+            // Memory patterns pre-allocate for the largest shape seen so
+            // far and keep it. With variable-length audio that means the
+            // longest utterance of the session sets the floor forever.
+            // The builder's error type carries the builder itself so a
+            // failed step can be recovered from; the hook wants the plain
+            // one, hence the conversion.
+            builder
+                .with_memory_pattern(false)
+                // Prepacking rewrites weights into a layout that multiplies
+                // faster, and keeps the original as well.
+                .and_then(|b| b.with_config_entry("session.disable_prepacking", "1"))
+                // Read initializers straight from the mapped file instead of
+                // copying them into the arena first.
+                .and_then(|b| {
+                    b.with_config_entry("session.use_device_allocator_for_initializers", "1")
+                })
+                .map_err(Into::into)
+        })),
+        ..Default::default()
+    }
+}
+
+/// Resident memory of this process, as a human-readable string.
+///
+/// Reported at startup because it is the number that decides whether this
+/// is something you can leave running all day.
+fn resident_memory() -> String {
+    let output = std::process::Command::new("/bin/ps")
+        .args(["-o", "rss=", "-p"])
+        .arg(std::process::id().to_string())
+        .output();
+    match output {
+        Ok(out) => {
+            let kb: f64 = String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .parse()
+                .unwrap_or(0.0);
+            format!("Using {:.0} MB.", kb / 1024.0)
+        }
+        Err(_) => String::new(),
+    }
+}
+
 /// The recognition loop. Owns the model and runs on its own thread.
 fn listen_and_obey(
     model_path: String,
@@ -98,10 +156,10 @@ fn listen_and_obey(
     play_sounds: bool,
     active: Arc<AtomicBool>,
 ) -> Result<()> {
-    let mut model = ParakeetTDT::from_pretrained(&model_path, None)
+    let mut model = ParakeetTDT::from_pretrained(&model_path, Some(inference_config()))
         .map_err(|e| anyhow!("{e}"))
         .with_context(|| format!("loading the model from '{model_path}'"))?;
-    note!("Model loaded.");
+    note!("Model loaded. {}", resident_memory());
 
     let listener =
         audio::start(settings, Arc::clone(&active)).context("opening the microphone")?;
