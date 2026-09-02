@@ -146,6 +146,41 @@ pub fn quit_app(bundle_id: &str) -> bool {
     applescript(&format!("tell application id \"{bundle_id}\" to quit"))
 }
 
+/// Types text into whatever has focus.
+///
+/// Sends the characters as a Unicode string rather than as key codes, so
+/// accents and ñ come out right regardless of keyboard layout — simulating
+/// the keystrokes for "acción" on a Spanish ISO layout would be a mess of
+/// dead keys.
+///
+/// Long text is sent in chunks: the event queue drops oversized payloads
+/// silently, which would lose the tail of a dictated sentence.
+pub fn type_text(text: &str) -> bool {
+    if text.is_empty() {
+        return true;
+    }
+    if !has_accessibility_permission() {
+        return false;
+    }
+    let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
+        return false;
+    };
+
+    const CHUNK_CHARS: usize = 20;
+    let chars: Vec<char> = text.chars().collect();
+    for chunk in chars.chunks(CHUNK_CHARS) {
+        let piece: String = chunk.iter().collect();
+        let Ok(event) = CGEvent::new_keyboard_event(source.clone(), 0, true) else {
+            return false;
+        };
+        event.set_string(&piece);
+        event.post(CGEventTapLocation::HID);
+        // A short gap keeps the receiving app from dropping characters.
+        std::thread::sleep(std::time::Duration::from_millis(6));
+    }
+    true
+}
+
 /// Bundle identifier of the application currently in front.
 ///
 /// What makes a command mean different things in different places: "limpia

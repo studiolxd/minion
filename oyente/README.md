@@ -122,6 +122,18 @@ netflix.
 An application always wins over a site: "abre Chrome" opens the browser,
 not a search for it.
 
+### Dictating text
+
+«ordenador, **escribe** hola qué tal» types the words that follow —
+also *anota, apunta, dicta*.
+
+Everything after the verb is content, never a command: "ordenador escribe
+cierra la ventana" types the phrase instead of closing anything. Accents
+and capitals survive, because the text comes from the original transcript
+rather than the normalised form used for matching, and it is sent as a
+Unicode string rather than as keystrokes, so ñ and á do not depend on the
+keyboard layout.
+
 ### Inside particular applications
 
 Some phrases only exist where they mean something, and beat the global
@@ -274,7 +286,6 @@ rebuilding.
 
 - **Real VAD.** Energy cannot tell speech from a door slam, and background
   music keeps it triggering. Silero VAD is the next step.
-- **Dictation.** Oyente runs commands; it does not type text.
 
 - **Custom key commands in the config file**, not just applications.
 - **Developer ID signing**, so the app can be shared with other machines.

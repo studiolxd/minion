@@ -70,6 +70,13 @@ const APP_VERBS: &[&str] = &[
 /// Verbs asking for an application to be closed.
 const QUIT_VERBS: &[&str] = &["cerrar", "salir", "matar", "terminar"];
 
+/// Verbs that introduce text to be typed out.
+///
+/// Deliberately narrow. "poner" was tried here and had to go: "pon la
+/// pantalla completa" is a command, and treating it as dictation typed the
+/// rest of the sentence instead of running it.
+const DICTATION_VERBS: &[&str] = &["escribir", "anotar", "apuntar", "dictar"];
+
 /// Top-level domains recognised when a web address is spoken.
 ///
 /// The recogniser writes "google.com" with the dot, which normalisation
@@ -327,6 +334,8 @@ pub enum Decision {
     Browse(String),
     /// Run a command that only exists in the current application.
     RunHere(&'static str),
+    /// Type text into whatever has focus.
+    Type(String),
     /// Run a command from the table, identified by name.
     Run(&'static str),
     /// Started with the wake word, but nothing was recognised.
@@ -341,6 +350,30 @@ fn strip_wake_word(phrase: &str) -> Option<&str> {
     wake_words()
         .contains(&first)
         .then(|| phrase[first.len()..].trim())
+}
+
+/// Extracts text to be typed, if the sentence asks for dictation.
+///
+/// Works on the original transcript rather than the normalised form: what
+/// gets typed must keep its accents and capitals. Only the first two words
+/// are inspected — wake word, then dictation verb — and everything after
+/// them is content, however much it looks like a command.
+fn dictation_text(transcript: &str) -> Option<String> {
+    let words: Vec<&str> = transcript.split_whitespace().collect();
+    if words.len() < 3 {
+        return None;
+    }
+    if !wake_words().contains(&normalise(words[0]).as_str()) {
+        return None;
+    }
+    let verb = spanish::canonical_verb(&normalise(words[1])).to_string();
+    if !DICTATION_VERBS.contains(&verb.as_str()) {
+        return None;
+    }
+    let text = words[2..].join(" ");
+    // "pon la música" is a command, not a request to type "la música".
+    // Requiring some length keeps short phrases out of dictation.
+    (text.chars().count() >= 4).then_some(text)
 }
 
 /// Finds a web address in the sentence.
@@ -409,6 +442,12 @@ pub fn decide_in(transcript: &str, context: Option<&str>) -> (Decision, f32) {
     };
     if rest.is_empty() {
         return (Decision::Unrecognised, 0.0);
+    }
+
+    // Dictation first: everything after the verb is content, not a command,
+    // so it must not be matched against the vocabulary at all.
+    if let Some(text) = dictation_text(transcript) {
+        return (Decision::Type(text), 1.0);
     }
 
     // Commands belonging to the application in front come first: they are
@@ -508,6 +547,10 @@ pub fn perform(decision: &Decision) -> Option<Done> {
         Decision::Browse(url) => Some(Done {
             description: format!("abrir {url}"),
             succeeded: actions::open_url(url),
+        }),
+        Decision::Type(text) => Some(Done {
+            description: format!("escribir «{text}»"),
+            succeeded: actions::type_text(text),
         }),
         Decision::RunHere(name) => {
             let command = CONTEXTUAL_COMMANDS.iter().find(|c| c.name == *name)?;
@@ -777,6 +820,36 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn types(phrase: &str, expected: &str) {
+        match decision(phrase) {
+            Decision::Type(text) => assert_eq!(text, expected, "for «{phrase}»"),
+            other => panic!("«{phrase}» should type «{expected}», got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dictates_text() {
+        types("Ordenador escribe hola qué tal estás",  "hola qué tal estás");
+        types("Ordenador, anota comprar pan mañana", "comprar pan mañana");
+        // Accents and capitals survive: the text comes from the original
+        // transcript, not the normalised form used for matching.
+        types("Ordenador escribe Señor Muñoz", "Señor Muñoz");
+    }
+
+    #[test]
+    fn dictated_text_is_never_matched_as_a_command() {
+        // The whole point: everything after the verb is content, however
+        // much it looks like something in the vocabulary.
+        types("Ordenador escribe cierra la ventana", "cierra la ventana");
+        types("Ordenador escribe sube el volumen", "sube el volumen");
+    }
+
+    #[test]
+    fn short_phrases_stay_commands() {
+        // "pon la música" must not become a request to type "la música".
+        assert_eq!(decision("Ordenador pon la música."), Decision::Run("reproducir"));
     }
 
     #[test]

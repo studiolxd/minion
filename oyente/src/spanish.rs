@@ -71,6 +71,10 @@ const VERBS: &[(&str, &str)] = &[
     ("descansa", "descansar"), ("descansar", "descansar"),
     ("escucha", "escuchar"), ("escuchar", "escuchar"),
     ("pasa", "pasar"), ("pasar", "pasar"),
+    ("escribe", "escribir"), ("escriba", "escribir"), ("escribir", "escribir"),
+    ("anota", "anotar"), ("anotar", "anotar"),
+    ("apunta", "apuntar"), ("apuntar", "apuntar"),
+    ("dicta", "dictar"), ("dictar", "dictar"),
 ];
 
 /// True if the word carries no instruction and can be dropped.
