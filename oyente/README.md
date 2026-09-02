@@ -8,7 +8,10 @@ option-free:  «ordenador, abre Chrome»      → Chrome comes forward
               «mañana quedamos a las cinco» → ignored
 ```
 
-Lives in the menu bar as 🎙. No Dock icon, no window.
+Lives in the menu bar as 🎙 — 😴 when paused. No Dock icon, no window.
+
+The menu holds one toggle (Pausar / Escuchar), *Aprender del registro…*,
+*Ver el registro*, and Salir.
 
 ## Why
 
@@ -284,6 +287,11 @@ quit the app.
 Every phrase Oyente failed to understand is in the log. `oyente learn`
 reads them back, works out what each was probably meant to be, and offers
 to add it as an alias:
+
+From the menu bar: **Aprender del registro…**. It shows what it found and
+asks before changing anything.
+
+From a terminal:
 
 ```bash
 /Applications/Oyente.app/Contents/MacOS/oyente learn

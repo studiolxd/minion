@@ -22,11 +22,94 @@ use crate::{commands, config, journal};
 const SUGGEST_ABOVE: f32 = 0.55;
 
 /// A phrase that failed, with what it was probably meant to be.
-struct Candidate {
-    phrase: String,
-    times: usize,
-    command: String,
-    score: f32,
+pub struct Candidate {
+    pub phrase: String,
+    pub times: usize,
+    pub command: String,
+    pub score: f32,
+}
+
+/// What the log has to teach, split by whether it can be acted on.
+pub struct Lesson {
+    /// Close enough to an existing command to be added as an alias.
+    pub teachable: Vec<Candidate>,
+    /// Nothing resembles these; they need a command that does not exist.
+    pub missing: Vec<Candidate>,
+}
+
+impl Lesson {
+    pub fn is_empty(&self) -> bool {
+        self.teachable.is_empty() && self.missing.is_empty()
+    }
+
+    /// A plain-text summary, for the terminal or a dialog.
+    pub fn summary(&self) -> String {
+        if self.is_empty() {
+            return "Nada que aprender: el registro no tiene frases sin entender.".into();
+        }
+        let mut out = String::new();
+        if !self.teachable.is_empty() {
+            out.push_str("Frases que se parecen a una orden que ya existe:\n\n");
+            for candidate in &self.teachable {
+                let repeats = if candidate.times > 1 {
+                    format!("  ×{}", candidate.times)
+                } else {
+                    String::new()
+                };
+                let _ = writeln!(
+                    out,
+                    "  «{}»{}\n      → {} ({:.0}%)",
+                    candidate.phrase, repeats, candidate.command, candidate.score * 100.0
+                );
+            }
+        }
+        if !self.missing.is_empty() {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str("Ninguna orden se parece a estas — harían falta nuevas:\n\n");
+            for candidate in &self.missing {
+                let _ = writeln!(out, "  «{}»", candidate.phrase);
+            }
+        }
+        out
+    }
+}
+
+/// Reads the log and works out what it has to teach.
+pub fn analyse(config: &config::Config) -> Lesson {
+    let (teachable, missing) = candidates(config)
+        .into_iter()
+        .partition(|c| c.score >= SUGGEST_ABOVE);
+    Lesson { teachable, missing }
+}
+
+/// Writes the teachable phrases into the configuration as aliases.
+///
+/// Returns how many were added, or an error message.
+pub fn apply(lesson: &Lesson) -> Result<usize, String> {
+    if lesson.teachable.is_empty() {
+        return Ok(0);
+    }
+    let path = config::path().ok_or("No se encuentra el archivo de configuración.")?;
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    let mut addition = String::from("\n# Aprendido del registro con `oyente learn`.\n");
+    for candidate in &lesson.teachable {
+        let phrase = without_wake_word(&candidate.phrase);
+        let _ = write!(
+            addition,
+            "\n[[aliases]]\ncommand = \"{}\"\nphrase = \"{}\"\n",
+            candidate.command, phrase
+        );
+    }
+
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+    fs::write(&path, existing + &addition)
+        .map(|()| lesson.teachable.len())
+        .map_err(|e| format!("No se pudo escribir {}: {e}", path.display()))
 }
 
 /// Reads the phrases the log recorded as not understood.
@@ -111,77 +194,19 @@ fn without_wake_word(phrase: &str) -> String {
 }
 
 /// Prints the report, and optionally writes the accepted aliases.
-pub fn run(config: &config::Config, apply: bool) {
-    let all = candidates(config);
-    if all.is_empty() {
-        println!("Nothing to learn: no unrecognised phrases in the log.");
-        return;
-    }
+pub fn run(config: &config::Config, apply_now: bool) {
+    let lesson = analyse(config);
+    println!("\n{}", lesson.summary());
 
-    let (worth_teaching, unclear): (Vec<_>, Vec<_>) =
-        all.into_iter().partition(|c| c.score >= SUGGEST_ABOVE);
-
-    if !worth_teaching.is_empty() {
-        println!("\nPhrases that look like an existing command:\n");
-        for candidate in &worth_teaching {
-            println!(
-                "  «{}»{}\n      → {} ({:.0}% similar)",
-                candidate.phrase,
-                if candidate.times > 1 {
-                    format!("  ×{}", candidate.times)
-                } else {
-                    String::new()
-                },
-                candidate.command,
-                candidate.score * 100.0
-            );
+    if !apply_now {
+        if !lesson.teachable.is_empty() {
+            println!("\nRun `oyente learn --apply` to add the first group as aliases.");
         }
-    }
-
-    if !unclear.is_empty() {
-        println!("\nNo command resembles these — they may need a new one:\n");
-        for candidate in &unclear {
-            println!("  «{}»", candidate.phrase);
-        }
-    }
-
-    if !apply {
-        println!(
-            "\nRun `oyente learn --apply` to add the first group as aliases."
-        );
         return;
     }
-
-    if worth_teaching.is_empty() {
-        println!("\nNothing close enough to add.");
-        return;
-    }
-
-    let Some(path) = config::path() else {
-        eprintln!("Cannot locate the configuration file.");
-        return;
-    };
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-
-    let mut addition = String::from("\n# Learned from the log by `oyente learn`.\n");
-    for candidate in &worth_teaching {
-        let phrase = without_wake_word(&candidate.phrase);
-        let _ = write!(
-            addition,
-            "\n[[aliases]]\ncommand = \"{}\"\nphrase = \"{}\"\n",
-            candidate.command, phrase
-        );
-    }
-
-    let existing = fs::read_to_string(&path).unwrap_or_default();
-    match fs::write(&path, existing + &addition) {
-        Ok(()) => println!(
-            "\nAdded {} alias(es) to {}.\nRestart Oyente for them to take effect.",
-            worth_teaching.len(),
-            path.display()
-        ),
-        Err(e) => eprintln!("\nCould not write {}: {e}", path.display()),
+    match apply(&lesson) {
+        Ok(0) => println!("Nothing close enough to add."),
+        Ok(n) => println!("\nAdded {n} alias(es). Restart Oyente for them to take effect."),
+        Err(e) => eprintln!("\n{e}"),
     }
 }

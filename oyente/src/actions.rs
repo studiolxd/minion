@@ -233,6 +233,39 @@ pub fn search_spotify(query: &str) -> bool {
     open_url(&format!("spotify:search:{encoded}"), None)
 }
 
+/// Shows a message with a single dismiss button.
+pub fn show_message(text: &str) {
+    let escaped = text.replace('\\', "").replace('"', "'");
+    applescript(&format!(
+        "display dialog \"{escaped}\" with title \"Oyente\" buttons {{\"Cerrar\"}} \
+         default button \"Cerrar\""
+    ));
+}
+
+/// Asks a yes/no question. True when the affirmative button was pressed.
+///
+/// Blocks until answered, so it must not be called from the recognition
+/// thread — a dialog waiting for a click would stop everything being heard.
+pub fn ask(text: &str, affirmative: &str) -> bool {
+    let escaped = text.replace('\\', "").replace('"', "'");
+    let script = format!(
+        "display dialog \"{escaped}\" with title \"Oyente\" \
+         buttons {{\"Cancelar\", \"{affirmative}\"}} default button \"{affirmative}\""
+    );
+    Command::new("/usr/bin/osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .is_ok_and(|out| {
+            String::from_utf8_lossy(&out.stdout).contains(&format!("button returned:{affirmative}"))
+        })
+}
+
+/// Shows a file in the Finder.
+pub fn reveal(path: &str) {
+    let _ = Command::new("/usr/bin/open").arg("-R").arg(path).spawn();
+}
+
 /// Runs an AppleScript snippet.
 pub fn applescript(script: &str) -> bool {
     Command::new("/usr/bin/osascript")

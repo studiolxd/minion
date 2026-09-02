@@ -48,6 +48,11 @@ mod icon {
     pub const PAUSED: &str = "😴";
 }
 
+/// The toggle's two faces. It names the action, not the state: a menu item
+/// is something you do, so while listening it offers to pause.
+const MENU_PAUSE: &str = "Pausar";
+const MENU_LISTEN: &str = "Escuchar";
+
 /// How often the menu bar checks whether the state changed.
 const ICON_REFRESH_SECONDS: f64 = 0.4;
 
@@ -252,16 +257,22 @@ fn run_menu_bar(active: Arc<AtomicBool>) -> Result<()> {
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 
     let menu = Menu::new();
-    let listen = MenuItem::new("Escuchar", true, None);
-    let pause = MenuItem::new("Pausar", true, None);
+    // One item for one piece of state. Two — "Escuchar" and "Pausar" — made
+    // the reader work out which one applied right now.
+    let toggle = MenuItem::new(MENU_PAUSE, true, None);
+    let learn = MenuItem::new("Aprender del registro…", true, None);
+    let show_log = MenuItem::new("Ver el registro", true, None);
     let quit = MenuItem::new("Salir de Oyente", true, None);
-    menu.append(&listen)?;
-    menu.append(&pause)?;
+    menu.append(&toggle)?;
+    menu.append(&PredefinedMenuItem::separator())?;
+    menu.append(&learn)?;
+    menu.append(&show_log)?;
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&quit)?;
 
-    let listen_id = listen.id().clone();
-    let pause_id = pause.id().clone();
+    let toggle_id = toggle.id().clone();
+    let learn_id = learn.id().clone();
+    let show_log_id = show_log.id().clone();
     let quit_id = quit.id().clone();
 
     // Held for the lifetime of the process: dropping it removes the icon.
@@ -275,9 +286,10 @@ fn run_menu_bar(active: Arc<AtomicBool>) -> Result<()> {
 
     // The state can change from the menu or from a spoken "deja de
     // escuchar", and the second happens on the recognition thread, which
-    // must not touch AppKit. A timer on the main run loop is the bridge:
-    // it polls the flag and repaints the icon when it differs.
+    // must not touch AppKit. A timer on the main run loop is the bridge: it
+    // polls the flag and repaints the icon and the menu item together.
     let tray_for_timer = Rc::clone(&tray);
+    let toggle_for_timer = toggle.clone();
     let active_for_timer = Arc::clone(&active);
     let shown_as_listening = Cell::new(true);
     let repaint = RcBlock::new(move |_timer: NonNull<NSTimer>| {
@@ -286,11 +298,15 @@ fn run_menu_bar(active: Arc<AtomicBool>) -> Result<()> {
             return;
         }
         shown_as_listening.set(listening);
-        let title = if listening { icon::LISTENING } else { icon::PAUSED };
-        tray_for_timer.set_title(Some(title));
+        tray_for_timer.set_title(Some(if listening {
+            icon::LISTENING
+        } else {
+            icon::PAUSED
+        }));
+        toggle_for_timer.set_text(if listening { MENU_PAUSE } else { MENU_LISTEN });
     });
-    // Safety: the block only touches the tray icon and an atomic flag, and
-    // the timer fires on the main thread, which is where the tray lives.
+    // Safety: the block only touches the tray icon, the menu item and an
+    // atomic flag, and the timer fires on the main thread, where they live.
     let _timer = unsafe {
         NSTimer::scheduledTimerWithTimeInterval_repeats_block(
             ICON_REFRESH_SECONDS,
@@ -301,16 +317,23 @@ fn run_menu_bar(active: Arc<AtomicBool>) -> Result<()> {
 
     // Menu events arrive on a global channel, which is Send, so they can be
     // serviced from another thread while AppKit owns the main one. The icon
-    // itself is repainted by the timer above, not from here.
+    // and the item's text are repainted by the timer above, not from here.
     std::thread::spawn(move || {
         let events = MenuEvent::receiver();
         while let Ok(event) = events.recv() {
-            if event.id == listen_id {
-                active.store(true, Ordering::Relaxed);
-                note!("resumed from the menu");
-            } else if event.id == pause_id {
-                active.store(false, Ordering::Relaxed);
-                note!("paused from the menu");
+            if event.id == toggle_id {
+                let now_listening = !active.load(Ordering::Relaxed);
+                active.store(now_listening, Ordering::Relaxed);
+                note!(
+                    "{} from the menu",
+                    if now_listening { "resumed" } else { "paused" }
+                );
+            } else if event.id == learn_id {
+                show_lesson();
+            } else if event.id == show_log_id {
+                if let Some(path) = journal::path() {
+                    actions::reveal(&path.to_string_lossy());
+                }
             } else if event.id == quit_id {
                 note!("quit from the menu");
                 std::process::exit(0);
@@ -320,6 +343,42 @@ fn run_menu_bar(active: Arc<AtomicBool>) -> Result<()> {
 
     app.run();
     Ok(())
+}
+
+/// Shows what the log has to teach, and offers to apply it.
+///
+/// A menu bar app has nowhere to print, so the report goes in a dialog. The
+/// alternative — writing aliases straight from the menu — would change the
+/// vocabulary without showing what changed.
+fn show_lesson() {
+    let config = config::load();
+    let lesson = learn::analyse(&config);
+
+    if lesson.is_empty() {
+        actions::show_message("Nada que aprender: no hay frases sin entender en el registro.");
+        return;
+    }
+
+    let mut body = lesson.summary();
+    if lesson.teachable.is_empty() {
+        actions::show_message(&body);
+        return;
+    }
+    body.push_str("\n¿Añadir las primeras como alias?");
+
+    if !actions::ask(&body, "Añadir") {
+        return;
+    }
+    match learn::apply(&lesson) {
+        Ok(0) => {}
+        Ok(n) => {
+            note!("learned {n} alias(es) from the log");
+            actions::show_message(&format!(
+                "Añadidos {n}. Reinicia Oyente desde el menú para que se apliquen."
+            ));
+        }
+        Err(e) => actions::show_message(&e),
+    }
 }
 
 /// Says plainly whether the key-pressing commands can work at all.
