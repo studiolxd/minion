@@ -63,14 +63,10 @@ pub fn set(enabled: bool) -> Result<(), String> {
     }
     fs::write(&path, plist).map_err(|e| format!("cannot write the agent: {e}"))?;
 
-    // Replace any previous registration, so toggling twice is harmless.
-    let _ = Command::new("/bin/launchctl")
-        .args(["bootout", &format!("{domain}/{LABEL}")])
-        .output();
-    Command::new("/bin/launchctl")
-        .args(["bootstrap", &domain])
-        .arg(&path)
-        .output()
-        .map_err(|e| format!("launchctl would not run: {e}"))?;
+    // Deliberately not bootstrapped here. Loading the agent starts the
+    // program, and the copy asking for this is already running — which put
+    // two faces in the menu bar. Writing the file is enough: launchd reads
+    // it at the next login, which is what "start at login" means.
+    let _ = domain;
     Ok(())
 }

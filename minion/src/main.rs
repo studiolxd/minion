@@ -586,6 +586,42 @@ fn show_lesson() {
     }
 }
 
+/// Refuses to start if another copy is already running.
+///
+/// Two copies means two faces in the menu bar, two microphones open and
+/// every command run twice. The lock is held by the file descriptor, so it
+/// is released when the process ends however it ends — no stale lock file
+/// to clean up after a crash.
+fn claim_sole_instance() -> bool {
+    use std::os::unix::io::IntoRawFd;
+
+    let Some(mut path) = config::path() else {
+        return true;
+    };
+    path.set_file_name("running.lock");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+    else {
+        return true; // cannot lock: better to run than to refuse wrongly
+    };
+
+    // Leaked on purpose: the lock must outlive this function and last as
+    // long as the process does.
+    let fd = file.into_raw_fd();
+    let locked = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    if !locked {
+        // Someone else holds it; let go of our descriptor.
+        unsafe { libc::close(fd) };
+    }
+    locked
+}
+
 /// Says plainly whether the key-pressing commands can work at all.
 ///
 /// Worth its own step because the failure is invisible: without the
@@ -636,6 +672,11 @@ fn main() -> Result<()> {
             learn::run(&config, apply);
             return Ok(());
         }
+    }
+
+    if !claim_sole_instance() {
+        eprintln!("Minion ya se está ejecutando.");
+        return Ok(());
     }
 
     let model_path = locate_model(first_argument)?;
