@@ -35,7 +35,7 @@ use anyhow::{anyhow, Context, Result};
 use block2::RcBlock;
 use objc2::MainThreadMarker;
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
-use objc2_foundation::NSTimer;
+use objc2_foundation::{NSRunLoop, NSRunLoopCommonModes, NSTimer};
 use ort::session::builder::SessionBuilder;
 use parakeet_rs::{ExecutionConfig, ParakeetTDT, Transcriber};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
@@ -434,7 +434,7 @@ fn run_menu_bar(
     // Watches this application's keys, so the shortcut button can be set by
     // pressing a combination rather than typing its name.
     let panel_for_capture = Rc::clone(&panel);
-    let _capture = hotkey::capture_next(move |code, mods| {
+    let _capture = preferences::capture_keys(move |code, mods| {
         panel_for_capture.is_capturing() && panel_for_capture.capture(code, mods)
     });
     // Requests from the menu thread, which must not touch AppKit itself.
@@ -514,15 +514,17 @@ fn run_menu_bar(
         }
         toggle_for_timer.set_text(if listening { MENU_PAUSE } else { MENU_LISTEN });
     });
-    // Safety: the block only touches the tray icon, the menu item and an
-    // atomic flag, and the timer fires on the main thread, where they live.
-    let _timer = unsafe {
-        NSTimer::scheduledTimerWithTimeInterval_repeats_block(
-            UI_REFRESH_SECONDS,
-            true,
-            &repaint,
-        )
+    // Scheduled in the common modes rather than the default one. While a
+    // slider is being dragged, AppKit runs the loop in event-tracking mode
+    // and timers registered only for the default mode stop firing — which
+    // is exactly when the readout beside the slider needs to keep up.
+    let timer = unsafe {
+        NSTimer::timerWithTimeInterval_repeats_block(UI_REFRESH_SECONDS, true, &repaint)
     };
+    unsafe {
+        NSRunLoop::currentRunLoop().addTimer_forMode(&timer, NSRunLoopCommonModes);
+    }
+    let _timer = timer;
 
     // Menu events arrive on a global channel, which is Send, so they can be
     // serviced from another thread while AppKit owns the main one. The icon
@@ -705,14 +707,13 @@ fn main() -> Result<()> {
     });
 
     // Kept alive for the life of the process: dropping it stops the watch.
-    let _shortcut = config.resume_shortcut().and_then(|shortcut| {
-        let watch = hotkey::watch(&shortcut, Arc::clone(&active));
-        match &watch {
-            Some(_) => note!("Shortcut {shortcut} pauses and resumes."),
-            None => note!("Cannot read the shortcut «{shortcut}»; ignoring it."),
+    if let Some(shortcut) = config.resume_shortcut() {
+        if hotkey::watch(&shortcut, Arc::clone(&active)) {
+            note!("Shortcut {shortcut} pauses and resumes.");
+        } else {
+            note!("Cannot read the shortcut «{shortcut}»; ignoring it.");
         }
-        watch
-    });
+    }
 
     run_menu_bar(active, play_sounds, log_ignored)
 }

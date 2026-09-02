@@ -4,104 +4,104 @@
 //! a paused microphone hears nothing. The menu bar always works, but it
 //! needs the mouse. This watches for one combination system-wide.
 //!
-//! Uses a global event monitor rather than the older hotkey registration:
-//! it needs the Accessibility permission, which Minion already requires for
-//! its key commands, and it does not claim the combination away from other
-//! applications — the keystroke still reaches whatever has focus.
+//! It runs on a thread of its own with its own run loop. The obvious
+//! approach — `NSEvent`'s global monitor — hangs off the main run loop,
+//! the same one that tracks the menu bar, and in practice left the menu
+//! unable to open at all. An event tap on a separate thread cannot reach
+//! the main loop to break it.
+//!
+//! The tap only listens; it does not consume the keystroke, so the
+//! combination still reaches whatever has focus.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use block2::RcBlock;
-use objc2_app_kit::{NSEvent, NSEventMask, NSEventModifierFlags};
+use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
+use core_graphics::event::{
+    CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType,
+    CallbackResult, EventField,
+};
 
 use crate::actions::Mods;
 
-/// Watches for the combination and flips `active` when it arrives.
-///
-/// The returned token must be kept alive; dropping it stops the watch.
-pub struct Watch {
-    _monitor: Option<objc2::rc::Retained<objc2::runtime::AnyObject>>,
-    /// The handler must outlive the monitor. AppKit is documented to copy
-    /// the block, but holding it here costs nothing and removes any doubt:
-    /// a freed block called on the next keystroke would corrupt the run
-    /// loop in ways that show up far from the cause.
-    _handler: RcBlock<dyn Fn(std::ptr::NonNull<NSEvent>)>,
+/// Modifier bits as they arrive in a CGEvent's flags.
+mod flags {
+    pub const SHIFT: u64 = 0x0002_0000;
+    pub const CONTROL: u64 = 0x0004_0000;
+    pub const OPTION: u64 = 0x0008_0000;
+    pub const COMMAND: u64 = 0x0010_0000;
 }
 
-/// Starts watching. Returns `None` if the shortcut cannot be read.
-pub fn watch(shortcut: &str, active: Arc<AtomicBool>) -> Option<Watch> {
-    let (code, mods) = crate::actions::parse_shortcut(shortcut)?;
-
-    let handler = RcBlock::new(move |event: std::ptr::NonNull<NSEvent>| {
-        let event = unsafe { event.as_ref() };
-        if event.keyCode() != code {
-            return;
-        }
-        if !modifiers_match(event.modifierFlags(), mods) {
-            return;
-        }
-        let now = !active.load(Ordering::Relaxed);
-        active.store(now, Ordering::Relaxed);
-        crate::journal::write(if now {
-            "resumed by shortcut"
-        } else {
-            "paused by shortcut"
-        });
-    });
-
-    let monitor =
-        NSEvent::addGlobalMonitorForEventsMatchingMask_handler(NSEventMask::KeyDown, &handler);
-    Some(Watch { _monitor: monitor, _handler: handler })
-}
-
-/// Watches this application's own key presses, for capturing a shortcut.
+/// Starts watching for `shortcut`, flipping `active` when it arrives.
 ///
-/// A local monitor rather than a global one: it only sees events aimed at
-/// Minion, which while the preferences window has focus is exactly the
-/// keystroke being offered. It swallows the event, or pressing ⌘Q to set a
-/// shortcut would also quit something.
-pub fn capture_next<F>(handle: F) -> LocalWatch
-where
-    F: Fn(u16, Mods) -> bool + 'static,
-{
-    // Returns a raw pointer: null to swallow the event, or the event itself
-    // to pass it on. AppKit does not take ownership of what comes back.
-    let handler = RcBlock::new(move |event: std::ptr::NonNull<NSEvent>| -> *mut NSEvent {
-        let borrowed = unsafe { event.as_ref() };
-        let flags = borrowed.modifierFlags();
-        let mods = Mods {
-            command: flags.contains(NSEventModifierFlags::Command),
-            shift: flags.contains(NSEventModifierFlags::Shift),
-            option: flags.contains(NSEventModifierFlags::Option),
-            control: flags.contains(NSEventModifierFlags::Control),
-        };
-        if handle(borrowed.keyCode(), mods) {
-            return std::ptr::null_mut(); // taken: do not pass it on
-        }
-        event.as_ptr()
-    });
-    let monitor = unsafe {
-        NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::KeyDown, &handler)
+/// Returns whether the shortcut could be read. The thread runs for the life
+/// of the process.
+pub fn watch(shortcut: &str, active: Arc<AtomicBool>) -> bool {
+    let Some((code, mods)) = crate::actions::parse_shortcut(shortcut) else {
+        return false;
     };
-    LocalWatch { _monitor: monitor, _handler: handler }
-}
 
-pub struct LocalWatch {
-    _monitor: Option<objc2::rc::Retained<objc2::runtime::AnyObject>>,
-    _handler: RcBlock<dyn Fn(std::ptr::NonNull<NSEvent>) -> *mut NSEvent>,
+    std::thread::spawn(move || {
+        let tap = CGEventTap::new(
+            CGEventTapLocation::Session,
+            CGEventTapPlacement::HeadInsertEventTap,
+            // Listening only: the keystroke still reaches whatever has
+            // focus, so the combination is shared rather than claimed.
+            CGEventTapOptions::ListenOnly,
+            vec![CGEventType::KeyDown],
+            move |_proxy, _type, event| {
+                let pressed = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
+                if pressed != i64::from(code) || !modifiers_match(event.get_flags().bits(), mods)
+                {
+                    return CallbackResult::Keep;
+                }
+                let now = !active.load(Ordering::Relaxed);
+                active.store(now, Ordering::Relaxed);
+                crate::journal::write(if now {
+                    "resumed by shortcut"
+                } else {
+                    "paused by shortcut"
+                });
+                // Kept, not dropped: the combination still reaches whatever
+                // has focus, so Minion shares it rather than claiming it.
+                CallbackResult::Keep
+            },
+        );
+
+        let Ok(tap) = tap else {
+            crate::journal::write(
+                "Could not watch the shortcut: macOS refused the event tap. \
+                 Accessibility permission is required.",
+            );
+            return;
+        };
+
+        // Its own run loop, on its own thread. This is the whole point: the
+        // main one belongs to the menu bar.
+        let source = tap.mach_port().create_runloop_source(0);
+        let Ok(source) = source else {
+            crate::journal::write("Could not attach the shortcut watcher.");
+            return;
+        };
+        let run_loop = CFRunLoop::get_current();
+        unsafe { run_loop.add_source(&source, kCFRunLoopCommonModes) };
+        tap.enable();
+        CFRunLoop::run_current();
+    });
+
+    true
 }
 
 /// Whether the event's modifiers are exactly the ones wanted.
 ///
 /// Exactly, not merely including: otherwise ⌥Space would also fire on
 /// ⌥⌘Space, which belongs to something else.
-fn modifiers_match(flags: NSEventModifierFlags, wanted: Mods) -> bool {
-    let held = |flag: NSEventModifierFlags| flags.contains(flag);
-    held(NSEventModifierFlags::Command) == wanted.command
-        && held(NSEventModifierFlags::Shift) == wanted.shift
-        && held(NSEventModifierFlags::Option) == wanted.option
-        && held(NSEventModifierFlags::Control) == wanted.control
+fn modifiers_match(bits: u64, wanted: Mods) -> bool {
+    let held = |bit: u64| bits & bit != 0;
+    held(flags::COMMAND) == wanted.command
+        && held(flags::SHIFT) == wanted.shift
+        && held(flags::OPTION) == wanted.option
+        && held(flags::CONTROL) == wanted.control
 }
 
 #[cfg(test)]
@@ -110,18 +110,22 @@ mod tests {
 
     #[test]
     fn modifiers_must_match_exactly() {
-        let option_only = NSEventModifierFlags::Option;
         let wanted = Mods { option: true, ..Mods::NONE };
-        assert!(modifiers_match(option_only, wanted));
-
+        assert!(modifiers_match(flags::OPTION, wanted));
         // An extra modifier belongs to a different shortcut.
-        let option_and_command = NSEventModifierFlags::Option | NSEventModifierFlags::Command;
-        assert!(!modifiers_match(option_and_command, wanted));
+        assert!(!modifiers_match(flags::OPTION | flags::COMMAND, wanted));
     }
 
     #[test]
     fn a_missing_modifier_does_not_match() {
         let wanted = Mods { option: true, ..Mods::NONE };
-        assert!(!modifiers_match(NSEventModifierFlags::empty(), wanted));
+        assert!(!modifiers_match(0, wanted));
+    }
+
+    #[test]
+    fn every_modifier_is_recognised() {
+        let all = Mods { command: true, shift: true, option: true, control: true };
+        let bits = flags::COMMAND | flags::SHIFT | flags::OPTION | flags::CONTROL;
+        assert!(modifiers_match(bits, all));
     }
 }

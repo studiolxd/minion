@@ -25,7 +25,12 @@ use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 use crate::{config, startup};
 
 const WIDTH: f64 = 380.0;
-const HEIGHT: f64 = 470.0;
+/// Tall enough for the last hint to sit clear of the bottom edge.
+///
+/// The layout runs downwards from the top, so the window has to be as tall
+/// as everything in it plus a margin; too short and the final line simply
+/// falls off, which is what it did.
+const HEIGHT: f64 = 516.0;
 const MARGIN: f64 = 22.0;
 
 /// A slider's range and the setting behind it.
@@ -515,6 +520,44 @@ fn save_audio(key: &str, value: &str) {
     } else {
         crate::journal::write(&format!("audio.{key} = {value}"));
     }
+}
+
+/// Watches this application's own key presses, for capturing a shortcut.
+///
+/// A local monitor, unlike the global watcher in `hotkey`: it only sees
+/// events already aimed at Minion, so it cannot interfere with anything
+/// else, and the preferences window has focus while it is open.
+pub fn capture_keys<F>(handle: F) -> KeyCapture
+where
+    F: Fn(u16, crate::actions::Mods) -> bool + 'static,
+{
+    use objc2_app_kit::{NSEvent, NSEventMask, NSEventModifierFlags};
+
+    let handler = block2::RcBlock::new(
+        move |event: std::ptr::NonNull<NSEvent>| -> *mut NSEvent {
+            let borrowed = unsafe { event.as_ref() };
+            let flags = borrowed.modifierFlags();
+            let mods = crate::actions::Mods {
+                command: flags.contains(NSEventModifierFlags::Command),
+                shift: flags.contains(NSEventModifierFlags::Shift),
+                option: flags.contains(NSEventModifierFlags::Option),
+                control: flags.contains(NSEventModifierFlags::Control),
+            };
+            if handle(borrowed.keyCode(), mods) {
+                return std::ptr::null_mut(); // taken: do not pass it on
+            }
+            event.as_ptr()
+        },
+    );
+    let monitor = unsafe {
+        NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::KeyDown, &handler)
+    };
+    KeyCapture { _monitor: monitor, _handler: handler }
+}
+
+pub struct KeyCapture {
+    _monitor: Option<Retained<objc2::runtime::AnyObject>>,
+    _handler: block2::RcBlock<dyn Fn(std::ptr::NonNull<objc2_app_kit::NSEvent>) -> *mut objc2_app_kit::NSEvent>,
 }
 
 /// A window showing text, with the usual close button.
