@@ -16,6 +16,7 @@ mod fbank;
 mod icon;
 mod journal;
 mod learn;
+mod preferences;
 mod spanish;
 mod startup;
 mod speaker;
@@ -36,7 +37,7 @@ use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 use objc2_foundation::NSTimer;
 use ort::session::builder::SessionBuilder;
 use parakeet_rs::{ExecutionConfig, ParakeetTDT, Transcriber};
-use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
+use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::TrayIconBuilder;
 
 use commands::Decision;
@@ -390,51 +391,34 @@ fn run_menu_bar(
     // Accessory: menu bar only, no Dock icon and no window.
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 
-    let settings = config::load();
-
     let menu = Menu::new();
     // One item for one piece of state. Two — "Escuchar" and "Pausar" — made
     // the reader work out which one applied right now.
     let toggle = MenuItem::new(MENU_PAUSE, true, None);
     let learn = MenuItem::new("Aprender del registro…", true, None);
 
-    // Settings that are worth changing without opening a file. Anything
-    // with a number — thresholds, timings — stays in config.toml, where
-    // there is room to explain what the number means.
-    let options = Submenu::new("Opciones", true);
-    let sounds = CheckMenuItem::new("Sonido al ejecutar", true, settings.sounds, None);
-    let log_voices = CheckMenuItem::new(
-        "Registrar voces ajenas",
-        true,
-        settings.log_ignored_speech,
-        None,
-    );
-    let at_login = CheckMenuItem::new("Abrir al iniciar sesión", true, startup::enabled(), None);
+    let preferences = MenuItem::new("Preferencias…", true, None);
     let show_log = MenuItem::new("Ver el registro", true, None);
-    let edit_config = MenuItem::new("Editar la configuración…", true, None);
-    options.append(&sounds)?;
-    options.append(&log_voices)?;
-    options.append(&at_login)?;
-    options.append(&PredefinedMenuItem::separator())?;
-    options.append(&show_log)?;
-    options.append(&edit_config)?;
-
     let quit = MenuItem::new("Salir de Minion", true, None);
     menu.append(&toggle)?;
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&learn)?;
-    menu.append(&options)?;
+    menu.append(&preferences)?;
+    menu.append(&show_log)?;
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&quit)?;
 
     let toggle_id = toggle.id().clone();
     let learn_id = learn.id().clone();
-    let sounds_id = sounds.id().clone();
-    let log_voices_id = log_voices.id().clone();
-    let at_login_id = at_login.id().clone();
+    let preferences_id = preferences.id().clone();
     let show_log_id = show_log.id().clone();
-    let edit_config_id = edit_config.id().clone();
     let quit_id = quit.id().clone();
+
+    // Built once and reused: reopening should bring back the same window,
+    // not stack another one behind it.
+    let panel = Rc::new(preferences::Preferences::new(mtm));
+    // Requests from the menu thread, which must not touch AppKit itself.
+    let open_requested = Arc::new(AtomicBool::new(false));
 
     // Held for the lifetime of the process: dropping it removes the icon.
     let tray = Rc::new(
@@ -456,7 +440,20 @@ fn run_menu_bar(
     let toggle_for_timer = toggle.clone();
     let active_for_timer = Arc::clone(&active);
     let shown_as_listening = Cell::new(true);
+    let panel_for_timer = Rc::clone(&panel);
+    let open_for_timer = Arc::clone(&open_requested);
+    let sounds_for_timer = Arc::clone(&sounds_on);
+    let voices_for_timer = Arc::clone(&log_voices_on);
     let repaint = RcBlock::new(move |_timer: NonNull<NSTimer>| {
+        if open_for_timer.swap(false, Ordering::Relaxed) {
+            panel_for_timer.show();
+        }
+        // Controls report by being read: see preferences.rs for why.
+        if panel_for_timer.poll() {
+            sounds_for_timer.store(panel_for_timer.sounds_on(), Ordering::Relaxed);
+            voices_for_timer.store(panel_for_timer.log_voices_on(), Ordering::Relaxed);
+        }
+
         let listening = active_for_timer.load(Ordering::Relaxed);
         if listening == shown_as_listening.get() {
             return;
@@ -481,6 +478,7 @@ fn run_menu_bar(
     // Menu events arrive on a global channel, which is Send, so they can be
     // serviced from another thread while AppKit owns the main one. The icon
     // and the item's text are repainted by the timer above, not from here.
+    let open_from_menu = Arc::clone(&open_requested);
     std::thread::spawn(move || {
         let events = MenuEvent::receiver();
         while let Ok(event) = events.recv() {
@@ -493,22 +491,9 @@ fn run_menu_bar(
                 );
             } else if event.id == learn_id {
                 show_lesson();
-            } else if event.id == sounds_id {
-                let on = !sounds_on.load(Ordering::Relaxed);
-                sounds_on.store(on, Ordering::Relaxed);
-                save_option("sounds", on);
-            } else if event.id == log_voices_id {
-                let on = !log_voices_on.load(Ordering::Relaxed);
-                log_voices_on.store(on, Ordering::Relaxed);
-                save_option("log_ignored_speech", on);
-            } else if event.id == at_login_id {
-                let on = !startup::enabled();
-                match startup::set(on) {
-                    Ok(()) => note!("start at login: {on}"),
-                    Err(e) => actions::show_message(&format!("No se pudo cambiar: {e}")),
-                }
-            } else if event.id == edit_config_id {
-                open_config();
+            } else if event.id == preferences_id {
+                // Windows belong to the main thread; the timer opens it.
+                open_from_menu.store(true, Ordering::Relaxed);
             } else if event.id == show_log_id {
                 if let Some(path) = journal::path() {
                     actions::reveal(&path.to_string_lossy());
@@ -522,35 +507,6 @@ fn run_menu_bar(
 
     app.run();
     Ok(())
-}
-
-/// Writes a switch back to the configuration file.
-fn save_option(key: &str, value: bool) {
-    match config::set_option(key, if value { "true" } else { "false" }) {
-        Ok(()) => note!("{key} = {value}"),
-        Err(e) => actions::show_message(&format!("No se pudo guardar «{key}»: {e}")),
-    }
-}
-
-/// Opens the configuration file, creating it from the example if missing.
-fn open_config() {
-    let Some(path) = config::path() else {
-        return;
-    };
-    if !path.exists() {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(
-            &path,
-            "# Configuración de Minion. Todo es opcional.\n\
-             # El ejemplo completo está en config.example.toml del proyecto.\n",
-        );
-    }
-    let _ = std::process::Command::new("/usr/bin/open")
-        .arg("-t")
-        .arg(&path)
-        .spawn();
 }
 
 /// Shows what the log has to teach, and offers to apply it.

@@ -154,6 +154,52 @@ pub fn path() -> Option<PathBuf> {
     Some(PathBuf::from(home).join("Library/Application Support/Minion/config.toml"))
 }
 
+/// Sets an option inside a table, such as `[audio]`.
+///
+/// Same care as [`set_option`]: the file is edited, not regenerated, so the
+/// comments survive. Creates the table if it is not there yet.
+pub fn set_table_option(table: &str, key: &str, value: &str) -> Result<(), String> {
+    let path = path().ok_or("no home directory")?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let header = format!("[{table}]");
+
+    let mut lines: Vec<String> = existing.lines().map(str::to_string).collect();
+    let table_at = lines.iter().position(|l| l.trim() == header);
+
+    let Some(start) = table_at else {
+        // No such table: append it with the one setting in it.
+        if !lines.last().is_some_and(|l| l.trim().is_empty()) {
+            lines.push(String::new());
+        }
+        lines.push(header);
+        lines.push(format!("{key} = {value}"));
+        return std::fs::write(&path, lines.join("\n") + "\n").map_err(|e| e.to_string());
+    };
+
+    // The table runs until the next header.
+    let end = lines
+        .iter()
+        .skip(start + 1)
+        .position(|l| l.trim_start().starts_with('['))
+        .map_or(lines.len(), |offset| start + 1 + offset);
+
+    let existing_key = (start + 1..end).find(|i| {
+        lines[*i]
+            .split('=')
+            .next()
+            .is_some_and(|name| name.trim() == key)
+    });
+
+    match existing_key {
+        Some(i) => lines[i] = format!("{key} = {value}"),
+        None => lines.insert(end, format!("{key} = {value}")),
+    }
+    std::fs::write(&path, lines.join("\n") + "\n").map_err(|e| e.to_string())
+}
+
 /// Sets one top-level option, preserving everything else.
 ///
 /// Rewrites the line if it is there and appends it otherwise, rather than
@@ -248,6 +294,13 @@ impl Config {
                 ),
             })
             .collect()
+    }
+
+    /// Confidence a phrase needs before it is acted on.
+    pub fn command_threshold(&self) -> f32 {
+        self.threshold
+            .unwrap_or(crate::commands::DEFAULT_THRESHOLD)
+            .clamp(0.3, 1.0)
     }
 
     /// How alike a voice must sound before it is obeyed.

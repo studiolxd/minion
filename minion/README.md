@@ -9,17 +9,39 @@ Control your Mac by speaking Spanish. Always listening, entirely offline.
 ```
 
 Lives in the menu bar as a small face — eye open while listening, eye shut
-and mouth turned down when paused. No Dock icon, no window.
+when paused. No Dock icon.
 
 The menu holds one toggle (Pausar / Escuchar), *Aprender del registro…*,
-an **Opciones** submenu, and Salir. Options covers the switches worth
-flipping without opening a file — sound, logging other voices, starting at
-login — plus shortcuts to the log and the configuration. Anything with a
-number in it stays in `config.toml`, where there is room to explain what
-the number means.
+*Preferencias…*, *Ver el registro*, and Salir.
 
-The icon is drawn once as SVG and rendered both for the menu bar and for
-the app itself, so the two cannot drift apart.
+The icon is a template image drawn once as SVG, rendered for the menu bar
+at run time and for the app at build time, so the two cannot drift apart.
+macOS tints it from its alpha, black on a light bar and white on a dark one.
+
+## Preferences
+
+A native window, opened from the menu. It covers what is worth changing
+without reading documentation:
+
+- sound on running a command
+- whether other people's speech is written to the log
+- starting at login
+- **sensibilidad** — how sure Minion must be before acting, as words rather
+  than a number: nobody wants to type 0.72, they want it to be less touchy
+- **pausa que cierra una frase** — longer if it cuts you off while thinking
+- **liberar memoria** — idle minutes before the model is released
+
+The controls report by being read rather than by calling back. AppKit
+delivers actions to an Objective-C target, which from Rust means declaring
+a class — the most delicate part of the bridge, for a panel that changes at
+human speed. The run loop timer that already repaints the menu bar reads
+them a few times a second and writes through whatever moved. It also means
+the window follows along when a setting changes elsewhere.
+
+Everything else still lives in `config.toml`, which the window edits
+without disturbing: the file keeps its comments, and settings the window
+does not cover — wake words, extra applications, aliases, your own
+commands — are only there.
 
 ## Why
 
