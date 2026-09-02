@@ -55,7 +55,7 @@ pub struct Config {
 
     /// Extra ways of saying commands that already exist.
     ///
-    /// This is where `oyente aprender` writes what it learned from the log,
+    /// This is where `oyente learn` writes what it learned from the log,
     /// and where you add a phrasing the recogniser keeps producing.
     #[serde(default)]
     pub aliases: Vec<AliasConfig>,

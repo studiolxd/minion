@@ -709,7 +709,7 @@ pub fn is_sleep(decision: &Decision) -> bool {
 
 /// The command a phrase most resembles, ignoring the confidence threshold.
 ///
-/// Used by `oyente aprender` to suggest what a misheard phrase was probably
+/// Used by `oyente learn` to suggest what a misheard phrase was probably
 /// meant to be. Deliberately separate from [`decide_in`]: this one always
 /// answers, which is useful for a suggestion and dangerous for an action.
 pub fn closest_command(phrase: &str) -> Option<(&'static str, f32)> {

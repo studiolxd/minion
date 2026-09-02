@@ -281,12 +281,12 @@ quit the app.
 
 ## Learning from its own mistakes
 
-Every phrase Oyente failed to understand is in the log. `oyente aprender`
+Every phrase Oyente failed to understand is in the log. `oyente learn`
 reads them back, works out what each was probably meant to be, and offers
 to add it as an alias:
 
 ```bash
-/Applications/Oyente.app/Contents/MacOS/oyente aprender
+/Applications/Oyente.app/Contents/MacOS/oyente learn
 ```
 
 ```
@@ -300,7 +300,7 @@ No command resembles these — they may need a new one:
   «Ordenador reproduce la canción vértigo.»
 ```
 
-`--aplicar` writes the first group into `config.toml` as aliases. The
+`--apply` writes the first group into `config.toml` as aliases. The
 second group is the useful half: it is the list of things the vocabulary
 does not cover yet.
 

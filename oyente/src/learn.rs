@@ -5,7 +5,7 @@
 //! add it to the configuration as an alias — so the same mistake is only
 //! made once.
 //!
-//! Run with `oyente aprender`, or `oyente aprender --aplicar` to write.
+//! Run with `oyente learn`, or `oyente learn --apply` to write.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -147,7 +147,7 @@ pub fn run(config: &config::Config, apply: bool) {
 
     if !apply {
         println!(
-            "\nRun `oyente aprender --aplicar` to add the first group as aliases."
+            "\nRun `oyente learn --apply` to add the first group as aliases."
         );
         return;
     }
@@ -165,7 +165,7 @@ pub fn run(config: &config::Config, apply: bool) {
         let _ = fs::create_dir_all(parent);
     }
 
-    let mut addition = String::from("\n# Learned from the log by `oyente aprender`.\n");
+    let mut addition = String::from("\n# Learned from the log by `oyente learn`.\n");
     for candidate in &worth_teaching {
         let phrase = without_wake_word(&candidate.phrase);
         let _ = write!(
