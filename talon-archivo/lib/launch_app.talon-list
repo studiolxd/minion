@@ -1,8 +1,0 @@
-list: user.launch_app
--
-chrome: com.google.Chrome
-browser: com.google.Chrome
-safari: com.apple.Safari
-orca: com.stablyai.orca
-terminal: com.apple.Terminal
-talon: com.talonvoice.Talon
