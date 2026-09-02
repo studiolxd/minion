@@ -10,7 +10,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+
+use chrono::Local;
 
 /// Rotate once the file passes this, keeping one previous copy.
 const MAX_BYTES: u64 = 5 * 1024 * 1024;
@@ -43,17 +44,13 @@ fn handle() -> Option<&'static Mutex<File>> {
     .as_ref()
 }
 
-/// Seconds since the epoch, as a wall-clock time of day.
+/// Local date and time.
 ///
-/// Deliberately not a date library: the log is read within the session that
-/// produced it, so hours, minutes and seconds are enough.
+/// Both parts matter. The log outlives the session that wrote it, so a bare
+/// time of day is ambiguous the next morning — and it has to be local time,
+/// or the timestamps disagree with the clock in the menu bar.
 fn timestamp() -> String {
-    let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else {
-        return "--:--:--".into();
-    };
-    let secs = now.as_secs();
-    let day = secs % 86_400;
-    format!("{:02}:{:02}:{:02}", day / 3600, (day % 3600) / 60, day % 60)
+    Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
 /// Writes one line to the log and to stdout.

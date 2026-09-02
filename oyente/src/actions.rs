@@ -36,8 +36,12 @@ pub mod key {
     pub const L: u16 = 37;
     pub const M: u16 = 46;
     pub const N: u16 = 45;
+    pub const DIGIT_1: u16 = 18;
+    pub const DIGIT_2: u16 = 19;
     pub const DIGIT_3: u16 = 20;
     pub const DIGIT_4: u16 = 21;
+    pub const DIGIT_5: u16 = 23;
+    pub const DIGIT_9: u16 = 25;
     pub const TAB: u16 = 48;
     pub const SPACE: u16 = 49;
     pub const DELETE: u16 = 51;
@@ -62,6 +66,7 @@ impl Mods {
     pub const CMD_SHIFT: Mods = Mods::new(true, true, false, false);
     pub const CTRL: Mods = Mods::new(false, false, false, true);
     pub const CTRL_CMD: Mods = Mods::new(true, false, false, true);
+    pub const CTRL_SHIFT: Mods = Mods::new(false, true, false, true);
 
     const fn new(command: bool, shift: bool, option: bool, control: bool) -> Self {
         Self { command, shift, option, control }
@@ -91,6 +96,12 @@ impl Mods {
 /// events are simply swallowed, which is macOS's most baffling failure
 /// mode. Check [`has_accessibility_permission`] at startup instead.
 pub fn press(code: u16, mods: Mods) -> bool {
+    // Checked here rather than only at startup: the permission can be
+    // granted while Oyente is running and takes effect immediately, so a
+    // one-off check at launch goes stale the moment the user turns it on.
+    if !has_accessibility_permission() {
+        return false;
+    }
     let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
         return false;
     };

@@ -166,6 +166,22 @@ pub const COMMANDS: &[Command] = &[
               action: Action::Key(key::T, Mods::CMD_SHIFT) },
     Command { phrases: &["pasa a la siguiente pestana", "siguiente pestana"], name: "pestaña siguiente",
               action: Action::Key(key::TAB, Mods::CTRL) },
+    Command { phrases: &["vuelve a la pestana anterior", "pestana anterior"], name: "pestaña anterior",
+              action: Action::Key(key::TAB, Mods::CTRL_SHIFT) },
+    // Ir a una pestaña concreta. El reconocedor devuelve el número como
+    // dígito ("pestaña 1"), así que esa es la forma principal.
+    Command { phrases: &["pestana 1", "pestana uno", "primera pestana"], name: "pestaña 1",
+              action: Action::Key(key::DIGIT_1, Mods::CMD) },
+    Command { phrases: &["pestana 2", "pestana dos"], name: "pestaña 2",
+              action: Action::Key(key::DIGIT_2, Mods::CMD) },
+    Command { phrases: &["pestana 3", "pestana tres"], name: "pestaña 3",
+              action: Action::Key(key::DIGIT_3, Mods::CMD) },
+    Command { phrases: &["pestana 4", "pestana cuatro"], name: "pestaña 4",
+              action: Action::Key(key::DIGIT_4, Mods::CMD) },
+    Command { phrases: &["pestana 5", "pestana cinco"], name: "pestaña 5",
+              action: Action::Key(key::DIGIT_5, Mods::CMD) },
+    Command { phrases: &["ultima pestana", "pestana final"], name: "última pestaña",
+              action: Action::Key(key::DIGIT_9, Mods::CMD) },
 
     // --- Windows ---
     Command { phrases: &["cierra la ventana"], name: "cerrar ventana",
@@ -180,9 +196,9 @@ pub const COMMANDS: &[Command] = &[
               action: Action::Key(key::H, Mods::CMD) },
 
     // --- Navigation ---
-    Command { phrases: &["vuelve atras"], name: "atrás",
+    Command { phrases: &["vuelve atras", "pagina anterior", "pagina atras"], name: "atrás",
               action: Action::Key(key::LEFT, Mods::CMD) },
-    Command { phrases: &["ve hacia adelante", "ve adelante"], name: "adelante",
+    Command { phrases: &["ve hacia adelante", "ve adelante", "pagina siguiente"], name: "adelante",
               action: Action::Key(key::RIGHT, Mods::CMD) },
     Command { phrases: &["recarga la pagina", "recarga"], name: "recargar",
               action: Action::Key(key::R, Mods::CMD) },
@@ -331,27 +347,35 @@ pub fn decide(transcript: &str) -> (Decision, f32) {
     }
 }
 
-/// Carries out a decision. Returns a description of what was done.
-pub fn perform(decision: &Decision) -> Option<String> {
+/// The result of carrying out a decision.
+pub struct Done {
+    pub description: String,
+    /// False when the action was refused by the system — in practice, a
+    /// keystroke dropped for want of Accessibility permission.
+    pub succeeded: bool,
+}
+
+/// Carries out a decision. Returns what was done, and whether it worked.
+pub fn perform(decision: &Decision) -> Option<Done> {
     match decision {
-        Decision::Launch { name, bundle_id } => {
-            actions::open_app(bundle_id);
-            Some(format!("abrir {name}"))
-        }
-        Decision::Quit { name, bundle_id } => {
-            actions::quit_app(bundle_id);
-            Some(format!("cerrar {name}"))
-        }
+        Decision::Launch { name, bundle_id } => Some(Done {
+            description: format!("abrir {name}"),
+            succeeded: actions::open_app(bundle_id),
+        }),
+        Decision::Quit { name, bundle_id } => Some(Done {
+            description: format!("cerrar {name}"),
+            succeeded: actions::quit_app(bundle_id),
+        }),
         Decision::Run(name) => {
             let command = COMMANDS.iter().find(|c| c.name == *name)?;
-            match command.action {
+            let succeeded = match command.action {
                 Action::Key(code, mods) => actions::press(code, mods),
                 Action::Volume(delta) => actions::adjust_volume(delta),
                 Action::Mute(muted) => actions::set_muted(muted),
                 Action::Script(script) => actions::applescript(script),
                 Action::Sleep => true,
             };
-            Some((*name).to_string())
+            Some(Done { description: (*name).to_string(), succeeded })
         }
         _ => None,
     }
@@ -493,6 +517,25 @@ mod tests {
                        "vete a chrome", "cambia a chrome", "ponme chrome",
                        "traeme chrome", "saca chrome", "abrir chrome"] {
             launches(&format!("ordenador {spoken}"), "Chrome");
+        }
+    }
+
+    #[test]
+    fn phrases_that_failed_in_the_log_now_work() {
+        // Straight from ~/Library/Logs/oyente.log, where each of these came
+        // back "not understood".
+        let cases: &[(&str, &str)] = &[
+            ("ordenador pestaña anterior", "pestaña anterior"),
+            ("Ordenador pestaña 1.", "pestaña 1"),
+            ("Ordenador página atrás.", "atrás"),
+            ("Ordenador página anterior.", "atrás"),
+            ("Ordenador página siguiente.", "adelante"),
+        ];
+        for (spoken, expected) in cases {
+            match decide(spoken).0 {
+                Decision::Run(name) if name == *expected => {}
+                other => panic!("«{spoken}» should be «{expected}», got {other:?}"),
+            }
         }
     }
 

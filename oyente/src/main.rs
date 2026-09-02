@@ -95,6 +95,7 @@ fn listen_and_obey(
     model_path: String,
     settings: audio::Settings,
     log_ignored_speech: bool,
+    play_sounds: bool,
     active: Arc<AtomicBool>,
 ) -> Result<()> {
     let mut model = ParakeetTDT::from_pretrained(&model_path, None)
@@ -144,16 +145,34 @@ fn listen_and_obey(
             }
             Decision::Unrecognised => {
                 note!("unknown  «{transcript}»  ->  not understood");
-                actions::play_sound(sounds::UNSURE);
+                if play_sounds {
+                    actions::play_sound(sounds::UNSURE);
+                }
             }
             _ => {
-                if let Some(description) = commands::perform(&decision) {
-                    note!(
-                        "ran      «{transcript}»  ->  {description}  \
-                         [{:.0}% · {seconds:.1}s audio · {elapsed_ms} ms]",
-                        confidence * 100.0
-                    );
-                    actions::play_sound(sounds::DONE);
+                if let Some(done) = commands::perform(&decision) {
+                    if done.succeeded {
+                        note!(
+                            "ran      «{transcript}»  ->  {}  \
+                             [{:.0}% · {seconds:.1}s audio · {elapsed_ms} ms]",
+                            done.description,
+                            confidence * 100.0
+                        );
+                        if play_sounds {
+                            actions::play_sound(sounds::DONE);
+                        }
+                    } else {
+                        // Understood perfectly and refused by the system.
+                        // Almost always the Accessibility permission.
+                        note!(
+                            "BLOCKED  «{transcript}»  ->  {}  — macOS refused it. \
+                             Grant Accessibility in System Settings.",
+                            done.description
+                        );
+                        if play_sounds {
+                            actions::play_sound(sounds::UNSURE);
+                        }
+                    }
                 }
                 if commands::is_sleep(&decision) {
                     active.store(false, Ordering::Relaxed);
@@ -259,8 +278,14 @@ fn report_permissions() {
          work; anything that presses keys (copy, save, close tab) will be \
          silently ignored by macOS."
     );
+    // Ask macOS to prompt. This is the call that registers Oyente with the
+    // system, so that there is a switch to turn on when the pane opens —
+    // an app that never asked simply is not in the list.
+    actions::request_accessibility_permission();
     println!(
-        "\n  Grant it in System Settings → Privacy & Security → Accessibility,\n           then restart Oyente. Opening that pane now…\n"
+        "\n  Accept the dialog, or switch Oyente on in System Settings →\n  \
+         Privacy & Security → Accessibility. Then restart Oyente from the\n  \
+         menu bar: the permission is only read at startup.\n"
     );
     actions::open_accessibility_settings();
 }
@@ -272,6 +297,7 @@ fn main() -> Result<()> {
     commands::configure(&config);
     let audio_settings = config.audio_settings();
     let log_ignored = config.log_ignored_speech;
+    let play_sounds = config.sounds;
 
     note!("Oyente starting — loading model…");
     if let Some(log) = journal::path() {
@@ -286,6 +312,7 @@ fn main() -> Result<()> {
             model_path,
             audio_settings,
             log_ignored,
+            play_sounds,
             worker_active,
         ) {
             eprintln!("Error: {e:#}");

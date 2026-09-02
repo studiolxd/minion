@@ -13,7 +13,12 @@ use serde::Deserialize;
 use crate::audio;
 use crate::commands::App;
 
-#[derive(Debug, Default, Deserialize)]
+/// serde needs a function for a default of `true`.
+fn yes() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// Words that mark a sentence as a command. Replaces the defaults.
@@ -31,6 +36,15 @@ pub struct Config {
     /// seeing the exact wording is the whole point.
     #[serde(default)]
     pub log_ignored_speech: bool,
+
+    /// Play a short sound when a command runs, and another when a sentence
+    /// starting with the wake word is not understood.
+    ///
+    /// On by default: a command that succeeds produces no visible output of
+    /// its own, so without a sound there is no way to tell whether you were
+    /// heard. Turn it off once the commands are familiar.
+    #[serde(default = "yes")]
+    pub sounds: bool,
 
     #[serde(default)]
     pub audio: AudioConfig,
@@ -56,6 +70,19 @@ pub struct AppConfig {
     pub bundle_id: String,
     /// Ways of saying the name. Include what the recogniser really hears.
     pub aliases: Vec<String>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            wake_words: Vec::new(),
+            threshold: None,
+            log_ignored_speech: false,
+            sounds: true,
+            audio: AudioConfig::default(),
+            apps: Vec::new(),
+        }
+    }
 }
 
 /// Where the configuration file lives.
@@ -137,6 +164,14 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sounds_are_on_by_default_and_can_be_turned_off() {
+        let default: Config = toml::from_str("").expect("empty config should parse");
+        assert!(default.sounds);
+        let quiet: Config = toml::from_str("sounds = false").expect("should parse");
+        assert!(!quiet.sounds);
+    }
 
     #[test]
     fn overheard_speech_is_not_logged_by_default() {
