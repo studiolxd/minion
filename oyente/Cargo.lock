@@ -1719,6 +1719,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "block2",
+ "core-foundation",
  "core-graphics",
  "cpal",
  "objc2",

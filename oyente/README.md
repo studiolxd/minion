@@ -43,7 +43,16 @@ log, and opens the settings pane for you.
 
 The permission is granted **per binary**, so rebuilding invalidates it.
 Install to /Applications and grant it there, rather than granting it to a
-copy in the project folder that you will replace on the next build.
+copy in the project folder that you will replace on the next build. Keep
+one copy only: two bundles with the same name make it impossible to tell
+which one the switch in System Settings refers to.
+
+If the permission gets into a confused state:
+
+```bash
+tccutil reset Accessibility com.studiolxd.oyente
+open /Applications/Oyente.app     # asks again
+```
 
 Installing as an app matters for more than tidiness: macOS attributes
 permissions to whichever binary asks for them. Run from a terminal and the

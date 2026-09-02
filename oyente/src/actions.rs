@@ -7,6 +7,10 @@
 
 use std::process::Command;
 
+use core_foundation::base::TCFType;
+use core_foundation::boolean::CFBoolean;
+use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
+use core_foundation::string::CFString;
 use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation};
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 
@@ -159,6 +163,7 @@ pub fn play_sound(path: &str) {
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
     fn AXIsProcessTrusted() -> bool;
+    fn AXIsProcessTrustedWithOptions(options: CFDictionaryRef) -> bool;
 }
 
 /// Whether macOS will actually deliver the key events we post.
@@ -169,6 +174,26 @@ unsafe extern "C" {
 /// startup rather than leaving someone wondering why ⌘W does nothing.
 pub fn has_accessibility_permission() -> bool {
     unsafe { AXIsProcessTrusted() }
+}
+
+/// Asks macOS to prompt for Accessibility, and reports whether it is held.
+///
+/// This is the part that matters: merely opening the settings pane leaves
+/// the user hunting for an app that is not in the list yet. Calling
+/// `AXIsProcessTrustedWithOptions` with the prompt option makes macOS show
+/// its own dialog and register the app, so there is a switch to turn on.
+///
+/// The prompt appears only once per app per login session; afterwards this
+/// behaves like [`has_accessibility_permission`].
+pub fn request_accessibility_permission() -> bool {
+    // The constant's value is this string; using it directly avoids linking
+    // against the exported symbol.
+    let prompt_key = CFString::from_static_string("AXTrustedCheckOptionPrompt");
+    let options = CFDictionary::from_CFType_pairs(&[(
+        prompt_key.as_CFType(),
+        CFBoolean::true_value().as_CFType(),
+    )]);
+    unsafe { AXIsProcessTrustedWithOptions(options.as_concrete_TypeRef()) }
 }
 
 /// Opens the Accessibility pane of System Settings.
