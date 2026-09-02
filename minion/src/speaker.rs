@@ -91,7 +91,7 @@ pub fn similarity(a: &[f32], b: &[f32]) -> f32 {
 /// Where the enrolled voice is kept.
 pub fn profile_path() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join("Library/Application Support/Oyente/voice.txt"))
+    Some(PathBuf::from(home).join("Library/Application Support/Minion/voice.txt"))
 }
 
 /// Reads the enrolled voice, if there is one.

@@ -14,8 +14,10 @@ use crate::spanish;
 use crate::text::{keywords, normalise, similarity};
 
 /// Words that mark a sentence as a command. Only counted at the start.
-pub const DEFAULT_WAKE_WORDS: &[&str] =
-    &["ordenador", "ordenadora", "computador", "computadora"];
+/// Includes what the recogniser actually produces for the name, not just
+/// its spelling: said in Spanish it comes out as "minion", "minión" or
+/// "miñón", and normalisation flattens the accents but not the ñ.
+pub const DEFAULT_WAKE_WORDS: &[&str] = &["minion", "minions", "minon", "miñon"];
 
 /// Set once at startup from the configuration file. Absent means defaults.
 static USER_APPS: OnceLock<Vec<App>> = OnceLock::new();
@@ -350,7 +352,7 @@ pub const COMMANDS: &[Command] = &[
     Command { phrases: &["pon la cancion anterior", "cancion anterior"], name: "canción anterior",
               action: Action::Script("tell application \"Spotify\" to previous track") },
 
-    // --- Oyente itself ---
+    // --- Minion itself ---
     Command { phrases: &["deja de escuchar"], name: "dormir",
               action: Action::Sleep },
 ];
@@ -436,7 +438,7 @@ fn repeat_request(rest: &str) -> Option<usize> {
 /// Splits a sentence that holds more than one instruction.
 ///
 /// The wake word is carried onto each part, since only the first was
-/// spoken with it: "ordenador cierra la pestaña y luego recarga" becomes
+/// spoken with it: "minion cierra la pestaña y luego recarga" becomes
 /// two sentences that each stand on their own.
 pub fn split_chain(transcript: &str) -> Vec<String> {
     let lowered = transcript.to_lowercase();
@@ -701,7 +703,7 @@ pub fn decide_in(transcript: &str, context: Option<&str>) -> (Decision, f32) {
                 score,
             );
         }
-        // Named without a verb ("ordenador, Safari") still means open it.
+        // Named without a verb ("minion, Safari") still means open it.
         let named_outright = score > 0.85 && leading_verb.is_none_or(|v| !spanish::is_known_verb(v));
         if (asks_to_open || named_outright) && !other_verb && app_wins {
             return (
@@ -788,14 +790,14 @@ fn run_action(action: Action) -> bool {
     }
 }
 
-/// Whether this decision asks Oyente to stop listening.
+/// Whether this decision asks Minion to stop listening.
 pub fn is_sleep(decision: &Decision) -> bool {
     matches!(decision, Decision::Run(name) if *name == "dormir")
 }
 
 /// The command a phrase most resembles, ignoring the confidence threshold.
 ///
-/// Used by `oyente learn` to suggest what a misheard phrase was probably
+/// Used by `minion learn` to suggest what a misheard phrase was probably
 /// meant to be. Deliberately separate from [`decide_in`]: this one always
 /// answers, which is useful for a suggestion and dangerous for an action.
 pub fn closest_command(phrase: &str) -> Option<(&'static str, f32)> {
@@ -844,18 +846,18 @@ mod tests {
 
     #[test]
     fn launches_applications() {
-        launches("Ordenador, abre Chrome.", "Chrome");
-        launches("Ordenador, vete a Safari.", "Safari");
-        launches("Ordenador, tráeme la terminal.", "Terminal");
+        launches("Minion, abre Chrome.", "Chrome");
+        launches("Minion, vete a Safari.", "Safari");
+        launches("Minion, tráeme la terminal.", "Terminal");
         // Named outright, without a verb.
-        launches("Ordenador, Spotify.", "Spotify");
+        launches("Minion, Spotify.", "Spotify");
     }
 
     #[test]
     fn survives_recogniser_slips() {
         // Both seen in the real log.
-        launches("Ordenador Abrecrome.", "Chrome");
-        launches("ordenador abre cromo", "Chrome");
+        launches("Minion Abrecrome.", "Chrome");
+        launches("minion abre cromo", "Chrome");
     }
 
     fn quits(phrase: &str, expected: &str) {
@@ -869,26 +871,26 @@ mod tests {
     fn closes_applications() {
         // Straight from the log: these used to LAUNCH Safari, because
         // naming an application was enough regardless of the verb.
-        quits("Ordenador cierra Safari.", "Safari");
-        quits("Ordenador Cierra Safari.", "Safari");
-        quits("Ordenador Sal de Safari.", "Safari");
-        quits("ordenador cierra chrome", "Chrome");
-        quits("ordenador sal de spotify", "Spotify");
+        quits("Minion cierra Safari.", "Safari");
+        quits("Minion Cierra Safari.", "Safari");
+        quits("Minion Sal de Safari.", "Safari");
+        quits("minion cierra chrome", "Chrome");
+        quits("minion sal de spotify", "Spotify");
     }
 
     #[test]
     fn naming_an_app_does_not_override_the_verb() {
         // The window and tab commands must survive an app name nearby.
-        assert_eq!(decision("Ordenador cierra la pestaña."), Decision::Run("cerrar pestaña"));
-        assert_eq!(decision("Ordenador cierra la ventana."), Decision::Run("cerrar ventana"));
-        assert_eq!(decision("Ordenador minimiza la ventana."), Decision::Run("minimizar"));
+        assert_eq!(decision("Minion cierra la pestaña."), Decision::Run("cerrar pestaña"));
+        assert_eq!(decision("Minion cierra la ventana."), Decision::Run("cerrar ventana"));
+        assert_eq!(decision("Minion minimiza la ventana."), Decision::Run("minimizar"));
     }
 
     #[test]
     fn runs_table_commands() {
-        assert_eq!(decision("Ordenador, guarda esto."), Decision::Run("guardar"));
-        assert_eq!(decision("Ordenador, sube el volumen."), Decision::Run("subir volumen"));
-        assert_eq!(decision("Ordenador, pantalla completa."), Decision::Run("pantalla completa"));
+        assert_eq!(decision("Minion, guarda esto."), Decision::Run("guardar"));
+        assert_eq!(decision("Minion, sube el volumen."), Decision::Run("subir volumen"));
+        assert_eq!(decision("Minion, pantalla completa."), Decision::Run("pantalla completa"));
     }
 
     #[test]
@@ -905,8 +907,8 @@ mod tests {
     #[test]
     fn admits_when_it_does_not_understand() {
         // Better to do nothing than to guess.
-        assert_eq!(decision("Ordenador, haz un pino."), Decision::Unrecognised);
-        assert_eq!(decision("Ordenador, qué hora es."), Decision::Unrecognised);
+        assert_eq!(decision("Minion, haz un pino."), Decision::Unrecognised);
+        assert_eq!(decision("Minion, qué hora es."), Decision::Unrecognised);
     }
 
     #[test]
@@ -935,7 +937,7 @@ mod tests {
                 .iter()
                 .find(|c| c.phrases.contains(canonical))
                 .unwrap_or_else(|| panic!("«{canonical}» is not in the table"));
-            let heard = format!("ordenador {spoken}");
+            let heard = format!("minion {spoken}");
             match decide(&heard).0 {
                 Decision::Run(name) if name == expected.name => {}
                 other => panic!("«{spoken}» should reach «{}», got {other:?}", expected.name),
@@ -948,21 +950,21 @@ mod tests {
         for spoken in ["abre chrome", "abreme chrome", "ve a chrome",
                        "vete a chrome", "cambia a chrome", "ponme chrome",
                        "traeme chrome", "saca chrome", "abrir chrome"] {
-            launches(&format!("ordenador {spoken}"), "Chrome");
+            launches(&format!("minion {spoken}"), "Chrome");
         }
     }
 
     #[test]
     fn phrases_that_failed_in_the_log_now_work() {
-        // Straight from ~/Library/Logs/oyente.log, where each of these came
+        // Straight from ~/Library/Logs/minion.log, where each of these came
         // back "not understood".
         let cases: &[(&str, &str)] = &[
-            ("ordenador pestaña anterior", "pestaña anterior"),
-            ("Ordenador pestaña 1.", "pestaña 1"),
-            ("Ordenador página atrás.", "atrás"),
-            ("Ordenador página anterior.", "atrás"),
-            ("Ordenador página siguiente.", "adelante"),
-            ("Ordenador retroceder página.", "atrás"),
+            ("minion pestaña anterior", "pestaña anterior"),
+            ("Minion pestaña 1.", "pestaña 1"),
+            ("Minion página atrás.", "atrás"),
+            ("Minion página anterior.", "atrás"),
+            ("Minion página siguiente.", "adelante"),
+            ("Minion retroceder página.", "atrás"),
         ];
         for (spoken, expected) in cases {
             match decide(spoken).0 {
@@ -983,7 +985,7 @@ mod tests {
     fn a_link_opens_where_you_are_working() {
         // In a browser, the page belongs in that browser rather than in
         // whichever one the system considers default.
-        match decide_in("ordenador abre youtube", Some("com.google.Chrome")).0 {
+        match decide_in("minion abre youtube", Some("com.google.Chrome")).0 {
             Decision::Browse { in_browser, .. } => {
                 assert_eq!(in_browser, Some("com.google.Chrome"));
             }
@@ -991,7 +993,7 @@ mod tests {
         }
         // Outside a browser there is nothing to prefer, so the default wins.
         for elsewhere in [None, Some("com.apple.Terminal"), Some("com.apple.finder")] {
-            match decide_in("ordenador abre youtube", elsewhere).0 {
+            match decide_in("minion abre youtube", elsewhere).0 {
                 Decision::Browse { in_browser, .. } => {
                     assert_eq!(in_browser, None, "from {elsewhere:?}");
                 }
@@ -1003,37 +1005,37 @@ mod tests {
     #[test]
     fn opens_web_addresses() {
         // From the log: this came back not understood.
-        browses("Ordenador ir a google.com", "https://google.com");
-        browses("ordenador abre studiolxd.es", "https://studiolxd.es");
+        browses("Minion ir a google.com", "https://google.com");
+        browses("minion abre studiolxd.es", "https://studiolxd.es");
         // Spoken aloud, the dot becomes a word.
-        browses("ordenador ve a github punto com", "https://github.com");
+        browses("minion ve a github punto com", "https://github.com");
     }
 
     #[test]
     fn a_domain_needs_no_verb() {
         // From the log: the recogniser runs the words together, leaving no
         // verb to recognise — but ".com" makes the intent unmistakable.
-        browses("Ordenador abremarca.com", "https://abremarca.com");
-        browses("Ordenador iramarca.com", "https://iramarca.com");
-        browses("Ordenador ir a Marca.com", "https://marca.com");
+        browses("Minion abremarca.com", "https://abremarca.com");
+        browses("Minion iramarca.com", "https://iramarca.com");
+        browses("Minion ir a Marca.com", "https://marca.com");
     }
 
     #[test]
     fn the_wake_word_alone_is_not_an_error() {
-        assert_eq!(decision("Ordenador."), Decision::Ignored);
+        assert_eq!(decision("Minion."), Decision::Ignored);
     }
 
     #[test]
     fn opens_well_known_sites_by_name() {
-        browses("ordenador abre youtube", "https://www.youtube.com");
-        browses("ordenador ve a wikipedia", "https://es.wikipedia.org");
+        browses("minion abre youtube", "https://www.youtube.com");
+        browses("minion ve a wikipedia", "https://es.wikipedia.org");
     }
 
     #[test]
     fn applications_still_win_over_sites() {
         // Chrome is an app in the table; it must not become a web search.
-        launches("ordenador abre chrome", "Chrome");
-        launches("ordenador abre safari", "Safari");
+        launches("minion abre chrome", "Chrome");
+        launches("minion abre safari", "Safari");
     }
 
     #[test]
@@ -1054,7 +1056,7 @@ mod tests {
             ("sube del todo", Some("com.apple.Terminal"), "orden anterior"),
         ];
         for (phrase, context, expected) in cases {
-            let spoken = format!("ordenador {phrase}");
+            let spoken = format!("minion {phrase}");
             let name = match decide_in(&spoken, *context).0 {
                 Decision::Run(name) | Decision::RunHere(name) => name,
                 other => panic!("«{spoken}» in {context:?} gave {other:?}"),
@@ -1067,15 +1069,15 @@ mod tests {
     fn commands_belong_to_their_application() {
         // Inside Terminal these mean something; nowhere else do they.
         assert_eq!(
-            decide_in("ordenador limpia la pantalla", Some("com.apple.Terminal")).0,
+            decide_in("minion limpia la pantalla", Some("com.apple.Terminal")).0,
             Decision::RunHere("limpiar terminal")
         );
         assert_eq!(
-            decide_in("ordenador limpia la pantalla", Some("com.google.Chrome")).0,
+            decide_in("minion limpia la pantalla", Some("com.google.Chrome")).0,
             Decision::Unrecognised
         );
         assert_eq!(
-            decide_in("ordenador limpia la pantalla", None).0,
+            decide_in("minion limpia la pantalla", None).0,
             Decision::Unrecognised
         );
     }
@@ -1085,11 +1087,11 @@ mod tests {
         // Chrome and Finder both know "nueva ventana", but only Finder
         // knows "nueva carpeta".
         assert_eq!(
-            decide_in("ordenador nueva carpeta", Some("com.apple.finder")).0,
+            decide_in("minion nueva carpeta", Some("com.apple.finder")).0,
             Decision::RunHere("carpeta nueva")
         );
         assert_eq!(
-            decide_in("ordenador abre una ventana nueva", Some("com.apple.finder")).0,
+            decide_in("minion abre una ventana nueva", Some("com.apple.finder")).0,
             Decision::Run("ventana nueva")
         );
     }
@@ -1097,7 +1099,7 @@ mod tests {
     #[test]
     fn global_commands_still_work_inside_an_application() {
         assert_eq!(
-            decide_in("ordenador guarda esto", Some("com.apple.Terminal")).0,
+            decide_in("minion guarda esto", Some("com.apple.Terminal")).0,
             Decision::Run("guardar")
         );
     }
@@ -1106,7 +1108,7 @@ mod tests {
     fn every_contextual_command_recognises_itself() {
         for command in CONTEXTUAL_COMMANDS {
             for phrase in command.phrases {
-                let spoken = format!("ordenador {phrase}");
+                let spoken = format!("minion {phrase}");
                 let bundle = command.bundles[0];
                 match decide_in(&spoken, Some(bundle)).0 {
                     Decision::RunHere(name) if name == command.name => {}
@@ -1126,19 +1128,19 @@ mod tests {
 
     #[test]
     fn dictates_text() {
-        types("Ordenador escribe hola qué tal estás",  "hola qué tal estás");
-        types("Ordenador, anota comprar pan mañana", "comprar pan mañana");
+        types("Minion escribe hola qué tal estás",  "hola qué tal estás");
+        types("Minion, anota comprar pan mañana", "comprar pan mañana");
         // Accents and capitals survive: the text comes from the original
         // transcript, not the normalised form used for matching.
-        types("Ordenador escribe Señor Muñoz", "Señor Muñoz");
+        types("Minion escribe Señor Muñoz", "Señor Muñoz");
     }
 
     #[test]
     fn dictated_text_is_never_matched_as_a_command() {
         // The whole point: everything after the verb is content, however
         // much it looks like something in the vocabulary.
-        types("Ordenador escribe cierra la ventana", "cierra la ventana");
-        types("Ordenador escribe sube el volumen", "sube el volumen");
+        types("Minion escribe cierra la ventana", "cierra la ventana");
+        types("Minion escribe sube el volumen", "sube el volumen");
     }
 
     fn searches_music(phrase: &str, expected: &str) {
@@ -1151,19 +1153,19 @@ mod tests {
     #[test]
     fn finds_music_by_name() {
         // From the log, where it came back not understood.
-        searches_music("Ordenador reproduce la canción vértigo.", "vértigo");
-        searches_music("ordenador pon la canción Bohemian Rhapsody", "Bohemian Rhapsody");
-        searches_music("ordenador pon el disco Kind of Blue", "Kind of Blue");
-        searches_music("ordenador pon el grupo Radiohead", "Radiohead");
+        searches_music("Minion reproduce la canción vértigo.", "vértigo");
+        searches_music("minion pon la canción Bohemian Rhapsody", "Bohemian Rhapsody");
+        searches_music("minion pon el disco Kind of Blue", "Kind of Blue");
+        searches_music("minion pon el grupo Radiohead", "Radiohead");
     }
 
     #[test]
     fn plain_music_commands_are_not_searches() {
         // No title follows, so these stay transport controls.
-        assert_eq!(decision("Ordenador pon la música."), Decision::Run("reproducir"));
-        assert_eq!(decision("Ordenador para la música."), Decision::Run("pausar"));
+        assert_eq!(decision("Minion pon la música."), Decision::Run("reproducir"));
+        assert_eq!(decision("Minion para la música."), Decision::Run("pausar"));
         assert_eq!(
-            decision("Ordenador pon la siguiente canción."),
+            decision("Minion pon la siguiente canción."),
             Decision::Run("canción siguiente")
         );
     }
@@ -1171,36 +1173,36 @@ mod tests {
     #[test]
     fn short_phrases_stay_commands() {
         // "pon la música" must not become a request to type "la música".
-        assert_eq!(decision("Ordenador pon la música."), Decision::Run("reproducir"));
+        assert_eq!(decision("Minion pon la música."), Decision::Run("reproducir"));
     }
 
     #[test]
     fn asks_to_repeat() {
-        assert_eq!(decision("ordenador otra vez"), Decision::Again(1));
-        assert_eq!(decision("ordenador repite"), Decision::Again(1));
-        assert_eq!(decision("ordenador hazlo tres veces"), Decision::Again(3));
-        assert_eq!(decision("ordenador repite dos veces"), Decision::Again(2));
+        assert_eq!(decision("minion otra vez"), Decision::Again(1));
+        assert_eq!(decision("minion repite"), Decision::Again(1));
+        assert_eq!(decision("minion hazlo tres veces"), Decision::Again(3));
+        assert_eq!(decision("minion repite dos veces"), Decision::Again(2));
     }
 
     #[test]
     fn a_repeat_is_capped() {
         // Spoken numbers stop at five; anything else falls back to once.
-        assert_eq!(decision("ordenador repite cien veces"), Decision::Again(1));
+        assert_eq!(decision("minion repite cien veces"), Decision::Again(1));
     }
 
     #[test]
     fn splits_chained_instructions() {
         assert_eq!(
-            split_chain("Ordenador cierra la pestaña y luego recarga"),
-            vec!["Ordenador cierra la pestaña", "Ordenador recarga"]
+            split_chain("Minion cierra la pestaña y luego recarga"),
+            vec!["Minion cierra la pestaña", "Minion recarga"]
         );
         // Three in a row.
         assert_eq!(
-            split_chain("Ordenador copia esto y luego abre Chrome y después pega esto"),
+            split_chain("Minion copia esto y luego abre Chrome y después pega esto"),
             vec![
-                "Ordenador copia esto",
-                "Ordenador abre Chrome",
-                "Ordenador pega esto"
+                "Minion copia esto",
+                "Minion abre Chrome",
+                "Minion pega esto"
             ]
         );
     }
@@ -1210,14 +1212,14 @@ mod tests {
         // Titles and dictated text are full of "y"; only explicit joiners
         // count, or "pon la canción tú y yo" would become two commands.
         assert_eq!(
-            split_chain("Ordenador pon la canción tú y yo"),
-            vec!["Ordenador pon la canción tú y yo"]
+            split_chain("Minion pon la canción tú y yo"),
+            vec!["Minion pon la canción tú y yo"]
         );
     }
 
     #[test]
     fn each_part_of_a_chain_still_resolves() {
-        let parts = split_chain("Ordenador cierra la pestaña y luego recarga");
+        let parts = split_chain("Minion cierra la pestaña y luego recarga");
         assert_eq!(decide(&parts[0]).0, Decision::Run("cerrar pestaña"));
         assert_eq!(decide(&parts[1]).0, Decision::Run("recargar"));
     }
@@ -1242,7 +1244,7 @@ mod tests {
         // shadowed by a similar one elsewhere in the table.
         for command in COMMANDS {
             for phrase in command.phrases {
-                let spoken = format!("ordenador {phrase}");
+                let spoken = format!("minion {phrase}");
                 match decide(&spoken).0 {
                     Decision::Run(name) if name == command.name => {}
                     other => panic!("«{spoken}» should be «{}», got {other:?}", command.name),
@@ -1255,7 +1257,7 @@ mod tests {
     fn every_app_alias_reaches_its_app() {
         for app in all_apps() {
             for alias in app.aliases {
-                let spoken = format!("ordenador abre {alias}");
+                let spoken = format!("minion abre {alias}");
                 match decide(&spoken).0 {
                     Decision::Launch { name, .. } if name == app.name => {}
                     other => panic!("«{spoken}» should launch {}, got {other:?}", app.name),

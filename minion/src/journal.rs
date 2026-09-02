@@ -1,4 +1,4 @@
-//! Where Oyente writes down what it heard.
+//! Where Minion writes down what it heard.
 //!
 //! The log is not a debugging leftover: it is the only way to find out why
 //! a command did not fire, and the raw material for adding aliases. So it
@@ -21,7 +21,7 @@ static FILE: OnceLock<Option<Mutex<File>>> = OnceLock::new();
 /// Path of the log file.
 pub fn path() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join("Library/Logs/oyente.log"))
+    Some(PathBuf::from(home).join("Library/Logs/minion.log"))
 }
 
 fn handle() -> Option<&'static Mutex<File>> {

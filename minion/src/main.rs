@@ -1,4 +1,4 @@
-//! Oyente — control your Mac by speaking Spanish.
+//! Minion — control your Mac by speaking Spanish.
 //!
 //! Listens on the microphone, transcribes with Parakeet, and carries out
 //! sentences that open with the wake word. Lives in the menu bar.
@@ -13,9 +13,11 @@ mod commands;
 mod config;
 mod enroll;
 mod fbank;
+mod icon;
 mod journal;
 mod learn;
 mod spanish;
+mod startup;
 mod speaker;
 mod text;
 
@@ -34,7 +36,7 @@ use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 use objc2_foundation::NSTimer;
 use ort::session::builder::SessionBuilder;
 use parakeet_rs::{ExecutionConfig, ParakeetTDT, Transcriber};
-use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::TrayIconBuilder;
 
 use commands::Decision;
@@ -44,12 +46,6 @@ use commands::Decision;
 mod sounds {
     pub const DONE: &str = "/System/Library/Sounds/Pop.aiff";
     pub const UNSURE: &str = "/System/Library/Sounds/Tink.aiff";
-}
-
-/// What the menu bar shows in each state.
-mod icon {
-    pub const LISTENING: &str = "🎙";
-    pub const PAUSED: &str = "😴";
 }
 
 /// The toggle's two faces. It names the action, not the state: a menu item
@@ -78,7 +74,7 @@ fn locate_model(argument: Option<String>) -> Result<String> {
 
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
 
-    // Inside the app bundle: Contents/MacOS/oyente -> Contents/Resources/model
+    // Inside the app bundle: Contents/MacOS/minion -> Contents/Resources/model
     if let Ok(executable) = std::env::current_exe() {
         if let Some(macos_dir) = executable.parent() {
             candidates.push(macos_dir.join("../Resources/model"));
@@ -90,7 +86,7 @@ fn locate_model(argument: Option<String>) -> Result<String> {
 
     // Installed alongside user data.
     if let Ok(home) = std::env::var("HOME") {
-        candidates.push(Path::new(&home).join("Library/Application Support/Oyente/model"));
+        candidates.push(Path::new(&home).join("Library/Application Support/Minion/model"));
     }
 
     for candidate in candidates {
@@ -174,8 +170,8 @@ struct Voice {
 fn listen_and_obey(
     model_path: String,
     settings: audio::Settings,
-    log_ignored_speech: bool,
-    play_sounds: bool,
+    log_ignored_speech: Arc<AtomicBool>,
+    play_sounds: Arc<AtomicBool>,
     idle_unload: Option<Duration>,
     mut voice: Option<Voice>,
     active: Arc<AtomicBool>,
@@ -197,7 +193,7 @@ fn listen_and_obey(
         listener.channels,
         commands::phrase_count()
     );
-    note!("Listening. Say: «ordenador, abre Chrome»");
+    note!("Listening. Say: «minion, abre Chrome»");
 
     loop {
         // A bounded wait, so idleness can be noticed while nothing is being
@@ -296,8 +292,8 @@ fn listen_and_obey(
                 repeats,
                 seconds,
                 elapsed_ms,
-                log_ignored_speech,
-                play_sounds,
+                log_ignored_speech.load(Ordering::Relaxed),
+                play_sounds.load(Ordering::Relaxed),
             );
 
             if commands::is_sleep(&decision) {
@@ -383,38 +379,69 @@ fn report(
 }
 
 /// Builds the menu bar item and hands control to AppKit. Never returns.
-fn run_menu_bar(active: Arc<AtomicBool>) -> Result<()> {
+fn run_menu_bar(
+    active: Arc<AtomicBool>,
+    sounds_on: Arc<AtomicBool>,
+    log_voices_on: Arc<AtomicBool>,
+) -> Result<()> {
     let mtm = MainThreadMarker::new()
         .ok_or_else(|| anyhow!("the menu bar must be built on the main thread"))?;
     let app = NSApplication::sharedApplication(mtm);
     // Accessory: menu bar only, no Dock icon and no window.
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 
+    let settings = config::load();
+
     let menu = Menu::new();
     // One item for one piece of state. Two — "Escuchar" and "Pausar" — made
     // the reader work out which one applied right now.
     let toggle = MenuItem::new(MENU_PAUSE, true, None);
     let learn = MenuItem::new("Aprender del registro…", true, None);
+
+    // Settings that are worth changing without opening a file. Anything
+    // with a number — thresholds, timings — stays in config.toml, where
+    // there is room to explain what the number means.
+    let options = Submenu::new("Opciones", true);
+    let sounds = CheckMenuItem::new("Sonido al ejecutar", true, settings.sounds, None);
+    let log_voices = CheckMenuItem::new(
+        "Registrar voces ajenas",
+        true,
+        settings.log_ignored_speech,
+        None,
+    );
+    let at_login = CheckMenuItem::new("Abrir al iniciar sesión", true, startup::enabled(), None);
     let show_log = MenuItem::new("Ver el registro", true, None);
-    let quit = MenuItem::new("Salir de Oyente", true, None);
+    let edit_config = MenuItem::new("Editar la configuración…", true, None);
+    options.append(&sounds)?;
+    options.append(&log_voices)?;
+    options.append(&at_login)?;
+    options.append(&PredefinedMenuItem::separator())?;
+    options.append(&show_log)?;
+    options.append(&edit_config)?;
+
+    let quit = MenuItem::new("Salir de Minion", true, None);
     menu.append(&toggle)?;
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&learn)?;
-    menu.append(&show_log)?;
+    menu.append(&options)?;
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&quit)?;
 
     let toggle_id = toggle.id().clone();
     let learn_id = learn.id().clone();
+    let sounds_id = sounds.id().clone();
+    let log_voices_id = log_voices.id().clone();
+    let at_login_id = at_login.id().clone();
     let show_log_id = show_log.id().clone();
+    let edit_config_id = edit_config.id().clone();
     let quit_id = quit.id().clone();
 
     // Held for the lifetime of the process: dropping it removes the icon.
     let tray = Rc::new(
         TrayIconBuilder::new()
             .with_menu(Box::new(menu))
-            .with_title(icon::LISTENING)
-            .with_tooltip("Oyente — control por voz")
+            .with_icon(icon::awake()?)
+            .with_tooltip("Minion — control por voz")
             .build()?,
     );
 
@@ -432,11 +459,10 @@ fn run_menu_bar(active: Arc<AtomicBool>) -> Result<()> {
             return;
         }
         shown_as_listening.set(listening);
-        tray_for_timer.set_title(Some(if listening {
-            icon::LISTENING
-        } else {
-            icon::PAUSED
-        }));
+        let face = if listening { icon::awake() } else { icon::asleep() };
+        if let Ok(face) = face {
+            let _ = tray_for_timer.set_icon(Some(face));
+        }
         toggle_for_timer.set_text(if listening { MENU_PAUSE } else { MENU_LISTEN });
     });
     // Safety: the block only touches the tray icon, the menu item and an
@@ -464,6 +490,22 @@ fn run_menu_bar(active: Arc<AtomicBool>) -> Result<()> {
                 );
             } else if event.id == learn_id {
                 show_lesson();
+            } else if event.id == sounds_id {
+                let on = !sounds_on.load(Ordering::Relaxed);
+                sounds_on.store(on, Ordering::Relaxed);
+                save_option("sounds", on);
+            } else if event.id == log_voices_id {
+                let on = !log_voices_on.load(Ordering::Relaxed);
+                log_voices_on.store(on, Ordering::Relaxed);
+                save_option("log_ignored_speech", on);
+            } else if event.id == at_login_id {
+                let on = !startup::enabled();
+                match startup::set(on) {
+                    Ok(()) => note!("start at login: {on}"),
+                    Err(e) => actions::show_message(&format!("No se pudo cambiar: {e}")),
+                }
+            } else if event.id == edit_config_id {
+                open_config();
             } else if event.id == show_log_id {
                 if let Some(path) = journal::path() {
                     actions::reveal(&path.to_string_lossy());
@@ -477,6 +519,35 @@ fn run_menu_bar(active: Arc<AtomicBool>) -> Result<()> {
 
     app.run();
     Ok(())
+}
+
+/// Writes a switch back to the configuration file.
+fn save_option(key: &str, value: bool) {
+    match config::set_option(key, if value { "true" } else { "false" }) {
+        Ok(()) => note!("{key} = {value}"),
+        Err(e) => actions::show_message(&format!("No se pudo guardar «{key}»: {e}")),
+    }
+}
+
+/// Opens the configuration file, creating it from the example if missing.
+fn open_config() {
+    let Some(path) = config::path() else {
+        return;
+    };
+    if !path.exists() {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(
+            &path,
+            "# Configuración de Minion. Todo es opcional.\n\
+             # El ejemplo completo está en config.example.toml del proyecto.\n",
+        );
+    }
+    let _ = std::process::Command::new("/usr/bin/open")
+        .arg("-t")
+        .arg(&path)
+        .spawn();
 }
 
 /// Shows what the log has to teach, and offers to apply it.
@@ -508,7 +579,7 @@ fn show_lesson() {
         Ok(n) => {
             note!("learned {n} alias(es) from the log");
             actions::show_message(&format!(
-                "Añadidos {n}. Reinicia Oyente desde el menú para que se apliquen."
+                "Añadidos {n}. Reinicia Minion desde el menú para que se apliquen."
             ));
         }
         Err(e) => actions::show_message(&e),
@@ -530,24 +601,30 @@ fn report_permissions() {
          work; anything that presses keys (copy, save, close tab) will be \
          silently ignored by macOS."
     );
-    // Ask macOS to prompt. This is the call that registers Oyente with the
+    // Ask macOS to prompt. This is the call that registers Minion with the
     // system, so that there is a switch to turn on when the pane opens —
     // an app that never asked simply is not in the list.
     actions::request_accessibility_permission();
     println!(
-        "\n  Accept the dialog, or switch Oyente on in System Settings →\n  \
-         Privacy & Security → Accessibility. Then restart Oyente from the\n  \
+        "\n  Accept the dialog, or switch Minion on in System Settings →\n  \
+         Privacy & Security → Accessibility. Then restart Minion from the\n  \
          menu bar: the permission is only read at startup.\n"
     );
     actions::open_accessibility_settings();
 }
 
 fn main() -> Result<()> {
-    // `oyente learn` reads the log and turns its failures into vocabulary.
+    // `minion learn` reads the log and turns its failures into vocabulary.
     // It touches neither the microphone nor the model, so it is handled
     // before any of that is set up.
     let first_argument = std::env::args().nth(1);
     if let Some(argument) = first_argument.as_deref() {
+        if argument == "export-icon" {
+            let directory = std::env::args().nth(2).unwrap_or_else(|| "Minion.iconset".into());
+            icon::export_iconset(&directory)?;
+            println!("Icon written to {directory}");
+            return Ok(());
+        }
         if argument == "enroll" {
             let model_path = locate_model(None)?;
             return enroll::run(&model_path);
@@ -566,12 +643,14 @@ fn main() -> Result<()> {
     let config = config::load();
     commands::configure(&config);
     let audio_settings = config.audio_settings();
-    let log_ignored = config.log_ignored_speech;
-    let play_sounds = config.sounds;
+    // Shared so the menu can flip them while the loop is running: a switch
+    // that needs a restart to take effect is not much of a switch.
+    let log_ignored = Arc::new(AtomicBool::new(config.log_ignored_speech));
+    let play_sounds = Arc::new(AtomicBool::new(config.sounds));
     let idle_unload = config.idle_unload();
 
     // Voice recognition is opt-in: it exists only once someone has run
-    // `oyente enroll`. Without a profile Oyente answers anyone who says the
+    // `minion enroll`. Without a profile Minion answers anyone who says the
     // wake word, which is the right default for a machine with one user.
     let voice = match speaker::load_profile() {
         Some(profile) => match speaker::Speaker::load(&model_path) {
@@ -587,7 +666,7 @@ fn main() -> Result<()> {
         None => None,
     };
 
-    note!("Oyente starting — loading model…");
+    note!("Minion starting — loading model…");
     if let Some(log) = journal::path() {
         println!("Log: {}", log.display());
     }
@@ -595,12 +674,14 @@ fn main() -> Result<()> {
     let active = Arc::new(AtomicBool::new(true));
 
     let worker_active = Arc::clone(&active);
+    let worker_log_ignored = Arc::clone(&log_ignored);
+    let worker_sounds = Arc::clone(&play_sounds);
     std::thread::spawn(move || {
         if let Err(e) = listen_and_obey(
             model_path,
             audio_settings,
-            log_ignored,
-            play_sounds,
+            worker_log_ignored,
+            worker_sounds,
             idle_unload,
             voice,
             worker_active,
@@ -610,5 +691,5 @@ fn main() -> Result<()> {
         }
     });
 
-    run_menu_bar(active)
+    run_menu_bar(active, play_sounds, log_ignored)
 }

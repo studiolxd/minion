@@ -154,7 +154,7 @@ impl Mods {
 /// mode. Check [`has_accessibility_permission`] at startup instead.
 pub fn press(code: u16, mods: Mods) -> bool {
     // Checked here rather than only at startup: the permission can be
-    // granted while Oyente is running and takes effect immediately, so a
+    // granted while Minion is running and takes effect immediately, so a
     // one-off check at launch goes stale the moment the user turns it on.
     if !has_accessibility_permission() {
         return false;
@@ -287,7 +287,7 @@ pub fn search_spotify(query: &str) -> bool {
 pub fn show_message(text: &str) {
     let escaped = text.replace('\\', "").replace('"', "'");
     applescript(&format!(
-        "display dialog \"{escaped}\" with title \"Oyente\" buttons {{\"Cerrar\"}} \
+        "display dialog \"{escaped}\" with title \"Minion\" buttons {{\"Cerrar\"}} \
          default button \"Cerrar\""
     ));
 }
@@ -299,7 +299,7 @@ pub fn show_message(text: &str) {
 pub fn ask(text: &str, affirmative: &str) -> bool {
     let escaped = text.replace('\\', "").replace('"', "'");
     let script = format!(
-        "display dialog \"{escaped}\" with title \"Oyente\" \
+        "display dialog \"{escaped}\" with title \"Minion\" \
          buttons {{\"Cancelar\", \"{affirmative}\"}} default button \"{affirmative}\""
     );
     Command::new("/usr/bin/osascript")

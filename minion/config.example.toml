@@ -1,10 +1,10 @@
-# Oyente
+# Minion
 
 Control your Mac by speaking Spanish. Always listening, entirely offline.
 
 ```
-option-free:  «ordenador, abre Chrome»      → Chrome comes forward
-              «ordenador, guarda esto»      → ⌘S
+option-free:  «minion, abre Chrome»      → Chrome comes forward
+              «minion, guarda esto»      → ⌘S
               «mañana quedamos a las cinco» → ignored
 ```
 
@@ -17,7 +17,7 @@ The menu holds one toggle (Pausar / Escuchar), *Aprender del registro…*,
 
 Talon has excellent command recognition but its Conformer engine is
 English-only, and no Spanish model exists. Handy understands Spanish
-beautifully but is push-to-talk. Oyente is the missing combination:
+beautifully but is push-to-talk. Minion is the missing combination:
 Spanish recognition with hands-free listening.
 
 ## Quick start
@@ -32,16 +32,16 @@ Or to run it without installing:
 ```bash
 ./download-model.sh
 cargo build --release
-./target/release/oyente
+./target/release/minion
 ```
 
 Grant microphone access when asked. For commands that press keys (copy,
 save, close tab) also grant Accessibility under System Settings → Privacy
-& Security → Accessibility, then restart Oyente.
+& Security → Accessibility, then restart Minion.
 
 Without it those commands fail invisibly: macOS accepts the key event and
 discards it, so the log shows the command running while nothing happens on
-screen. Oyente checks at startup with `AXIsProcessTrusted`, says so in the
+screen. Minion checks at startup with `AXIsProcessTrusted`, says so in the
 log, and opens the settings pane for you.
 
 The permission is granted **per binary**, so rebuilding invalidates it.
@@ -53,14 +53,14 @@ which one the switch in System Settings refers to.
 If the permission gets into a confused state:
 
 ```bash
-tccutil reset Accessibility com.studiolxd.oyente
-open /Applications/Oyente.app     # asks again
+tccutil reset Accessibility com.studiolxd.minion
+open /Applications/Minion.app     # asks again
 ```
 
 Installing as an app matters for more than tidiness: macOS attributes
 permissions to whichever binary asks for them. Run from a terminal and the
 microphone permission belongs to the terminal, which then grants it to
-every script you run there. Bundled, it is Oyente's alone.
+every script you run there. Bundled, it is Minion's alone.
 
 `./uninstall.sh` removes it.
 
@@ -74,7 +74,7 @@ microphone (48 kHz)
 one utterance
     │  Parakeet TDT 0.6b v3, ONNX int8, on CPU
 Spanish text
-    │  does it start with "ordenador"?
+    │  does it start with "minion"?
 command executed
 ```
 
@@ -83,7 +83,7 @@ Everything runs locally. Nothing is sent anywhere.
 ## Speaking to it
 
 Every command opens with the wake word — **ordenador**. Only at the start,
-so "le dije al ordenador que abriera Chrome" does nothing.
+so "le dije al minion que abriera Chrome" does nothing.
 
 Phrasing is forgiving by design. Filler words are dropped and verbs are
 reduced to one form, so a single entry in the table covers the ways people
@@ -91,18 +91,18 @@ actually speak:
 
 | These all work | |
 |---|---|
-| «ordenador, cierra la ventana» | the natural phrasing |
-| «ordenador, cerrar ventana» | infinitive, no article |
-| «ordenador, cierra ventana» | clipped |
-| «ordenador, cierra la ventana por favor» | with politeness |
+| «minion, cierra la ventana» | the natural phrasing |
+| «minion, cerrar ventana» | infinitive, no article |
+| «minion, cierra ventana» | clipped |
+| «minion, cierra la ventana por favor» | with politeness |
 
 ### Applications
 
-«ordenador, **abre** Chrome» — and also *ábreme, ve a, vete a, cambia a,
+«minion, **abre** Chrome» — and also *ábreme, ve a, vete a, cambia a,
 pon, ponme, dame, trae, tráeme, muestra, enfoca, saca, lanza*. Or just name
-it: «ordenador, Spotify».
+it: «minion, Spotify».
 
-To close one: «ordenador, **cierra** Safari» — also *sal de, termina, mata*.
+To close one: «minion, **cierra** Safari» — also *sal de, termina, mata*.
 It is a polite quit, so an app with unsaved work still puts up its own save
 dialog.
 
@@ -117,7 +117,7 @@ VS Code · Claude · ChatGPT · Ajustes · Vista Previa · Monitor de Actividad
 
 ### Web addresses
 
-«ordenador, **ve a** google.com» — spelled out, or spoken with the dot as a
+«minion, **ve a** google.com» — spelled out, or spoken with the dot as a
 word ("github punto com"). Well-known sites work by name alone: google,
 youtube, gmail, github, wikipedia, drive, maps, calendar, linkedin, amazon,
 netflix.
@@ -131,10 +131,10 @@ default. Ask from anywhere else and the default applies.
 
 ### Dictating text
 
-«ordenador, **escribe** hola qué tal» types the words that follow —
+«minion, **escribe** hola qué tal» types the words that follow —
 also *anota, apunta, dicta*.
 
-Everything after the verb is content, never a command: "ordenador escribe
+Everything after the verb is content, never a command: "minion escribe
 cierra la ventana" types the phrase instead of closing anything. Accents
 and capitals survive, because the text comes from the original transcript
 rather than the normalised form used for matching, and it is sent as a
@@ -179,12 +179,12 @@ Other phrases have no global meaning at all, and only work in one place:
 | sube del todo · baja del todo | sube el volumen · baja el volumen |
 | ve a la barra de direcciones | quita el sonido · devuelve el sonido |
 
-| Music (Spotify) | Oyente itself |
+| Music (Spotify) | Minion itself |
 |---|---|
 | pon la música · para la música | deja de escuchar |
 | siguiente canción · canción anterior | (resume from the menu bar) |
 
-Naming something searches for it: «ordenador, pon la canción Vértigo» —
+Naming something searches for it: «minion, pon la canción Vértigo» —
 also *el disco, el grupo, el artista, el tema*. It opens the results in
 Spotify rather than playing straight away; starting a specific track needs
 the Web API and an OAuth token, which is a different project.
@@ -194,14 +194,14 @@ goes back one rather than searching for a song called "anterior".
 
 ## The log
 
-`~/Library/Logs/oyente.log` records every utterance it heard and what it
+`~/Library/Logs/minion.log` records every utterance it heard and what it
 did with it, whichever way the app was started:
 
 ```
-21:24:02  Listening. Say: «ordenador, abre Chrome»
-21:24:31  ran      «Ordenador, abre Chrome.»  ->  abrir Chrome  [96% · 1.8s audio · 240 ms]
+21:24:02  Listening. Say: «minion, abre Chrome»
+21:24:31  ran      «Minion, abre Chrome.»  ->  abrir Chrome  [96% · 1.8s audio · 240 ms]
 21:25:04  heard    2.4s of speech, not addressed to me
-21:25:19  unknown  «Ordenador, haz un pino.»  ->  not understood
+21:25:19  unknown  «Minion, haz un pino.»  ->  not understood
 ```
 
 This is the tool for tuning. `unknown` lines show what the recogniser
@@ -209,7 +209,7 @@ really produces from your voice, which is what should go into the alias
 list. Frequent `heard` lines when nobody is speaking mean
 `speech_threshold` is too low.
 
-**Speech not addressed to Oyente is counted, not transcribed.** With the
+**Speech not addressed to Minion is counted, not transcribed.** With the
 microphone always on, everything said nearby passes through the recogniser,
 and writing other people's conversations to disk is not something anyone
 asked for. Set `log_ignored_speech = true` while tuning, when seeing the
@@ -220,7 +220,7 @@ It rotates at 5 MB, keeping one previous copy.
 ## Configuration
 
 Copy `config.example.toml` to
-`~/Library/Application Support/Oyente/config.toml`. Everything in it is
+`~/Library/Application Support/Minion/config.toml`. Everything in it is
 optional, and it is read once at startup.
 
 It covers the wake words, the confidence threshold, the speech detection
@@ -240,7 +240,7 @@ aliases = ["notion", "nocion"]
 ```
 
 A typo in the file is reported at startup and then ignored; it will not
-stop Oyente from running.
+stop Minion from running.
 
 ## Tuning
 
@@ -282,9 +282,37 @@ once: app not running, running with no windows, and running with a window.
 The middle one is common on macOS, where closing the last window does not
 quit the app.
 
+## Answering only you
+
+By default Minion obeys anyone who says the wake word, which is right for a
+machine with one user. If other voices reach the microphone — a video, a
+colleague, a call on speaker — teach it yours:
+
+```bash
+/Applications/Minion.app/Contents/MacOS/minion enroll
+```
+
+It asks for five sentences and stores the average. From then on, anything
+that does not sound like you is discarded **before being transcribed**, so
+other people's words never reach the recogniser or the log.
+
+Five sentences rather than one because a single phrase carries its own
+intonation as much as the voice. Enrolment refuses to save samples that
+disagree with each other, which is what a noisy room produces — saving
+those would filter out the very person they are meant to admit.
+
+Delete `~/Library/Application Support/Minion/voice.txt` to undo it.
+
+The model is ECAPA-TDNN from wespeaker (24 MB, 192 numbers per voice).
+Its input is 80-bin mel filterbanks matching Kaldi's, which `fbank.rs`
+reproduces: the same pre-emphasis, the same Povey window, the same mel
+spacing. A frontend that is merely reasonable produces embeddings that look
+plausible and compare badly, which is a hard fault to see — hence the tests
+that check a tone lands in the right band.
+
 ## Learning from its own mistakes
 
-Every phrase Oyente failed to understand is in the log. `oyente learn`
+Every phrase Minion failed to understand is in the log. `minion learn`
 reads them back, works out what each was probably meant to be, and offers
 to add it as an alias:
 
@@ -294,7 +322,7 @@ asks before changing anything.
 From a terminal:
 
 ```bash
-/Applications/Oyente.app/Contents/MacOS/oyente learn
+/Applications/Minion.app/Contents/MacOS/minion learn
 ```
 
 ```
@@ -342,8 +370,10 @@ rebuilding.
 
 ## Not done yet
 
-- **Real VAD.** Energy cannot tell speech from a door slam, and background
-  music keeps it triggering. Silero VAD is the next step.
+- **Real VAD.** The energy detector cannot tell speech from a door slam.
+  In practice it has not needed to: a two-minute test with a video playing
+  produced no false commands, and speaker recognition now covers the case
+  that mattered. Silero VAD would mainly save CPU.
 
 - **Custom key commands in the config file**: applications and aliases can
   be added there, but not entirely new shortcuts.

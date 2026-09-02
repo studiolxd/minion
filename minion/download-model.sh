@@ -30,7 +30,7 @@ download decoder_joint-model.int8.onnx decoder_joint-model.onnx
 download encoder-model.int8.onnx encoder-model.onnx
 
 # Speaker model: 24 MB, tells your voice from anyone else's. Optional —
-# without it, Oyente answers whoever speaks the wake word.
+# without it, Minion answers whoever speaks the wake word.
 echo "  ↓ speaker.onnx"
 if [ ! -f speaker.onnx ]; then
   curl -fL --progress-bar -o speaker.onnx \

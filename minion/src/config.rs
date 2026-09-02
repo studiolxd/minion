@@ -4,7 +4,7 @@
 //! apply. The point is that adding your own applications or retuning the
 //! speech detector should not require a Rust toolchain.
 //!
-//! Lives at `~/Library/Application Support/Oyente/config.toml`.
+//! Lives at `~/Library/Application Support/Minion/config.toml`.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -40,7 +40,7 @@ pub struct Config {
     /// Confidence required before acting, from 0 to 1.
     pub threshold: Option<f32>,
 
-    /// Whether to write down speech that was not addressed to Oyente.
+    /// Whether to write down speech that was not addressed to Minion.
     ///
     /// Off by default, and deliberately so: with the microphone always on,
     /// anything said nearby gets transcribed, and keeping that on disk is
@@ -67,21 +67,21 @@ pub struct Config {
 
     /// Minutes of silence after which the speech model is released.
     ///
-    /// The model is most of the memory Oyente uses, and a machine that sits
+    /// The model is most of the memory Minion uses, and a machine that sits
     /// idle for hours has no reason to hold it. Reloading costs a second or
     /// so on the next thing you say. Zero keeps it loaded for good.
     pub unload_after_minutes: Option<u64>,
 
     /// Extra ways of saying commands that already exist.
     ///
-    /// This is where `oyente learn` writes what it learned from the log,
+    /// This is where `minion learn` writes what it learned from the log,
     /// and where you add a phrasing the recogniser keeps producing.
     #[serde(default)]
     pub aliases: Vec<AliasConfig>,
 
-    /// How alike a voice must sound to yours before Oyente listens to it.
+    /// How alike a voice must sound to yours before Minion listens to it.
     ///
-    /// Only used once `oyente enroll` has recorded a voice. Higher rejects
+    /// Only used once `minion enroll` has recorded a voice. Higher rejects
     /// more, including you on a bad day; lower lets others through. Zero to
     /// one, default 0.45.
     pub voice_threshold: Option<f32>,
@@ -151,7 +151,46 @@ impl Default for Config {
 /// Where the configuration file lives.
 pub fn path() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join("Library/Application Support/Oyente/config.toml"))
+    Some(PathBuf::from(home).join("Library/Application Support/Minion/config.toml"))
+}
+
+/// Sets one top-level option, preserving everything else.
+///
+/// Rewrites the line if it is there and appends it otherwise, rather than
+/// serialising the whole file back out — that would discard the comments,
+/// which are most of what makes the file worth editing by hand.
+pub fn set_option(key: &str, value: &str) -> Result<(), String> {
+    let path = path().ok_or("no home directory")?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+
+    let mut replaced = false;
+    let mut lines: Vec<String> = Vec::new();
+    for line in existing.lines() {
+        let is_this_key = line
+            .split('=')
+            .next()
+            .is_some_and(|name| name.trim() == key);
+        // Only at the top level: a key inside a [table] means something else.
+        if is_this_key && !replaced {
+            lines.push(format!("{key} = {value}"));
+            replaced = true;
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    if !replaced {
+        // Before the first table header, or the key would land inside it.
+        let insert_at = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with('['))
+            .unwrap_or(lines.len());
+        lines.insert(insert_at, format!("{key} = {value}"));
+    }
+
+    std::fs::write(&path, lines.join("\n") + "\n").map_err(|e| e.to_string())
 }
 
 /// Reads the configuration, or returns the defaults if there is no file.
@@ -285,6 +324,27 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setting_an_option_keeps_the_rest_of_the_file() {
+        // The comments are most of the value of a hand-edited file.
+        let before = "# a note\nsounds = true\n\n[audio]\nsilence_end_ms = 900\n";
+        // Simulated here rather than touching the real file.
+        let mut lines: Vec<String> = Vec::new();
+        let mut replaced = false;
+        for line in before.lines() {
+            if line.split('=').next().is_some_and(|n| n.trim() == "sounds") && !replaced {
+                lines.push("sounds = false".into());
+                replaced = true;
+            } else {
+                lines.push(line.into());
+            }
+        }
+        let after = lines.join("\n");
+        assert!(after.contains("# a note"), "comments survive");
+        assert!(after.contains("sounds = false"), "the value changed");
+        assert!(after.contains("silence_end_ms = 900"), "other settings survive");
+    }
 
     #[test]
     fn sounds_are_on_by_default_and_can_be_turned_off() {

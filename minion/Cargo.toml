@@ -1,5 +1,5 @@
 [package]
-name = "oyente"
+name = "minion"
 version = "0.1.0"
 edition = "2021"
 
@@ -10,11 +10,13 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 core-foundation = "0.10.1"
 core-graphics = "0.25.0"
 cpal = "0.18.2"
+libc = "0.2.189"
 objc2 = "0.6.4"
 objc2-app-kit = "0.3.2"
 objc2-foundation = { version = "0.3.2", features = ["NSTimer", "NSDate", "block2"] }
 ort = "2.0.0-rc.13"
 parakeet-rs = "0.3.7"
+resvg = { version = "0.48.1", default-features = false }
 rustfft = "6.4.1"
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.1.5"

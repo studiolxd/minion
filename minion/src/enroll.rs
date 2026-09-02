@@ -1,6 +1,6 @@
-//! Teaching Oyente your voice.
+//! Teaching Minion your voice.
 //!
-//! Run `oyente enroll` and say a few sentences. Each is turned into an
+//! Run `minion enroll` and say a few sentences. Each is turned into an
 //! embedding and the average is stored; from then on, anything that does
 //! not sound like you is discarded before it is even transcribed.
 //!
@@ -75,7 +75,7 @@ pub fn run(model_path: &str) -> Result<()> {
 
     speaker::save_profile(&voice)?;
     println!("Listo. Coherencia entre muestras: {:.0}%.", worst * 100.0);
-    println!("Reinicia Oyente: a partir de ahora solo te hará caso a ti.");
+    println!("Reinicia Minion: a partir de ahora solo te hará caso a ti.");
     println!("Para deshacerlo, borra {}.", speaker::profile_path()
         .map_or_else(|| "el perfil".into(), |p| p.display().to_string()));
     Ok(())

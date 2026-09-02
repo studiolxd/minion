@@ -1,11 +1,11 @@
 //! Turns the log's failures into vocabulary.
 //!
-//! Every phrase Oyente did not understand is already written down. This
+//! Every phrase Minion did not understand is already written down. This
 //! reads them back, works out what each was probably meant to be, and can
 //! add it to the configuration as an alias — so the same mistake is only
 //! made once.
 //!
-//! Run with `oyente learn`, or `oyente learn --apply` to write.
+//! Run with `minion learn`, or `minion learn --apply` to write.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -96,7 +96,7 @@ pub fn apply(lesson: &Lesson) -> Result<usize, String> {
         let _ = fs::create_dir_all(parent);
     }
 
-    let mut addition = String::from("\n# Aprendido del registro con `oyente learn`.\n");
+    let mut addition = String::from("\n# Aprendido del registro con `minion learn`.\n");
     for candidate in &lesson.teachable {
         let phrase = without_wake_word(&candidate.phrase);
         let _ = write!(
@@ -200,13 +200,13 @@ pub fn run(config: &config::Config, apply_now: bool) {
 
     if !apply_now {
         if !lesson.teachable.is_empty() {
-            println!("\nRun `oyente learn --apply` to add the first group as aliases.");
+            println!("\nRun `minion learn --apply` to add the first group as aliases.");
         }
         return;
     }
     match apply(&lesson) {
         Ok(0) => println!("Nothing close enough to add."),
-        Ok(n) => println!("\nAdded {n} alias(es). Restart Oyente for them to take effect."),
+        Ok(n) => println!("\nAdded {n} alias(es). Restart Minion for them to take effect."),
         Err(e) => eprintln!("\n{e}"),
     }
 }
