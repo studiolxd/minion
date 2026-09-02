@@ -1,235 +1,194 @@
-//! Oyente: escucha continua y ejecuta ordenes dichas en castellano.
+//! Oyente — control your Mac by speaking Spanish.
 //!
-//! Prototipo minimo. Solo hace una cosa: oir "ordenador, abre Chrome" y
-//! abrir Chrome. Todo lo demas se ignora.
+//! Listens on the microphone, transcribes with Parakeet, and carries out
+//! sentences that open with the wake word. Lives in the menu bar.
 //!
-//! El flujo es:
-//!   microfono -> remuestreo a 16 kHz -> deteccion de voz por energia
-//!             -> Parakeet transcribe la frase -> se busca una orden
+//! Thread layout matters here: AppKit insists the menu bar is created and
+//! serviced on the main thread, so recognition — the expensive part — runs
+//! on its own.
 
-use std::process::Command;
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+mod actions;
+mod audio;
+mod commands;
+mod spanish;
+mod text;
 
-use anyhow::{anyhow, Result};
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use anyhow::{anyhow, Context, Result};
+use objc2::MainThreadMarker;
+use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 use parakeet_rs::{ParakeetTDT, Transcriber};
+use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::TrayIconBuilder;
 
-/// Frecuencia que espera el modelo.
-const OBJETIVO_HZ: u32 = 16_000;
-/// Energia (RMS) por encima de la cual consideramos que alguien habla.
-const UMBRAL_VOZ: f32 = 0.015;
-/// Silencio necesario para dar la frase por terminada.
-const SILENCIO_FIN_MS: usize = 700;
-/// Por debajo de esto, es un ruido y no una frase.
-const MIN_VOZ_MS: usize = 300;
-/// Mas alla de esto cortamos, para no acumular sin fin.
-const MAX_FRASE_MS: usize = 12_000;
+use commands::Decision;
 
-/// Palabra que convierte una frase en orden.
-const PALABRAS_CLAVE: &[&str] = &["ordenador", "ordenadora", "computador"];
-
-/// Bloque de analisis: 20 ms.
-const MUESTRAS_BLOQUE: usize = (OBJETIVO_HZ as usize) / 50;
-
-// --- Utilidades de texto --------------------------------------------------
-
-/// Minusculas, sin tildes, sin puntuacion.
-fn normalizar(texto: &str) -> String {
-    let mut salida = String::with_capacity(texto.len());
-    for c in texto.to_lowercase().chars() {
-        let limpio = match c {
-            'á' | 'à' | 'ä' | 'â' => 'a',
-            'é' | 'è' | 'ë' | 'ê' => 'e',
-            'í' | 'ì' | 'ï' | 'î' => 'i',
-            'ó' | 'ò' | 'ö' | 'ô' => 'o',
-            'ú' | 'ù' | 'ü' | 'û' => 'u',
-            'ñ' => 'n',
-            c if c.is_alphanumeric() => c,
-            _ => ' ',
-        };
-        salida.push(limpio);
-    }
-    salida.split_whitespace().collect::<Vec<_>>().join(" ")
+/// System sounds used as feedback. A command that runs produces no visible
+/// output, so without these you cannot tell whether you were heard.
+mod sounds {
+    pub const DONE: &str = "/System/Library/Sounds/Pop.aiff";
+    pub const UNSURE: &str = "/System/Library/Sounds/Tink.aiff";
 }
 
-/// Aplicaciones que sabemos abrir, con sus formas habladas.
-fn buscar_app(frase: &str) -> Option<(&'static str, &'static str)> {
-    const APPS: &[(&str, &str, &[&str])] = &[
-        ("Chrome", "com.google.Chrome", &["chrome", "crome", "cromo", "navegador"]),
-        ("Safari", "com.apple.Safari", &["safari"]),
-        ("Terminal", "com.apple.Terminal", &["terminal"]),
-        ("Orca", "com.stablyai.orca", &["orca", "orka"]),
-    ];
-    for (nombre, bundle, alias) in APPS {
-        if alias.iter().any(|a| frase.contains(a)) {
-            return Some((nombre, bundle));
+/// Locates the speech model.
+///
+/// Order: explicit argument, `OYENTE_MODEL` in the environment, then the
+/// usual spots relative to the working directory.
+fn locate_model(argument: Option<String>) -> Result<String> {
+    if let Some(path) = argument {
+        return Ok(path);
+    }
+    if let Ok(path) = std::env::var("OYENTE_MODEL") {
+        return Ok(path);
+    }
+    for candidate in ["model", "modelo", "../model", "../../model"] {
+        if Path::new(candidate).join("vocab.txt").exists() {
+            return Ok(candidate.to_string());
         }
     }
-    None
+    Err(anyhow!(
+        "speech model not found. Run ./download-model.sh, or pass the path \
+         as an argument."
+    ))
 }
 
-/// Interpreta una transcripcion. Devuelve una descripcion de lo ejecutado.
-fn interpretar(texto: &str) -> Option<String> {
-    let normal = normalizar(texto);
-    let primera = normal.split_whitespace().next()?;
-    if !PALABRAS_CLAVE.contains(&primera) {
-        return None;
-    }
-    let resto = normal[primera.len()..].trim();
+/// The recognition loop. Owns the model and runs on its own thread.
+fn listen_and_obey(model_path: String, active: Arc<AtomicBool>) -> Result<()> {
+    let mut model = ParakeetTDT::from_pretrained(&model_path, None)
+        .map_err(|e| anyhow!("{e}"))
+        .with_context(|| format!("loading the model from '{model_path}'"))?;
+    println!("Model loaded.");
 
-    // De momento solo entendemos "abre <app>" y variantes.
-    let verbos = ["abre", "abreme", "ve a", "vete a", "cambia a", "pon",
-                  "ponme", "dame", "trae", "traeme", "muestra", "enfoca"];
-    let pide_app = verbos.iter().any(|v| resto.starts_with(v)) || buscar_app(resto).is_some();
-    if !pide_app {
-        return None;
-    }
+    let listener = audio::start(audio::Settings::default(), Arc::clone(&active))
+        .context("opening the microphone")?;
+    println!(
+        "Microphone: {} Hz, {} channel(s)",
+        listener.source_hz, listener.channels
+    );
+    println!("{} phrases understood.\n", commands::phrase_count());
+    println!("Say: «ordenador, abre Chrome»\n");
 
-    let (nombre, bundle) = buscar_app(resto)?;
-    Command::new("/usr/bin/open").arg("-b").arg(bundle).spawn().ok()?;
-    Some(format!("abrir {nombre}"))
-}
-
-// --- Audio ----------------------------------------------------------------
-
-/// Convierte a mono y baja a 16 kHz quedandose una muestra de cada N.
-///
-/// Es un remuestreo tosco (sin filtro antialias), suficiente para voz en un
-/// prototipo. Si la calidad estorba, aqui es donde hay que mejorar.
-fn a_16k_mono(datos: &[f32], canales: usize, origen_hz: u32) -> Vec<f32> {
-    let paso = (origen_hz as f32 / OBJETIVO_HZ as f32).max(1.0);
-    let cuadros = datos.len() / canales;
-    let mut salida = Vec::with_capacity((cuadros as f32 / paso) as usize + 1);
-    let mut pos = 0.0f32;
-    while (pos as usize) < cuadros {
-        let i = pos as usize * canales;
-        let mezcla: f32 = datos[i..i + canales].iter().sum::<f32>() / canales as f32;
-        salida.push(mezcla);
-        pos += paso;
-    }
-    salida
-}
-
-fn energia(bloque: &[f32]) -> f32 {
-    if bloque.is_empty() {
-        return 0.0;
-    }
-    (bloque.iter().map(|m| m * m).sum::<f32>() / bloque.len() as f32).sqrt()
-}
-
-// --- Programa -------------------------------------------------------------
-
-fn main() -> Result<()> {
-    println!("Oyente — cargando modelo…");
-    let ruta_modelo = std::env::args().nth(1).unwrap_or_else(|| "modelo".into());
-    let mut modelo = ParakeetTDT::from_pretrained(&ruta_modelo, None)
-        .map_err(|e| anyhow!("no se pudo cargar el modelo de {ruta_modelo}: {e}"))?;
-    println!("Modelo listo.");
-
-    let host = cpal::default_host();
-    let dispositivo = host
-        .default_input_device()
-        .ok_or_else(|| anyhow!("no hay microfono disponible"))?;
-    let config = dispositivo.default_input_config()?;
-    let origen_hz = config.sample_rate();
-    let canales = config.channels() as usize;
-    println!("Microfono: {origen_hz} Hz, {canales} canal(es)");
-
-    // El callback de audio no debe hacer trabajo pesado: solo deja las
-    // muestras ya remuestreadas en una cola que consume el hilo principal.
-    let cola = Arc::new(Mutex::new(Vec::<f32>::new()));
-    let cola_audio = Arc::clone(&cola);
-    let (avisos, recibir_avisos) = mpsc::channel::<String>();
-
-    let stream = dispositivo.build_input_stream(
-        config.clone().into(),
-        move |datos: &[f32], _: &cpal::InputCallbackInfo| {
-            let trozo = a_16k_mono(datos, canales, origen_hz);
-            if let Ok(mut c) = cola_audio.lock() {
-                c.extend_from_slice(&trozo);
-            }
-        },
-        move |e| {
-            let _ = avisos.send(format!("error de audio: {e}"));
-        },
-        None,
-    )?;
-    stream.play()?;
-
-    println!("\nEscuchando. Di: «ordenador, abre Chrome»   (Ctrl-C para salir)\n");
-
-    let bloques_silencio_fin = SILENCIO_FIN_MS / 20;
-    let bloques_min_voz = MIN_VOZ_MS / 20;
-    let muestras_max = MAX_FRASE_MS * OBJETIVO_HZ as usize / 1000;
-
-    let mut frase: Vec<f32> = Vec::new();
-    let mut bloques_con_voz = 0usize;
-    let mut bloques_de_silencio = 0usize;
-    let mut hablando = false;
-
-    loop {
-        // Sacamos lo acumulado sin quedarnos con el cerrojo cogido.
-        let pendiente: Vec<f32> = {
-            let mut c = cola.lock().unwrap();
-            if c.len() < MUESTRAS_BLOQUE {
-                Vec::new()
-            } else {
-                std::mem::take(&mut *c)
-            }
-        };
-
-        if pendiente.is_empty() {
-            if let Ok(aviso) = recibir_avisos.try_recv() {
-                eprintln!("{aviso}");
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
+    for utterance in listener.utterances {
+        if !active.load(Ordering::Relaxed) {
             continue;
         }
+        let seconds = utterance.len() as f32 / audio::TARGET_HZ as f32;
+        let started = std::time::Instant::now();
 
-        for bloque in pendiente.chunks(MUESTRAS_BLOQUE) {
-            let hay_voz = energia(bloque) > UMBRAL_VOZ;
-
-            if hay_voz {
-                hablando = true;
-                bloques_con_voz += 1;
-                bloques_de_silencio = 0;
-            } else if hablando {
-                bloques_de_silencio += 1;
+        let transcript = match model.transcribe_samples(utterance, audio::TARGET_HZ, 1, None) {
+            Ok(result) => result.text.trim().to_string(),
+            Err(e) => {
+                eprintln!("  transcription failed: {e}");
+                continue;
             }
+        };
+        if transcript.is_empty() {
+            continue;
+        }
+        let elapsed_ms = started.elapsed().as_millis();
 
-            if hablando {
-                frase.extend_from_slice(bloque);
+        let (decision, confidence) = commands::decide(&transcript);
+        match &decision {
+            Decision::Ignored => println!("  «{transcript}»  (not addressed to me)"),
+            Decision::Unrecognised => {
+                println!("  «{transcript}»  ->  not understood");
+                actions::play_sound(sounds::UNSURE);
             }
-
-            let fin_por_silencio = hablando && bloques_de_silencio >= bloques_silencio_fin;
-            let fin_por_largo = frase.len() >= muestras_max;
-
-            if fin_por_silencio || fin_por_largo {
-                let suficiente = bloques_con_voz >= bloques_min_voz;
-                let audio = std::mem::take(&mut frase);
-                hablando = false;
-                bloques_con_voz = 0;
-                bloques_de_silencio = 0;
-
-                if !suficiente {
-                    continue; // ruido corto, no merece transcribirse
+            _ => {
+                if let Some(description) = commands::perform(&decision) {
+                    println!(
+                        "  «{transcript}»  ->  {description}  \
+                         [{:.0}% · {seconds:.1}s audio · {elapsed_ms} ms]",
+                        confidence * 100.0
+                    );
+                    actions::play_sound(sounds::DONE);
                 }
-
-                match modelo.transcribe_samples(audio, OBJETIVO_HZ, 1, None) {
-                    Ok(r) => {
-                        let texto = r.text.trim();
-                        if texto.is_empty() {
-                            continue;
-                        }
-                        match interpretar(texto) {
-                            Some(accion) => println!("  «{texto}»  ->  {accion}"),
-                            None => println!("  «{texto}»  (ignorado)"),
-                        }
-                    }
-                    Err(e) => eprintln!("  error al transcribir: {e}"),
+                if commands::is_sleep(&decision) {
+                    active.store(false, Ordering::Relaxed);
+                    println!("  (paused — resume from the menu bar)");
                 }
             }
         }
     }
+    Ok(())
+}
+
+/// Builds the menu bar item and hands control to AppKit. Never returns.
+fn run_menu_bar(active: Arc<AtomicBool>) -> Result<()> {
+    let mtm = MainThreadMarker::new()
+        .ok_or_else(|| anyhow!("the menu bar must be built on the main thread"))?;
+    let app = NSApplication::sharedApplication(mtm);
+    // Accessory: menu bar only, no Dock icon and no window.
+    app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+
+    let menu = Menu::new();
+    let listen = MenuItem::new("Escuchar", true, None);
+    let pause = MenuItem::new("Pausar", true, None);
+    let quit = MenuItem::new("Salir de Oyente", true, None);
+    menu.append(&listen)?;
+    menu.append(&pause)?;
+    menu.append(&PredefinedMenuItem::separator())?;
+    menu.append(&quit)?;
+
+    let listen_id = listen.id().clone();
+    let pause_id = pause.id().clone();
+    let quit_id = quit.id().clone();
+
+    // Held for the lifetime of the process: dropping it removes the icon.
+    let _tray = TrayIconBuilder::new()
+        .with_menu(Box::new(menu))
+        .with_title("🎙")
+        .with_tooltip("Oyente — control por voz")
+        .build()?;
+
+    // Menu events arrive on a global channel, which is Send, so they can be
+    // serviced from another thread while AppKit owns the main one.
+    std::thread::spawn(move || {
+        let events = MenuEvent::receiver();
+        while let Ok(event) = events.recv() {
+            if event.id == listen_id {
+                active.store(true, Ordering::Relaxed);
+                println!("(listening)");
+            } else if event.id == pause_id {
+                active.store(false, Ordering::Relaxed);
+                println!("(paused)");
+            } else if event.id == quit_id {
+                println!("Goodbye.");
+                std::process::exit(0);
+            }
+        }
+    });
+
+    app.run();
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    let model_path = locate_model(std::env::args().nth(1))?;
+
+    println!("Oyente — loading model…");
+    if !actions::has_accessibility_permission() {
+        eprintln!(
+            "Warning: no Accessibility permission. Commands that open apps\n\
+             will work, but those that press keys (copy, save, close tab)\n\
+             will do nothing and report no error.\n\
+             Grant it under System Settings → Privacy & Security →\n\
+             Accessibility.\n"
+        );
+    }
+
+    let active = Arc::new(AtomicBool::new(true));
+
+    let worker_active = Arc::clone(&active);
+    std::thread::spawn(move || {
+        if let Err(e) = listen_and_obey(model_path, worker_active) {
+            eprintln!("Error: {e:#}");
+            std::process::exit(1);
+        }
+    });
+
+    run_menu_bar(active)
 }

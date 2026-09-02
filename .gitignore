@@ -1,9 +1,9 @@
-# Compilación de Rust
+# Rust build output
 target/
 
-# Modelos de reconocimiento: 650 MB, se descargan con descargar-modelo.sh
-oyente/modelo/*.onnx
-oyente/modelo/*.onnx.data
+# Speech model: ~640 MB, fetched with oyente/download-model.sh
+oyente/model/*.onnx
+oyente/model/*.onnx.data
 
-# Registros
+# Logs
 *.log

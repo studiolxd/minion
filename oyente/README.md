@@ -1,78 +1,157 @@
 # Oyente
 
-Escucha continua en castellano y ejecuta órdenes. En Rust, sin Handy ni Talon.
+Control your Mac by speaking Spanish. Always listening, entirely offline.
 
-## Ejecutar
+```
+option-free:  «ordenador, abre Chrome»      → Chrome comes forward
+              «ordenador, guarda esto»      → ⌘S
+              «mañana quedamos a las cinco» → ignored
+```
+
+Lives in the menu bar as 🎙. No Dock icon, no window.
+
+## Why
+
+Talon has excellent command recognition but its Conformer engine is
+English-only, and no Spanish model exists. Handy understands Spanish
+beautifully but is push-to-talk. Oyente is the missing combination:
+Spanish recognition with hands-free listening.
+
+## Quick start
 
 ```bash
-cd /Users/suvi/Dev/talon/oyente
-./target/release/oyente modelo
+./download-model.sh          # ~640 MB, once
+cargo build --release
+./target/release/oyente
 ```
 
-Di: **«ordenador, abre Chrome»**. También valen Safari, Terminal y Orca, con
-cualquiera de estos verbos: abre, ábreme, ve a, vete a, cambia a, pon, ponme,
-dame, trae, tráeme, muestra, enfoca.
+Grant microphone access when asked. For commands that press keys (copy,
+save, close tab) also grant Accessibility under System Settings → Privacy
+& Security. Without it those commands silently do nothing — the program
+warns about this at startup.
 
-Imprime **todo** lo que oye, marcando qué hizo con ello:
-
-```
-  «Ordenador, abre Chrome.»   ->  abrir Chrome
-  «pues no sé qué decirte»    (ignorado)
-```
-
-Ctrl-C para salir.
-
-## Cómo está montado
+## How it works
 
 ```
-micrófono (48 kHz)
-    ↓  remuestreo tosco, sin filtro antialias
+microphone (48 kHz)
+    │  downmix and decimate
 16 kHz mono
-    ↓  detección de voz por energía (RMS)
-frase completa
-    ↓  Parakeet TDT 0.6b v3, ONNX int8, por CPU
-texto en castellano
-    ↓  ¿empieza por "ordenador"?
-orden ejecutada
+    │  energy-based speech detection
+one utterance
+    │  Parakeet TDT 0.6b v3, ONNX int8, on CPU
+Spanish text
+    │  does it start with "ordenador"?
+command executed
 ```
 
-- **Modelo**: `modelo/` — Parakeet TDT v3 int8 (25 idiomas), descargado de
-  `istupakov/parakeet-tdt-0.6b-v3-onnx`. Son 652 MB, no están en git.
-- **Crates**: `parakeet-rs` (ONNX Runtime), `cpal` (audio), `anyhow`.
-- CoreML está marcado como inestable en la crate, así que va por CPU.
+Everything runs locally. Nothing is sent anywhere.
 
-## Los números que habrá que afinar
+## Speaking to it
 
-Están todos juntos arriba de `src/main.rs`:
+Every command opens with the wake word — **ordenador**. Only at the start,
+so "le dije al ordenador que abriera Chrome" does nothing.
 
-| Constante | Valor | Qué pasa si está mal |
+Phrasing is forgiving by design. Filler words are dropped and verbs are
+reduced to one form, so a single entry in the table covers the ways people
+actually speak:
+
+| These all work | |
+|---|---|
+| «ordenador, cierra la ventana» | the natural phrasing |
+| «ordenador, cerrar ventana» | infinitive, no article |
+| «ordenador, cierra ventana» | clipped |
+| «ordenador, cierra la ventana por favor» | with politeness |
+
+### Applications
+
+«ordenador, **abre** Chrome» — and also *ábreme, ve a, vete a, cambia a,
+pon, ponme, dame, trae, tráeme, muestra, enfoca, saca, lanza*. Or just name
+it: «ordenador, Spotify».
+
+Chrome · Safari · Terminal · Orca · Finder · Mail · Notas · Calendario ·
+Spotify · WhatsApp · Telegram · Figma · Obsidian · Discord · Teams ·
+VS Code · Claude · ChatGPT · Ajustes · Vista Previa · Monitor de Actividad
+
+### Commands
+
+| Editing | Tabs and windows |
+|---|---|
+| copia esto · pega esto · corta esto | abre una pestaña nueva |
+| guarda esto | cierra la pestaña · recupera la pestaña |
+| deshaz el cambio · rehaz el cambio | pasa a la siguiente pestaña |
+| selecciona todo · borra esto | cierra la ventana · abre una ventana nueva |
+| busca en la página | minimiza · pon la pantalla completa · esconde la aplicación |
+
+| Navigation | System |
+|---|---|
+| vuelve atrás · ve adelante | captura la pantalla · recorta la pantalla |
+| recarga la página | abre Spotlight · bloquea la pantalla |
+| sube del todo · baja del todo | sube el volumen · baja el volumen |
+| ve a la barra de direcciones | quita el sonido · devuelve el sonido |
+
+| Music (Spotify) | Oyente itself |
+|---|---|
+| pon la música · para la música | deja de escuchar |
+| siguiente canción · canción anterior | (resume from the menu bar) |
+
+## Tuning
+
+The four numbers governing speech detection live at the top of
+`src/audio.rs`:
+
+| Setting | Default | If it is wrong |
 |---|---|---|
-| `UMBRAL_VOZ` | 0.015 | Alto: corta frases. Bajo: transcribe el ventilador |
-| `SILENCIO_FIN_MS` | 700 | Bajo: parte frases al pensar. Alto: tarda en responder |
-| `MIN_VOZ_MS` | 300 | Filtra golpes y ruidos cortos |
-| `MAX_FRASE_MS` | 12000 | Corte de seguridad |
+| `speech_threshold` | 0.015 | Too high: clips words. Too low: transcribes the fan |
+| `silence_end_ms` | 700 | Too low: splits sentences mid-thought. Too high: sluggish |
+| `min_speech_ms` | 300 | Filters out door slams and coughs |
+| `max_utterance_ms` | 12000 | Safety cut against continuous noise |
 
-## Lo que falta
+`THRESHOLD` in `src/commands.rs` is the match confidence needed to act. It
+errs high on purpose: with an always-on microphone, firing a command that
+was never spoken is much worse than missing one.
 
-- **VAD de verdad** (Silero) en vez de energía. La energía no distingue voz de
-  un portazo, y con música de fondo se dispara constantemente.
-- **Pulsar teclas**: copiar, guardar, cerrar pestaña. Necesita permiso de
-  Accesibilidad para este binario.
-- **Contexto por aplicación**: que una orden signifique cosas distintas según
-  lo que esté delante.
-- **Dictado**: ahora solo ejecuta órdenes, no escribe texto.
-- **Arranque automático**: un `launchd` plist para que se inicie solo.
-- **Firma del binario**: para que los permisos de micrófono salgan a nombre de
-  Oyente y no del terminal desde el que se lanza.
+## Design notes
 
-## Historia
+**Deciding and acting are separate.** `commands::decide` is pure and
+returns a `Decision`; `commands::perform` carries it out. That is what
+makes the vocabulary testable without applications opening for real —
+the test suite checks all 970 phrases without touching the system.
 
-Este proyecto sustituye a dos anteriores, ambos retirados:
+**Key codes are positional, not character-based.** Code 8 is wherever `C`
+sits on a US keyboard, which on a Spanish ISO layout is also `C`, so ⌘C
+works on both. Symbols are the exception: `[`, `]` and `=` are elsewhere
+entirely, and shortcuts using them fail silently. That is why navigation
+uses ⌘← rather than ⌘[.
 
-1. **Talon** (`../talon-archivo/`): excelente precisión, pero su motor
-   Conformer solo entiende inglés y no existe versión española.
-2. **Handy + script Python** (`../voz/`): entendía castellano de sobra, pero
-   sin manos libres — había que pulsar `option+space` para cada orden.
+**Edit distance is capped at one.** Two edits turns *ventana* into
+*pestana*, *copiar* into *cortar* and *deshacer* into *rehacer* — pairs of
+commands that do very different things. Bigger recogniser mangles are
+handled by listing the mangled form as an alias, which is explicit and
+safe. "cromo" is in the table because that is what saying *Chrome* in
+Spanish actually produces.
 
-El README de cada uno documenta las trampas que costaron tiempo, por si algún
-día hay que volver.
+**`open -b` rather than activating a process.** It covers three cases at
+once: app not running, running with no windows, and running with a window.
+The middle one is common on macOS, where closing the last window does not
+quit the app.
+
+## Testing
+
+```bash
+cargo test
+```
+
+26 tests. The ones that matter most check that ordinary conversation is
+ignored, that every declared phrase reaches its own command, and that no
+two commands claim the same phrase.
+
+## Not done yet
+
+- **Real VAD.** Energy cannot tell speech from a door slam, and background
+  music keeps it triggering. Silero VAD is the next step.
+- **Dictation.** Oyente runs commands; it does not type text.
+- **Per-application context**, so one phrase means different things
+  depending on what is in front.
+- **App bundle and signing**, so microphone permission is attributed to
+  Oyente rather than to the terminal that launched it.
+- **Launch at login** via a launchd agent.
