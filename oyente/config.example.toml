@@ -8,6 +8,12 @@
 # Pick something you would not say by accident in conversation.
 # wake_words = ["ordenador"]
 
+# Write down speech that was not addressed to Oyente. Off by default:
+# with the microphone always on, anything said nearby gets transcribed,
+# and keeping other people's conversations on disk is not something you
+# asked for. Turn it on while tuning, when the exact wording is the point.
+# log_ignored_speech = false
+
 # Confidence needed before acting, 0.3 to 1.0. Default 0.7.
 # Raise it if commands fire when you did not mean them; lower it if you
 # have to repeat yourself. With an always-on microphone, err high.

@@ -94,6 +94,7 @@ fn locate_model(argument: Option<String>) -> Result<String> {
 fn listen_and_obey(
     model_path: String,
     settings: audio::Settings,
+    log_ignored_speech: bool,
     active: Arc<AtomicBool>,
 ) -> Result<()> {
     let mut model = ParakeetTDT::from_pretrained(&model_path, None)
@@ -132,7 +133,15 @@ fn listen_and_obey(
 
         let (decision, confidence) = commands::decide(&transcript);
         match &decision {
-            Decision::Ignored => note!("heard    «{transcript}»  (not addressed to me)"),
+            Decision::Ignored => {
+                // Speech that was not for us. The wording is only written
+                // down when explicitly asked for: see log_ignored_speech.
+                if log_ignored_speech {
+                    note!("heard    «{transcript}»  (not addressed to me)");
+                } else {
+                    note!("heard    {seconds:.1}s of speech, not addressed to me");
+                }
+            }
             Decision::Unrecognised => {
                 note!("unknown  «{transcript}»  ->  not understood");
                 actions::play_sound(sounds::UNSURE);
@@ -241,6 +250,7 @@ fn main() -> Result<()> {
     let config = config::load();
     commands::configure(&config);
     let audio_settings = config.audio_settings();
+    let log_ignored = config.log_ignored_speech;
 
     note!("Oyente starting — loading model…");
     if let Some(log) = journal::path() {
@@ -260,7 +270,12 @@ fn main() -> Result<()> {
 
     let worker_active = Arc::clone(&active);
     std::thread::spawn(move || {
-        if let Err(e) = listen_and_obey(model_path, audio_settings, worker_active) {
+        if let Err(e) = listen_and_obey(
+            model_path,
+            audio_settings,
+            log_ignored,
+            worker_active,
+        ) {
             eprintln!("Error: {e:#}");
             std::process::exit(1);
         }

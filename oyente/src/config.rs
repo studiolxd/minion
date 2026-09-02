@@ -23,6 +23,15 @@ pub struct Config {
     /// Confidence required before acting, from 0 to 1.
     pub threshold: Option<f32>,
 
+    /// Whether to write down speech that was not addressed to Oyente.
+    ///
+    /// Off by default, and deliberately so: with the microphone always on,
+    /// anything said nearby gets transcribed, and keeping that on disk is
+    /// not something anyone asked for. Turn it on while tuning, when
+    /// seeing the exact wording is the whole point.
+    #[serde(default)]
+    pub log_ignored_speech: bool,
+
     #[serde(default)]
     pub audio: AudioConfig,
 
@@ -128,6 +137,12 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overheard_speech_is_not_logged_by_default() {
+        let config: Config = toml::from_str("").expect("empty config should parse");
+        assert!(!config.log_ignored_speech);
+    }
 
     #[test]
     fn an_empty_file_yields_defaults() {
