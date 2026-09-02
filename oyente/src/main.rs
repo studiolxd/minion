@@ -10,16 +10,22 @@
 mod actions;
 mod audio;
 mod commands;
+mod config;
 mod spanish;
 mod text;
 
+use std::cell::Cell;
 use std::path::Path;
+use std::ptr::NonNull;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
+use block2::RcBlock;
 use objc2::MainThreadMarker;
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
+use objc2_foundation::NSTimer;
 use parakeet_rs::{ParakeetTDT, Transcriber};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::TrayIconBuilder;
@@ -33,10 +39,20 @@ mod sounds {
     pub const UNSURE: &str = "/System/Library/Sounds/Tink.aiff";
 }
 
+/// What the menu bar shows in each state.
+mod icon {
+    pub const LISTENING: &str = "🎙";
+    pub const PAUSED: &str = "😴";
+}
+
+/// How often the menu bar checks whether the state changed.
+const ICON_REFRESH_SECONDS: f64 = 0.4;
+
 /// Locates the speech model.
 ///
-/// Order: explicit argument, `OYENTE_MODEL` in the environment, then the
-/// usual spots relative to the working directory.
+/// Order: explicit argument, `OYENTE_MODEL`, the app bundle's Resources,
+/// then the working directory. The bundle case is what makes double-click
+/// launching work, since a bundled app starts with `/` as its directory.
 fn locate_model(argument: Option<String>) -> Result<String> {
     if let Some(path) = argument {
         return Ok(path);
@@ -44,26 +60,48 @@ fn locate_model(argument: Option<String>) -> Result<String> {
     if let Ok(path) = std::env::var("OYENTE_MODEL") {
         return Ok(path);
     }
-    for candidate in ["model", "modelo", "../model", "../../model"] {
-        if Path::new(candidate).join("vocab.txt").exists() {
-            return Ok(candidate.to_string());
+
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+
+    // Inside the app bundle: Contents/MacOS/oyente -> Contents/Resources/model
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(macos_dir) = executable.parent() {
+            candidates.push(macos_dir.join("../Resources/model"));
+            candidates.push(macos_dir.join("model"));
+        }
+    }
+    candidates.push(Path::new("model").to_path_buf());
+    candidates.push(Path::new("../model").to_path_buf());
+
+    // Installed alongside user data.
+    if let Ok(home) = std::env::var("HOME") {
+        candidates.push(Path::new(&home).join("Library/Application Support/Oyente/model"));
+    }
+
+    for candidate in candidates {
+        if candidate.join("vocab.txt").exists() {
+            return Ok(candidate.to_string_lossy().into_owned());
         }
     }
     Err(anyhow!(
-        "speech model not found. Run ./download-model.sh, or pass the path \
+        "speech model not found. Run ./download-model.sh, or pass its path \
          as an argument."
     ))
 }
 
 /// The recognition loop. Owns the model and runs on its own thread.
-fn listen_and_obey(model_path: String, active: Arc<AtomicBool>) -> Result<()> {
+fn listen_and_obey(
+    model_path: String,
+    settings: audio::Settings,
+    active: Arc<AtomicBool>,
+) -> Result<()> {
     let mut model = ParakeetTDT::from_pretrained(&model_path, None)
         .map_err(|e| anyhow!("{e}"))
         .with_context(|| format!("loading the model from '{model_path}'"))?;
     println!("Model loaded.");
 
-    let listener = audio::start(audio::Settings::default(), Arc::clone(&active))
-        .context("opening the microphone")?;
+    let listener =
+        audio::start(settings, Arc::clone(&active)).context("opening the microphone")?;
     println!(
         "Microphone: {} Hz, {} channel(s)",
         listener.source_hz, listener.channels
@@ -138,14 +176,43 @@ fn run_menu_bar(active: Arc<AtomicBool>) -> Result<()> {
     let quit_id = quit.id().clone();
 
     // Held for the lifetime of the process: dropping it removes the icon.
-    let _tray = TrayIconBuilder::new()
-        .with_menu(Box::new(menu))
-        .with_title("🎙")
-        .with_tooltip("Oyente — control por voz")
-        .build()?;
+    let tray = Rc::new(
+        TrayIconBuilder::new()
+            .with_menu(Box::new(menu))
+            .with_title(icon::LISTENING)
+            .with_tooltip("Oyente — control por voz")
+            .build()?,
+    );
+
+    // The state can change from the menu or from a spoken "deja de
+    // escuchar", and the second happens on the recognition thread, which
+    // must not touch AppKit. A timer on the main run loop is the bridge:
+    // it polls the flag and repaints the icon when it differs.
+    let tray_for_timer = Rc::clone(&tray);
+    let active_for_timer = Arc::clone(&active);
+    let shown_as_listening = Cell::new(true);
+    let repaint = RcBlock::new(move |_timer: NonNull<NSTimer>| {
+        let listening = active_for_timer.load(Ordering::Relaxed);
+        if listening == shown_as_listening.get() {
+            return;
+        }
+        shown_as_listening.set(listening);
+        let title = if listening { icon::LISTENING } else { icon::PAUSED };
+        tray_for_timer.set_title(Some(title));
+    });
+    // Safety: the block only touches the tray icon and an atomic flag, and
+    // the timer fires on the main thread, which is where the tray lives.
+    let _timer = unsafe {
+        NSTimer::scheduledTimerWithTimeInterval_repeats_block(
+            ICON_REFRESH_SECONDS,
+            true,
+            &repaint,
+        )
+    };
 
     // Menu events arrive on a global channel, which is Send, so they can be
-    // serviced from another thread while AppKit owns the main one.
+    // serviced from another thread while AppKit owns the main one. The icon
+    // itself is repainted by the timer above, not from here.
     std::thread::spawn(move || {
         let events = MenuEvent::receiver();
         while let Ok(event) = events.recv() {
@@ -169,6 +236,10 @@ fn run_menu_bar(active: Arc<AtomicBool>) -> Result<()> {
 fn main() -> Result<()> {
     let model_path = locate_model(std::env::args().nth(1))?;
 
+    let config = config::load();
+    commands::configure(&config);
+    let audio_settings = config.audio_settings();
+
     println!("Oyente — loading model…");
     if !actions::has_accessibility_permission() {
         eprintln!(
@@ -184,7 +255,7 @@ fn main() -> Result<()> {
 
     let worker_active = Arc::clone(&active);
     std::thread::spawn(move || {
-        if let Err(e) = listen_and_obey(model_path, worker_active) {
+        if let Err(e) = listen_and_obey(model_path, audio_settings, worker_active) {
             eprintln!("Error: {e:#}");
             std::process::exit(1);
         }

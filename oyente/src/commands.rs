@@ -6,18 +6,56 @@
 //! a microphone that is always on, ignoring is the default and acting is the
 //! exception.
 
+use std::sync::OnceLock;
+
 use crate::actions::{self, key, Mods};
+use crate::config::Config;
 use crate::text::{keywords, normalise, similarity};
 
 /// Words that mark a sentence as a command. Only counted at the start.
-pub const WAKE_WORDS: &[&str] = &["ordenador", "ordenadora", "computador", "computadora"];
+pub const DEFAULT_WAKE_WORDS: &[&str] =
+    &["ordenador", "ordenadora", "computador", "computadora"];
+
+/// Set once at startup from the configuration file. Absent means defaults.
+static USER_APPS: OnceLock<Vec<App>> = OnceLock::new();
+static USER_WAKE_WORDS: OnceLock<Vec<&'static str>> = OnceLock::new();
+static USER_THRESHOLD: OnceLock<f32> = OnceLock::new();
+
+/// Applies the user configuration. Call once, before anything is decided.
+pub fn configure(config: &Config) {
+    let extra = config.extra_apps();
+    if !extra.is_empty() {
+        let _ = USER_APPS.set(extra);
+    }
+    if let Some(words) = config.wake_words() {
+        let _ = USER_WAKE_WORDS.set(words);
+    }
+    if let Some(threshold) = config.threshold {
+        let _ = USER_THRESHOLD.set(threshold.clamp(0.3, 1.0));
+    }
+}
+
+/// Wake words in force: the user's if configured, otherwise the defaults.
+fn wake_words() -> &'static [&'static str] {
+    USER_WAKE_WORDS.get().map_or(DEFAULT_WAKE_WORDS, |w| w.as_slice())
+}
+
+/// Confidence required to act.
+fn threshold() -> f32 {
+    *USER_THRESHOLD.get().unwrap_or(&DEFAULT_THRESHOLD)
+}
+
+/// Every application, built in and user-added.
+fn all_apps() -> impl Iterator<Item = &'static App> {
+    APPS.iter().chain(USER_APPS.get().into_iter().flatten())
+}
 
 /// Minimum similarity for a phrase to count as a command.
 ///
 /// Raising it means more commands are missed; lowering it means commands
 /// fire that were never spoken. With an always-on microphone, firing
 /// wrongly is far worse than missing one, so this errs high.
-pub const THRESHOLD: f32 = 0.7;
+pub const DEFAULT_THRESHOLD: f32 = 0.7;
 
 /// Verbs that introduce an application name, in canonical form.
 ///
@@ -30,7 +68,6 @@ const APP_VERBS: &[&str] = &[
 
 #[derive(Clone, Copy, Debug)]
 pub enum Action {
-    Launch(&'static str),
     Key(u16, Mods),
     Volume(i32),
     Mute(bool),
@@ -206,7 +243,7 @@ pub enum Decision {
 /// Strips the wake word. Returns `None` if the sentence is not a command.
 fn strip_wake_word(phrase: &str) -> Option<&str> {
     let first = phrase.split_whitespace().next()?;
-    WAKE_WORDS
+    wake_words()
         .contains(&first)
         .then(|| phrase[first.len()..].trim())
 }
@@ -214,7 +251,7 @@ fn strip_wake_word(phrase: &str) -> Option<&str> {
 /// Finds an application named in the sentence, with its match score.
 fn find_app(rest: &str) -> Option<(&'static App, f32)> {
     let mut best: Option<(&App, f32)> = None;
-    for app in APPS {
+    for app in all_apps() {
         for alias in app.aliases {
             // A literal mention beats a fuzzy one; longer aliases beat
             // shorter ones, so "vs code" wins over a stray "code".
@@ -223,7 +260,7 @@ fn find_app(rest: &str) -> Option<(&'static App, f32)> {
             } else {
                 similarity(rest, alias)
             };
-            if score >= THRESHOLD && best.is_none_or(|(_, b)| score > b) {
+            if score >= threshold() && best.is_none_or(|(_, b)| score > b) {
                 best = Some((app, score));
             }
         }
@@ -246,7 +283,7 @@ pub fn decide(transcript: &str) -> (Decision, f32) {
     for command in COMMANDS {
         for phrase in command.phrases {
             let score = similarity(rest, phrase);
-            if score >= THRESHOLD && best.is_none_or(|(_, b)| score > b) {
+            if score >= threshold() && best.is_none_or(|(_, b)| score > b) {
                 best = Some((command, score));
             }
         }
@@ -283,7 +320,6 @@ pub fn perform(decision: &Decision) -> Option<String> {
         Decision::Run(name) => {
             let command = COMMANDS.iter().find(|c| c.name == *name)?;
             match command.action {
-                Action::Launch(bundle_id) => actions::open_app(bundle_id),
                 Action::Key(code, mods) => actions::press(code, mods),
                 Action::Volume(delta) => actions::adjust_volume(delta),
                 Action::Mute(muted) => actions::set_muted(muted),
@@ -304,8 +340,7 @@ pub fn is_sleep(decision: &Decision) -> bool {
 /// Total number of distinct phrases understood, for the startup banner.
 pub fn phrase_count() -> usize {
     let from_commands: usize = COMMANDS.iter().map(|c| c.phrases.len()).sum();
-    let from_apps: usize = APPS
-        .iter()
+    let from_apps: usize = all_apps()
         .map(|a| a.aliases.len() * (APP_VERBS.len() + 1))
         .sum();
     from_commands + from_apps
@@ -441,7 +476,7 @@ mod tests {
 
     #[test]
     fn every_app_alias_reaches_its_app() {
-        for app in APPS {
+        for app in all_apps() {
             for alias in app.aliases {
                 let spoken = format!("ordenador abre {alias}");
                 match decide(&spoken).0 {

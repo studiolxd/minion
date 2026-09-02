@@ -162,7 +162,7 @@ pub fn start(settings: Settings, active: Arc<AtomicBool>) -> Result<Listener> {
     let capture_active = Arc::clone(&active);
 
     let stream = device.build_input_stream(
-        config.clone().into(),
+        config.into(),
         move |input: &[f32], _: &cpal::InputCallbackInfo| {
             // Audio callbacks must stay quick: resample and hand off, no
             // heavy work here or the stream glitches.

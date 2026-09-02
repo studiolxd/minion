@@ -20,7 +20,14 @@ Spanish recognition with hands-free listening.
 ## Quick start
 
 ```bash
-./download-model.sh          # ~640 MB, once
+./download-model.sh    # ~640 MB, once
+./install.sh           # builds, installs to /Applications, starts at login
+```
+
+Or to run it without installing:
+
+```bash
+./download-model.sh
 cargo build --release
 ./target/release/oyente
 ```
@@ -29,6 +36,13 @@ Grant microphone access when asked. For commands that press keys (copy,
 save, close tab) also grant Accessibility under System Settings → Privacy
 & Security. Without it those commands silently do nothing — the program
 warns about this at startup.
+
+Installing as an app matters for more than tidiness: macOS attributes
+permissions to whichever binary asks for them. Run from a terminal and the
+microphone permission belongs to the terminal, which then grants it to
+every script you run there. Bundled, it is Oyente's alone.
+
+`./uninstall.sh` removes it.
 
 ## How it works
 
@@ -94,10 +108,34 @@ VS Code · Claude · ChatGPT · Ajustes · Vista Previa · Monitor de Actividad
 | pon la música · para la música | deja de escuchar |
 | siguiente canción · canción anterior | (resume from the menu bar) |
 
+## Configuration
+
+Copy `config.example.toml` to
+`~/Library/Application Support/Oyente/config.toml`. Everything in it is
+optional, and it is read once at startup.
+
+It covers the wake words, the confidence threshold, the speech detection
+numbers, and extra applications — so adding your own apps or retuning the
+listener needs no Rust toolchain:
+
+```toml
+threshold = 0.75
+
+[audio]
+silence_end_ms = 900
+
+[[apps]]
+name = "Notion"
+bundle_id = "notion.id"
+aliases = ["notion", "nocion"]
+```
+
+A typo in the file is reported at startup and then ignored; it will not
+stop Oyente from running.
+
 ## Tuning
 
-The four numbers governing speech detection live at the top of
-`src/audio.rs`:
+The defaults for speech detection, overridable in the config file:
 
 | Setting | Default | If it is wrong |
 |---|---|---|
@@ -106,9 +144,9 @@ The four numbers governing speech detection live at the top of
 | `min_speech_ms` | 300 | Filters out door slams and coughs |
 | `max_utterance_ms` | 12000 | Safety cut against continuous noise |
 
-`THRESHOLD` in `src/commands.rs` is the match confidence needed to act. It
-errs high on purpose: with an always-on microphone, firing a command that
-was never spoken is much worse than missing one.
+`threshold` is the match confidence needed to act. It errs high on purpose:
+with an always-on microphone, firing a command that was never spoken is
+much worse than missing one.
 
 ## Design notes
 
@@ -141,9 +179,14 @@ quit the app.
 cargo test
 ```
 
-26 tests. The ones that matter most check that ordinary conversation is
+30 tests. The ones that matter most check that ordinary conversation is
 ignored, that every declared phrase reaches its own command, and that no
 two commands claim the same phrase.
+
+They have already earned their keep: they caught "cortar" being executed as
+"copiar", "cierra la ventana" running "cerrar pestaña", and "rehaz" landing
+on "deshacer" — all from an edit-distance allowance that was one step too
+generous.
 
 ## Not done yet
 
@@ -152,6 +195,6 @@ two commands claim the same phrase.
 - **Dictation.** Oyente runs commands; it does not type text.
 - **Per-application context**, so one phrase means different things
   depending on what is in front.
-- **App bundle and signing**, so microphone permission is attributed to
-  Oyente rather than to the terminal that launched it.
-- **Launch at login** via a launchd agent.
+- **Custom key commands in the config file**, not just applications.
+- **Developer ID signing**, so the app can be shared with other machines.
+  The ad-hoc signature is enough for this one.

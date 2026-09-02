@@ -1,0 +1,48 @@
+# Oyente configuration — every setting is optional.
+#
+# Copy to:  ~/Library/Application Support/Oyente/config.toml
+# Restart Oyente afterwards; it is read once at startup.
+
+# Words that turn a sentence into a command. Setting this REPLACES the
+# defaults ("ordenador", "ordenadora", "computador", "computadora").
+# Pick something you would not say by accident in conversation.
+# wake_words = ["ordenador"]
+
+# Confidence needed before acting, 0.3 to 1.0. Default 0.7.
+# Raise it if commands fire when you did not mean them; lower it if you
+# have to repeat yourself. With an always-on microphone, err high.
+# threshold = 0.7
+
+[audio]
+# RMS energy above which someone is considered to be speaking.
+# Too high clips the start of words; too low transcribes the fan.
+# speech_threshold = 0.015
+
+# Silence that ends a sentence, in milliseconds. Too low splits sentences
+# when you pause to think; too high makes it feel sluggish.
+# silence_end_ms = 700
+
+# Anything shorter than this is a noise, not speech. Filters door slams.
+# min_speech_ms = 300
+
+# Safety cut, so continuous noise cannot buffer forever.
+# max_utterance_ms = 12000
+
+# Extra applications, added to the built-in list.
+#
+# Find a bundle id with:
+#   defaults read "/Applications/Whatever.app/Contents/Info" CFBundleIdentifier
+#
+# For aliases, put down what the recogniser actually hears, not just the
+# correct spelling — saying "Chrome" in Spanish often comes out as "cromo".
+# Check the terminal output to see what it heard.
+
+# [[apps]]
+# name = "Notion"
+# bundle_id = "notion.id"
+# aliases = ["notion", "nocion"]
+
+# [[apps]]
+# name = "Linear"
+# bundle_id = "com.linear"
+# aliases = ["linear", "linia"]
