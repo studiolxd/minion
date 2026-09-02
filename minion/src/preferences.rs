@@ -25,7 +25,7 @@ use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 use crate::{config, startup};
 
 const WIDTH: f64 = 380.0;
-const HEIGHT: f64 = 384.0;
+const HEIGHT: f64 = 470.0;
 const MARGIN: f64 = 22.0;
 
 /// A slider's range and the setting behind it.
@@ -80,6 +80,8 @@ pub struct Preferences {
     sensitivity: Dial,
     pause: Dial,
     memory: Dial,
+    shortcut: Retained<NSTextField>,
+    last_shortcut: std::cell::RefCell<String>,
 }
 
 fn label(mtm: MainThreadMarker, text: &str, frame: NSRect, small: bool) -> Retained<NSTextField> {
@@ -126,7 +128,11 @@ fn slider(mtm: MainThreadMarker, y: f64, range: (f64, f64), value: f64, steps: u
         ),
         true,
     );
-    Dial { control, readout, last: Cell::new(value) }
+    // Read back rather than trusting what was set: with tick marks the
+    // control snaps to the nearest one, and the difference would look like
+    // the user had moved it — writing the setting back on every launch.
+    let settled = control.doubleValue();
+    Dial { control, readout, last: Cell::new(settled) }
 }
 
 /// How the sensitivity number reads to a person.
@@ -165,6 +171,8 @@ impl Preferences {
         };
 
         // Laid out from the top down, which is how it reads.
+        // Laid out downwards from the top, leaving MARGIN clear at the
+        // bottom: the last control was sitting on the window's edge.
         let mut y = HEIGHT - 52.0;
         let content = window.contentView().expect("a window has a content view");
 
@@ -260,6 +268,34 @@ impl Preferences {
         let memory = slider(mtm, y, (0.0, 30.0), minutes, 7);
         add(&memory.control);
         add(&memory.readout);
+        y -= 40.0;
+
+        add(&label(
+            mtm,
+            "Atajo para pausar y reanudar",
+            NSRect::new(NSPoint::new(MARGIN, y), NSSize::new(260.0, 18.0)),
+            false,
+        ));
+        y -= 28.0;
+        let current = settings
+            .resume_shortcut()
+            .unwrap_or_else(|| config::DEFAULT_RESUME_SHORTCUT.to_string());
+        let shortcut = NSTextField::new(mtm);
+        shortcut.setStringValue(&NSString::from_str(&current));
+        shortcut.setFrame(NSRect::new(
+            NSPoint::new(MARGIN, y),
+            NSSize::new(150.0, 24.0),
+        ));
+        add(&shortcut);
+        add(&label(
+            mtm,
+            "Escríbelo como en un menú: alt-space, ctrl+shift+m.",
+            NSRect::new(
+                NSPoint::new(MARGIN + 162.0, y + 4.0),
+                NSSize::new(WIDTH - MARGIN * 2.0 - 162.0, 32.0),
+            ),
+            true,
+        ));
 
         let preferences = Self {
             window,
@@ -269,6 +305,8 @@ impl Preferences {
             sensitivity,
             pause,
             memory,
+            shortcut,
+            last_shortcut: std::cell::RefCell::new(current),
         };
         preferences.update_readouts();
         preferences
@@ -334,6 +372,19 @@ impl Preferences {
         }
         if let Some(value) = self.memory.moved() {
             save("unload_after_minutes", &format!("{value:.0}"));
+            changed = true;
+        }
+
+        // The shortcut is text, so it is only worth saving once it reads as
+        // a shortcut — otherwise every keystroke of typing "alt-space"
+        // would be written, and most of them are not valid.
+        let typed = self.shortcut.stringValue().to_string();
+        let unchanged = typed == *self.last_shortcut.borrow();
+        let readable =
+            typed.trim().is_empty() || crate::actions::parse_shortcut(&typed).is_some();
+        if !unchanged && readable {
+            save("resume_shortcut", &format!("\"{}\"", typed.trim()));
+            *self.last_shortcut.borrow_mut() = typed;
             changed = true;
         }
 

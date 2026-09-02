@@ -353,7 +353,8 @@ pub const COMMANDS: &[Command] = &[
               action: Action::Script("tell application \"Spotify\" to previous track") },
 
     // --- Minion itself ---
-    Command { phrases: &["deja de escuchar"], name: "dormir",
+    Command { phrases: &["deja de escuchar", "duermete", "duerme", "silenciate",
+                         "apagate", "descansa", "callate"], name: "dormir",
               action: Action::Sleep },
 ];
 
@@ -1174,6 +1175,21 @@ mod tests {
     fn short_phrases_stay_commands() {
         // "pon la música" must not become a request to type "la música".
         assert_eq!(decision("Minion pon la música."), Decision::Run("reproducir"));
+    }
+
+    #[test]
+    fn many_ways_to_ask_for_quiet() {
+        for phrase in [
+            "deja de escuchar", "duérmete", "duerme", "silénciate",
+            "apágate", "descansa", "cállate",
+        ] {
+            let spoken = format!("minion {phrase}");
+            assert_eq!(
+                decide(&spoken).0,
+                Decision::Run("dormir"),
+                "«{spoken}» should pause"
+            );
+        }
     }
 
     #[test]

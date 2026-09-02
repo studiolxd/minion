@@ -14,6 +14,9 @@ use serde::Deserialize;
 /// Idle minutes before the model is released, when the file says nothing.
 const DEFAULT_UNLOAD_MINUTES: u64 = 5;
 
+/// Shortcut that pauses and resumes when nothing is set.
+pub const DEFAULT_RESUME_SHORTCUT: &str = "alt-space";
+
 /// Cosine similarity a voice must reach to be treated as yours.
 ///
 /// ECAPA embeddings of the same person typically score well above this and
@@ -86,6 +89,13 @@ pub struct Config {
     /// one, default 0.45.
     pub voice_threshold: Option<f32>,
 
+    /// Keyboard shortcut that pauses and resumes from anywhere.
+    ///
+    /// Pausing by voice is easy; getting attention back is not, since a
+    /// paused microphone hears nothing. Written as it appears on a menu:
+    /// "alt-space", "ctrl+shift+m". Empty disables it.
+    pub resume_shortcut: Option<String>,
+
     /// Entirely new commands, bound to a keyboard shortcut.
     #[serde(default)]
     pub commands: Vec<CommandConfig>,
@@ -143,6 +153,7 @@ impl Default for Config {
             aliases: Vec::new(),
             commands: Vec::new(),
             voice_threshold: None,
+            resume_shortcut: None,
             unload_after_minutes: None,
         }
     }
@@ -294,6 +305,15 @@ impl Config {
                 ),
             })
             .collect()
+    }
+
+    /// The shortcut that pauses and resumes, or none.
+    pub fn resume_shortcut(&self) -> Option<String> {
+        let shortcut = self
+            .resume_shortcut
+            .clone()
+            .unwrap_or_else(|| DEFAULT_RESUME_SHORTCUT.to_string());
+        (!shortcut.trim().is_empty()).then_some(shortcut)
     }
 
     /// Confidence a phrase needs before it is acted on.

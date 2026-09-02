@@ -54,9 +54,15 @@ fn timestamp() -> String {
 }
 
 /// Writes one line to the log and to stdout.
+///
+/// Under test it stays on stdout: the log belongs to the person running
+/// Minion, and a test run should not leave entries in it.
 pub fn write(line: &str) {
     let stamped = format!("{}  {line}", timestamp());
     println!("{stamped}");
+    if cfg!(test) {
+        return;
+    }
     if let Some(file) = handle() {
         if let Ok(mut file) = file.lock() {
             let _ = writeln!(file, "{stamped}");

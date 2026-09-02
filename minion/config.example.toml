@@ -3,15 +3,52 @@
 Control your Mac by speaking Spanish. Always listening, entirely offline.
 
 ```
-option-free:  «minion, abre Chrome»      → Chrome comes forward
-              «minion, guarda esto»      → ⌘S
-              «mañana quedamos a las cinco» → ignored
+«minion, abre Chrome»          → Chrome comes forward
+«minion, guarda esto»          → ⌘S
+«mañana quedamos a las cinco»  → ignored
 ```
 
-Lives in the menu bar as 🎙 — 😴 when paused. No Dock icon, no window.
+Lives in the menu bar as a small face — eye open while listening, eye shut
+when paused. No Dock icon.
 
-The menu holds one toggle (Pausar / Escuchar), *Aprender del registro…*,
-*Ver el registro*, and Salir.
+The menu holds one toggle (Pausar / Escuchar), a **Registro** submenu with
+*Aprender* and *Ver el registro*, *Preferencias…*, and Salir.
+
+The icon is a template image drawn once as SVG, rendered for the menu bar
+at run time and for the app at build time, so the two cannot drift apart.
+macOS tints it from its alpha, black on a light bar and white on a dark one.
+
+## Preferences
+
+A native window, opened from the menu. It covers what is worth changing
+without reading documentation:
+
+- sound on running a command
+- whether other people's speech is written to the log
+- starting at login
+- **sensibilidad** — how sure Minion must be before acting, as words rather
+  than a number: nobody wants to type 0.72, they want it to be less touchy
+- **pausa que cierra una frase** — longer if it cuts you off while thinking
+- **liberar memoria** — idle minutes before the model is released
+- **atajo para pausar y reanudar** — ⌥Space by default
+
+That last one earns its place: pausing by voice is easy, but getting
+attention back is not, since a paused microphone hears nothing. The
+shortcut is watched with a global event monitor rather than registered as a
+hotkey, so the keystroke still reaches whatever has focus — Minion listens
+for it without taking it away from anything else.
+
+The controls report by being read rather than by calling back. AppKit
+delivers actions to an Objective-C target, which from Rust means declaring
+a class — the most delicate part of the bridge, for a panel that changes at
+human speed. The run loop timer that already repaints the menu bar reads
+them a few times a second and writes through whatever moved. It also means
+the window follows along when a setting changes elsewhere.
+
+Everything else still lives in `config.toml`, which the window edits
+without disturbing: the file keeps its comments, and settings the window
+does not cover — wake words, extra applications, aliases, your own
+commands — are only there.
 
 ## Why
 
@@ -181,7 +218,7 @@ Other phrases have no global meaning at all, and only work in one place:
 
 | Music (Spotify) | Minion itself |
 |---|---|
-| pon la música · para la música | deja de escuchar |
+| pon la música · para la música | deja de escuchar · duérmete · silénciate · apágate · cállate |
 | siguiente canción · canción anterior | (resume from the menu bar) |
 
 Naming something searches for it: «minion, pon la canción Vértigo» —
@@ -282,34 +319,6 @@ once: app not running, running with no windows, and running with a window.
 The middle one is common on macOS, where closing the last window does not
 quit the app.
 
-## Answering only you
-
-By default Minion obeys anyone who says the wake word, which is right for a
-machine with one user. If other voices reach the microphone — a video, a
-colleague, a call on speaker — teach it yours:
-
-```bash
-/Applications/Minion.app/Contents/MacOS/minion enroll
-```
-
-It asks for five sentences and stores the average. From then on, anything
-that does not sound like you is discarded **before being transcribed**, so
-other people's words never reach the recogniser or the log.
-
-Five sentences rather than one because a single phrase carries its own
-intonation as much as the voice. Enrolment refuses to save samples that
-disagree with each other, which is what a noisy room produces — saving
-those would filter out the very person they are meant to admit.
-
-Delete `~/Library/Application Support/Minion/voice.txt` to undo it.
-
-The model is ECAPA-TDNN from wespeaker (24 MB, 192 numbers per voice).
-Its input is 80-bin mel filterbanks matching Kaldi's, which `fbank.rs`
-reproduces: the same pre-emphasis, the same Povey window, the same mel
-spacing. A frontend that is merely reasonable produces embeddings that look
-plausible and compare badly, which is a hard fault to see — hence the tests
-that check a tone lands in the right band.
-
 ## Learning from its own mistakes
 
 Every phrase Minion failed to understand is in the log. `minion learn`
@@ -370,10 +379,8 @@ rebuilding.
 
 ## Not done yet
 
-- **Real VAD.** The energy detector cannot tell speech from a door slam.
-  In practice it has not needed to: a two-minute test with a video playing
-  produced no false commands, and speaker recognition now covers the case
-  that mattered. Silero VAD would mainly save CPU.
+- **Real VAD.** Energy cannot tell speech from a door slam, and background
+  music keeps it triggering. Silero VAD is the next step.
 
 - **Custom key commands in the config file**: applications and aliases can
   be added there, but not entirely new shortcuts.

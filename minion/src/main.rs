@@ -13,6 +13,7 @@ mod commands;
 mod config;
 mod enroll;
 mod fbank;
+mod hotkey;
 mod icon;
 mod journal;
 mod learn;
@@ -37,7 +38,7 @@ use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 use objc2_foundation::NSTimer;
 use ort::session::builder::SessionBuilder;
 use parakeet_rs::{ExecutionConfig, ParakeetTDT, Transcriber};
-use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::TrayIconBuilder;
 
 use commands::Decision;
@@ -395,16 +396,23 @@ fn run_menu_bar(
     // One item for one piece of state. Two — "Escuchar" and "Pausar" — made
     // the reader work out which one applied right now.
     let toggle = MenuItem::new(MENU_PAUSE, true, None);
-    let learn = MenuItem::new("Aprender del registro…", true, None);
+    // No ellipsis: it acts on what it finds and reports, rather than
+    // opening something for you to fill in.
+    let learn = MenuItem::new("Aprender", true, None);
+    let show_log = MenuItem::new("Ver el registro", true, None);
 
     let preferences = MenuItem::new("Preferencias…", true, None);
-    let show_log = MenuItem::new("Ver el registro", true, None);
+
+    // The two things you do with the log, together.
+    let log_menu = Submenu::new("Registro", true);
+    log_menu.append(&learn)?;
+    log_menu.append(&show_log)?;
+
     let quit = MenuItem::new("Salir de Minion", true, None);
     menu.append(&toggle)?;
     menu.append(&PredefinedMenuItem::separator())?;
-    menu.append(&learn)?;
+    menu.append(&log_menu)?;
     menu.append(&preferences)?;
-    menu.append(&show_log)?;
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&quit)?;
 
@@ -689,6 +697,16 @@ fn main() -> Result<()> {
             eprintln!("Error: {e:#}");
             std::process::exit(1);
         }
+    });
+
+    // Kept alive for the life of the process: dropping it stops the watch.
+    let _shortcut = config.resume_shortcut().and_then(|shortcut| {
+        let watch = hotkey::watch(&shortcut, Arc::clone(&active));
+        match &watch {
+            Some(_) => note!("Shortcut {shortcut} pauses and resumes."),
+            None => note!("Cannot read the shortcut «{shortcut}»; ignoring it."),
+        }
+        watch
     });
 
     run_menu_bar(active, play_sounds, log_ignored)
