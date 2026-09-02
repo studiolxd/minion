@@ -24,7 +24,7 @@ A native window, opened from the menu. It covers what is worth changing
 without reading documentation:
 
 - sound on running a command
-- whether other people's speech is written to the log
+- whether what other people say is written to the log, or only counted
 - starting at login
 - **sensibilidad** — how sure Minion must be before acting, as words rather
   than a number: nobody wants to type 0.72, they want it to be less touchy

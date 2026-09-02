@@ -105,7 +105,14 @@ pub fn load_profile() -> Option<Embedding> {
 }
 
 /// Stores an enrolled voice.
+///
+/// Does nothing under test. The profile belongs to whoever is running
+/// Minion, and a test run wrote one made of arithmetic — which would have
+/// left the machine refusing to listen to its owner.
 pub fn save_profile(embedding: &[f32]) -> Result<()> {
+    if cfg!(test) {
+        return Ok(());
+    }
     let path = profile_path().ok_or_else(|| anyhow!("no home directory"))?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;

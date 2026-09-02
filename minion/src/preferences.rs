@@ -17,8 +17,8 @@ use std::cell::Cell;
 use objc2::rc::Retained;
 use objc2::MainThreadMarker;
 use objc2_app_kit::{
-    NSApplication, NSBackingStoreType, NSButton, NSColor, NSFont, NSSlider, NSTextField, NSView,
-    NSWindow, NSWindowStyleMask,
+    NSApplication, NSBackingStoreType, NSButton, NSColor, NSFont, NSLineBreakMode, NSSlider,
+    NSTextField, NSView, NSWindow, NSWindowStyleMask,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
@@ -30,7 +30,7 @@ const WIDTH: f64 = 380.0;
 /// The layout runs downwards from the top, so the window has to be as tall
 /// as everything in it plus a margin; too short and the final line simply
 /// falls off, which is what it did.
-const HEIGHT: f64 = 620.0;
+const HEIGHT: f64 = 664.0;
 const MARGIN: f64 = 22.0;
 
 /// A slider's range and the setting behind it.
@@ -137,6 +137,11 @@ fn pretty(shortcut: &str) -> String {
 fn label(mtm: MainThreadMarker, text: &str, frame: NSRect, small: bool) -> Retained<NSTextField> {
     let field = NSTextField::labelWithString(&NSString::from_str(text), mtm);
     field.setFrame(frame);
+    // Wrap rather than truncate: a prompt someone has to read aloud is
+    // useless with its end cut off.
+    field.setUsesSingleLineMode(false);
+    field.setLineBreakMode(NSLineBreakMode::ByWordWrapping);
+    field.setMaximumNumberOfLines(0);
     if small {
         field.setFont(Some(&NSFont::systemFontOfSize(11.0)));
         field.setTextColor(Some(&NSColor::secondaryLabelColor()));
@@ -265,12 +270,20 @@ impl Preferences {
 
         let log_voices = checkbox(
             mtm,
-            "Registrar las voces ajenas",
+            "Anotar en el registro lo que dicen otros",
             y,
             settings.log_ignored_speech,
         );
         add(&log_voices.control);
-        y -= 26.0;
+        y -= 20.0;
+        add(&label(
+            mtm,
+            "Con el micrófono abierto se transcribe todo lo que se habla cerca. \
+             Normalmente solo se cuenta cuánto se oyó, no qué se dijo.",
+            NSRect::new(NSPoint::new(MARGIN + 20.0, y - 14.0), NSSize::new(WIDTH - MARGIN * 2.0 - 20.0, 30.0)),
+            true,
+        ));
+        y -= 30.0;
 
         let at_login = checkbox(mtm, "Abrir al iniciar sesión", y, startup::enabled());
         add(&at_login.control);
@@ -419,7 +432,7 @@ impl Preferences {
             } else {
                 "Ahora obedece a cualquiera que diga «minion»."
             },
-            NSRect::new(NSPoint::new(MARGIN, y), NSSize::new(WIDTH - MARGIN * 2.0, 34.0)),
+            NSRect::new(NSPoint::new(MARGIN, y - 18.0), NSSize::new(WIDTH - MARGIN * 2.0, 52.0)),
             true,
         );
         add(&train_status);

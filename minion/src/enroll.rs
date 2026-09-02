@@ -47,7 +47,7 @@ impl Session {
     pub fn starting() -> Self {
         Self {
             collected: Vec::new(),
-            message: format!("Di: «{}»", PROMPTS[0]),
+            message: format!("1/{SENTENCES} — di: «{}»", PROMPTS[0]),
             finished: false,
         }
     }
@@ -55,16 +55,24 @@ impl Session {
     /// Takes one utterance. Returns true when training is over.
     pub fn accept(&mut self, embedding: Option<crate::speaker::Embedding>) -> bool {
         let Some(embedding) = embedding else {
-            self.message = "Demasiado corto. Repite la frase.".into();
+            self.message = format!(
+                "{}/{SENTENCES} — demasiado corto, repite: «{}»",
+                self.collected.len() + 1,
+                PROMPTS[self.collected.len()]
+            );
             return false;
         };
         self.collected.push(embedding);
 
         if self.collected.len() < SENTENCES {
+            // Numbered by what is being asked for, not by what is already
+            // in hand: hearing "1 of 5" while reading the second sentence
+            // makes it look like one went missing.
+            let asking_for = self.collected.len();
             self.message = format!(
                 "{}/{SENTENCES} — di: «{}»",
-                self.collected.len(),
-                PROMPTS[self.collected.len()]
+                asking_for + 1,
+                PROMPTS[asking_for]
             );
             return false;
         }
@@ -154,4 +162,59 @@ pub fn run(model_path: &str) -> Result<()> {
     println!("Para deshacerlo, borra {}.", speaker::profile_path()
         .map_or_else(|| "el perfil".into(), |p| p.display().to_string()));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fake_voice(seed: f32) -> crate::speaker::Embedding {
+        // Close to each other, so the agreement check passes.
+        (0..192).map(|i| seed + i as f32 * 0.001).collect()
+    }
+
+    #[test]
+    fn the_count_names_what_it_is_asking_for() {
+        let mut session = Session::starting();
+        assert!(
+            session.message.starts_with("1/5"),
+            "should open asking for the first: {}",
+            session.message
+        );
+
+        for expected in 2..=SENTENCES {
+            session.accept(Some(fake_voice(1.0)));
+            assert!(
+                session.message.starts_with(&format!("{expected}/{SENTENCES}")),
+                "after {} samples it should ask for {expected}: {}",
+                expected - 1,
+                session.message
+            );
+        }
+    }
+
+    #[test]
+    fn a_short_utterance_asks_for_the_same_sentence_again() {
+        let mut session = Session::starting();
+        session.accept(Some(fake_voice(1.0)));
+        let asking = session.message.clone();
+
+        session.accept(None); // too short to use
+        assert!(
+            session.message.starts_with("2/5"),
+            "should still be on the second: {}",
+            session.message
+        );
+        assert_ne!(asking, session.message, "and should say it was too short");
+    }
+
+    #[test]
+    fn it_finishes_after_the_last_sentence() {
+        let mut session = Session::starting();
+        for _ in 0..SENTENCES - 1 {
+            assert!(!session.accept(Some(fake_voice(1.0))), "not done yet");
+        }
+        assert!(session.accept(Some(fake_voice(1.0))), "the fifth ends it");
+        assert!(session.finished);
+    }
 }
