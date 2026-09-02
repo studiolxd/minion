@@ -34,8 +34,16 @@ cargo build --release
 
 Grant microphone access when asked. For commands that press keys (copy,
 save, close tab) also grant Accessibility under System Settings → Privacy
-& Security. Without it those commands silently do nothing — the program
-warns about this at startup.
+& Security → Accessibility, then restart Oyente.
+
+Without it those commands fail invisibly: macOS accepts the key event and
+discards it, so the log shows the command running while nothing happens on
+screen. Oyente checks at startup with `AXIsProcessTrusted`, says so in the
+log, and opens the settings pane for you.
+
+The permission is granted **per binary**, so rebuilding invalidates it.
+Install to /Applications and grant it there, rather than granting it to a
+copy in the project folder that you will replace on the next build.
 
 Installing as an app matters for more than tidiness: macOS attributes
 permissions to whichever binary asks for them. Run from a terminal and the

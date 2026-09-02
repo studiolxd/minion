@@ -244,6 +244,27 @@ fn run_menu_bar(active: Arc<AtomicBool>) -> Result<()> {
     Ok(())
 }
 
+/// Says plainly whether the key-pressing commands can work at all.
+///
+/// Worth its own step because the failure is invisible: without the
+/// permission, ⌘W is posted and silently dropped, so the log shows the
+/// command running while nothing happens on screen.
+fn report_permissions() {
+    if actions::has_accessibility_permission() {
+        note!("Accessibility granted — key commands will work.");
+        return;
+    }
+    note!(
+        "NO Accessibility permission. Opening apps, volume and music will \
+         work; anything that presses keys (copy, save, close tab) will be \
+         silently ignored by macOS."
+    );
+    println!(
+        "\n  Grant it in System Settings → Privacy & Security → Accessibility,\n           then restart Oyente. Opening that pane now…\n"
+    );
+    actions::open_accessibility_settings();
+}
+
 fn main() -> Result<()> {
     let model_path = locate_model(std::env::args().nth(1))?;
 
@@ -256,16 +277,7 @@ fn main() -> Result<()> {
     if let Some(log) = journal::path() {
         println!("Log: {}", log.display());
     }
-    if !actions::has_accessibility_permission() {
-        eprintln!(
-            "Warning: no Accessibility permission. Commands that open apps\n\
-             will work, but those that press keys (copy, save, close tab)\n\
-             will do nothing and report no error.\n\
-             Grant it under System Settings → Privacy & Security →\n\
-             Accessibility.\n"
-        );
-    }
-
+    report_permissions();
     let active = Arc::new(AtomicBool::new(true));
 
     let worker_active = Arc::clone(&active);

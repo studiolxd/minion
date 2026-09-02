@@ -152,7 +152,29 @@ pub fn play_sound(path: &str) {
     let _ = Command::new("/usr/bin/afplay").arg(path).spawn();
 }
 
-/// Whether we can post keyboard events at all.
+// Accessibility is granted per binary by macOS, and the only honest way to
+// ask about it is AXIsProcessTrusted. Creating an event source succeeds
+// either way — the events are simply dropped on the way out — so checking
+// that proves nothing.
+#[link(name = "ApplicationServices", kind = "framework")]
+unsafe extern "C" {
+    fn AXIsProcessTrusted() -> bool;
+}
+
+/// Whether macOS will actually deliver the key events we post.
+///
+/// Without this permission `press` still returns true and nothing happens:
+/// the events are created and then discarded by the window server. It is
+/// the quietest failure in the system, so it is worth reporting loudly at
+/// startup rather than leaving someone wondering why ⌘W does nothing.
 pub fn has_accessibility_permission() -> bool {
-    CGEventSource::new(CGEventSourceStateID::HIDSystemState).is_ok()
+    unsafe { AXIsProcessTrusted() }
+}
+
+/// Opens the Accessibility pane of System Settings.
+pub fn open_accessibility_settings() -> bool {
+    applescript(
+        "open location \"x-apple.systempreferences:com.apple.preference.security\
+         ?Privacy_Accessibility\"",
+    )
 }
