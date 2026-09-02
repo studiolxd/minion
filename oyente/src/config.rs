@@ -7,8 +7,12 @@
 //! Lives at `~/Library/Application Support/Oyente/config.toml`.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use serde::Deserialize;
+
+/// Idle minutes before the model is released, when the file says nothing.
+const DEFAULT_UNLOAD_MINUTES: u64 = 5;
 
 use crate::audio;
 use crate::commands::App;
@@ -52,6 +56,13 @@ pub struct Config {
     /// Extra applications, added to the built-in list.
     #[serde(default)]
     pub apps: Vec<AppConfig>,
+
+    /// Minutes of silence after which the speech model is released.
+    ///
+    /// The model is most of the memory Oyente uses, and a machine that sits
+    /// idle for hours has no reason to hold it. Reloading costs a second or
+    /// so on the next thing you say. Zero keeps it loaded for good.
+    pub unload_after_minutes: Option<u64>,
 
     /// Extra ways of saying commands that already exist.
     ///
@@ -99,6 +110,7 @@ impl Default for Config {
             audio: AudioConfig::default(),
             apps: Vec::new(),
             aliases: Vec::new(),
+            unload_after_minutes: None,
         }
     }
 }
@@ -164,6 +176,16 @@ impl Config {
                 ),
             })
             .collect()
+    }
+
+    /// How long to keep the model in memory with nothing to do.
+    ///
+    /// `None` in the file means the default; zero means never unload.
+    pub fn idle_unload(&self) -> Option<Duration> {
+        match self.unload_after_minutes.unwrap_or(DEFAULT_UNLOAD_MINUTES) {
+            0 => None,
+            minutes => Some(Duration::from_secs(minutes * 60)),
+        }
     }
 
     /// User aliases as `(command name, phrase)`, both normalised.
@@ -232,6 +254,18 @@ mod tests {
             settings.speech_threshold,
             audio::Settings::default().speech_threshold
         );
+    }
+
+    #[test]
+    fn the_model_is_released_when_idle_by_default() {
+        let default: Config = toml::from_str("").expect("empty config should parse");
+        assert_eq!(default.idle_unload(), Some(Duration::from_secs(300)));
+
+        let never: Config = toml::from_str("unload_after_minutes = 0").expect("should parse");
+        assert_eq!(never.idle_unload(), None, "zero should keep it loaded");
+
+        let custom: Config = toml::from_str("unload_after_minutes = 30").expect("should parse");
+        assert_eq!(custom.idle_unload(), Some(Duration::from_secs(1800)));
     }
 
     #[test]

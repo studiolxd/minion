@@ -8,7 +8,10 @@ option-free:  «ordenador, abre Chrome»      → Chrome comes forward
               «mañana quedamos a las cinco» → ignored
 ```
 
-Lives in the menu bar as 🎙. No Dock icon, no window.
+Lives in the menu bar as 🎙 — 😴 when paused. No Dock icon, no window.
+
+The menu holds one toggle (Pausar / Escuchar), *Aprender del registro…*,
+*Ver el registro*, and Salir.
 
 ## Why
 
@@ -112,6 +115,53 @@ Chrome · Safari · Terminal · Orca · Finder · Mail · Notas · Calendario ·
 Spotify · WhatsApp · Telegram · Figma · Obsidian · Discord · Teams ·
 VS Code · Claude · ChatGPT · Ajustes · Vista Previa · Monitor de Actividad
 
+### Web addresses
+
+«ordenador, **ve a** google.com» — spelled out, or spoken with the dot as a
+word ("github punto com"). Well-known sites work by name alone: google,
+youtube, gmail, github, wikipedia, drive, maps, calendar, linkedin, amazon,
+netflix.
+
+An application always wins over a site: "abre Chrome" opens the browser,
+not a search for it.
+
+**The page opens where you are working.** Ask for a site while Chrome is in
+front and it opens in Chrome, not in whichever browser the system considers
+default. Ask from anywhere else and the default applies.
+
+### Dictating text
+
+«ordenador, **escribe** hola qué tal» types the words that follow —
+also *anota, apunta, dicta*.
+
+Everything after the verb is content, never a command: "ordenador escribe
+cierra la ventana" types the phrase instead of closing anything. Accents
+and capitals survive, because the text comes from the original transcript
+rather than the normalised form used for matching, and it is sent as a
+Unicode string rather than as keystrokes, so ñ and á do not depend on the
+keyboard layout.
+
+### The same words, read where you are
+
+A phrase can mean the right thing in each place instead of needing a
+different name per application:
+
+| Say | Normally | In Finder | In Terminal |
+|---|---|---|---|
+| borra esto | ⌫ | to the Trash | ⌫ |
+| cancela | Escape | Escape | ⌃C |
+| sube del todo | scroll to top | enclosing folder | previous command |
+
+### Only where they exist
+
+Other phrases have no global meaning at all, and only work in one place:
+
+| In | Say |
+|---|---|
+| Terminal | limpia la pantalla · principio de línea · final de línea |
+| Chrome, Safari | abre los favoritos · abre el historial · ventana de incógnito |
+| Finder | crea una carpeta · muestra la información |
+
 ### Commands
 
 | Editing | Tabs and windows |
@@ -134,23 +184,25 @@ VS Code · Claude · ChatGPT · Ajustes · Vista Previa · Monitor de Actividad
 | pon la música · para la música | deja de escuchar |
 | siguiente canción · canción anterior | (resume from the menu bar) |
 
+Naming something searches for it: «ordenador, pon la canción Vértigo» —
+also *el disco, el grupo, el artista, el tema*. It opens the results in
+Spotify rather than playing straight away; starting a specific track needs
+the Web API and an OAuth token, which is a different project.
+
+A known command always wins over a title, so "pon la canción anterior"
+goes back one rather than searching for a song called "anterior".
+
 ## The log
 
 `~/Library/Logs/oyente.log` records every utterance it heard and what it
 did with it, whichever way the app was started:
 
 ```
-2026-09-02 23:24:02  Listening. Say: «ordenador, abre Chrome»
-2026-09-02 23:24:31  ran      «Ordenador, abre Chrome.»  ->  abrir Chrome  [96% · 1.8s audio · 240 ms]
-2026-09-02 23:25:04  heard    2.4s of speech, not addressed to me
-2026-09-02 23:25:19  unknown  «Ordenador, haz un pino.»  ->  not understood
-2026-09-02 23:25:40  BLOCKED  «Ordenador, guarda esto.»  ->  guardar  — macOS refused it.
+21:24:02  Listening. Say: «ordenador, abre Chrome»
+21:24:31  ran      «Ordenador, abre Chrome.»  ->  abrir Chrome  [96% · 1.8s audio · 240 ms]
+21:25:04  heard    2.4s of speech, not addressed to me
+21:25:19  unknown  «Ordenador, haz un pino.»  ->  not understood
 ```
-
-`BLOCKED` means the command was understood and the system refused to carry
-it out — in practice, a keystroke dropped for want of Accessibility
-permission. It is checked on every keystroke rather than once at startup,
-because granting it takes effect immediately on the running process.
 
 This is the tool for tuning. `unknown` lines show what the recogniser
 really produces from your voice, which is what should go into the alias
@@ -201,13 +253,25 @@ The defaults for speech detection, overridable in the config file:
 | `min_speech_ms` | 300 | Filters out door slams and coughs |
 | `max_utterance_ms` | 12000 | Safety cut against continuous noise |
 
+## Memory
+
+The speech model is most of what Oyente uses, so it is released after five
+minutes of silence and reloaded when you next speak — about a second, once.
+`unload_after_minutes = 0` keeps it loaded.
+
+Two ONNX Runtime settings do the rest. Prepacking rewrites weights into a
+layout that multiplies faster and keeps the original alongside, which
+halves nothing and doubles memory; turning it off took 1830 MB to 934 MB at
+a cost of roughly 40 ms per utterance. Memory patterns and thread count
+were tried first and changed nothing at all.
+
 `threshold` is the match confidence needed to act. It errs high on purpose:
 with an always-on microphone, firing a command that was never spoken is
 much worse than missing one.
 
 ## Design notes
 
-**Deciding and acting are separate.** `commands::decide` is pure and
+**Deciding and acting are separate.** `commands::decide_in` is pure and
 returns a `Decision`; `commands::perform` carries it out. That is what
 makes the vocabulary testable without applications opening for real —
 the test suite checks all 970 phrases without touching the system.
@@ -230,6 +294,39 @@ once: app not running, running with no windows, and running with a window.
 The middle one is common on macOS, where closing the last window does not
 quit the app.
 
+## Learning from its own mistakes
+
+Every phrase Oyente failed to understand is in the log. `oyente learn`
+reads them back, works out what each was probably meant to be, and offers
+to add it as an alias:
+
+From the menu bar: **Aprender del registro…**. It shows what it found and
+asks before changing anything.
+
+From a terminal:
+
+```bash
+/Applications/Oyente.app/Contents/MacOS/oyente learn
+```
+
+```
+Phrases that look like an existing command:
+
+  «Ordenador retroceder página.»  ×2
+      → atrás (100% similar)
+
+No command resembles these — they may need a new one:
+
+  «Ordenador reproduce la canción vértigo.»
+```
+
+`--apply` writes the first group into `config.toml` as aliases. The
+second group is the useful half: it is the list of things the vocabulary
+does not cover yet.
+
+Phrases the vocabulary has since learned are skipped, so the report shows
+what is still missing rather than everything that ever failed.
+
 ## Testing
 
 ```bash
@@ -245,13 +342,22 @@ They have already earned their keep: they caught "cortar" being executed as
 on "deshacer" — all from an edit-distance allowance that was one step too
 generous.
 
+## Signing
+
+`build-app.sh` signs with an Apple Development certificate when one is in
+the keychain, and falls back to ad-hoc otherwise. The difference matters
+more than it looks: an ad-hoc signature ties the Accessibility grant to the
+exact bytes of the binary, so **every rebuild silently revokes it** and the
+app goes back to being ignored by the window server with no error anywhere.
+A real certificate ties the grant to the team and bundle id, which survive
+rebuilding.
+
 ## Not done yet
 
 - **Real VAD.** Energy cannot tell speech from a door slam, and background
   music keeps it triggering. Silero VAD is the next step.
-- **Dictation.** Oyente runs commands; it does not type text.
-- **Per-application context**, so one phrase means different things
-  depending on what is in front.
-- **Custom key commands in the config file**, not just applications.
+
+- **Custom key commands in the config file**: applications and aliases can
+  be added there, but not entirely new shortcuts.
 - **Developer ID signing**, so the app can be shared with other machines.
   The ad-hoc signature is enough for this one.

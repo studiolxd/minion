@@ -21,7 +21,8 @@ use std::path::Path;
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use block2::RcBlock;
@@ -55,6 +56,9 @@ const MENU_LISTEN: &str = "Escuchar";
 
 /// How often the menu bar checks whether the state changed.
 const ICON_REFRESH_SECONDS: f64 = 0.4;
+
+/// How often the recognition loop wakes up to see whether it has gone idle.
+const IDLE_CHECK: Duration = Duration::from_secs(20);
 
 /// Locates the speech model.
 ///
@@ -151,16 +155,26 @@ fn resident_memory() -> String {
 }
 
 /// The recognition loop. Owns the model and runs on its own thread.
+/// Loads the speech model.
+fn load_model(model_path: &str) -> Result<ParakeetTDT> {
+    ParakeetTDT::from_pretrained(model_path, Some(inference_config()))
+        .map_err(|e| anyhow!("{e}"))
+        .with_context(|| format!("loading the model from '{model_path}'"))
+}
+
 fn listen_and_obey(
     model_path: String,
     settings: audio::Settings,
     log_ignored_speech: bool,
     play_sounds: bool,
+    idle_unload: Option<Duration>,
     active: Arc<AtomicBool>,
 ) -> Result<()> {
-    let mut model = ParakeetTDT::from_pretrained(&model_path, Some(inference_config()))
-        .map_err(|e| anyhow!("{e}"))
-        .with_context(|| format!("loading the model from '{model_path}'"))?;
+    // Held in an Option so it can be dropped while idle. It is loaded now
+    // rather than on first use, so the first thing said after starting is
+    // as quick as the rest.
+    let mut model = Some(load_model(&model_path)?);
+    let mut last_used = Instant::now();
     note!("Model loaded. {}", resident_memory());
 
     let listener =
@@ -173,14 +187,50 @@ fn listen_and_obey(
     );
     note!("Listening. Say: «ordenador, abre Chrome»");
 
-    for utterance in listener.utterances {
+    loop {
+        // A bounded wait, so idleness can be noticed while nothing is being
+        // said. A plain recv() would block until the next utterance, and
+        // the model would stay loaded through an empty afternoon.
+        let utterance = match listener.utterances.recv_timeout(IDLE_CHECK) {
+            Ok(utterance) => utterance,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Some(idle_for) = idle_unload {
+                    if model.is_some() && last_used.elapsed() >= idle_for {
+                        model = None;
+                        note!("Idle for {} min — model released. {}",
+                              idle_for.as_secs() / 60, resident_memory());
+                    }
+                }
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+
         if !active.load(Ordering::Relaxed) {
             continue;
         }
         let seconds = utterance.len() as f32 / audio::TARGET_HZ as f32;
-        let started = std::time::Instant::now();
+        let started = Instant::now();
 
-        let transcript = match model.transcribe_samples(utterance, audio::TARGET_HZ, 1, None) {
+        // Reload if it was released while idle. Costs about a second, once.
+        if model.is_none() {
+            match load_model(&model_path) {
+                Ok(loaded) => {
+                    model = Some(loaded);
+                    note!("Speech heard — model reloaded. {}", resident_memory());
+                }
+                Err(e) => {
+                    eprintln!("could not reload the model: {e:#}");
+                    continue;
+                }
+            }
+        }
+        last_used = Instant::now();
+
+        let Some(loaded) = model.as_mut() else {
+            continue;
+        };
+        let transcript = match loaded.transcribe_samples(utterance, audio::TARGET_HZ, 1, None) {
             Ok(result) => result.text.trim().to_string(),
             Err(e) => {
                 eprintln!("  transcription failed: {e}");
@@ -430,6 +480,7 @@ fn main() -> Result<()> {
     let audio_settings = config.audio_settings();
     let log_ignored = config.log_ignored_speech;
     let play_sounds = config.sounds;
+    let idle_unload = config.idle_unload();
 
     note!("Oyente starting — loading model…");
     if let Some(log) = journal::path() {
@@ -445,6 +496,7 @@ fn main() -> Result<()> {
             audio_settings,
             log_ignored,
             play_sounds,
+            idle_unload,
             worker_active,
         ) {
             eprintln!("Error: {e:#}");
