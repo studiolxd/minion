@@ -26,6 +26,9 @@ const FILLER: &[&str] = &[
 const VERBS: &[(&str, &str)] = &[
     ("abre", "abrir"), ("abreme", "abrir"), ("abrir", "abrir"),
     ("cierra", "cerrar"), ("cierre", "cerrar"), ("cerrar", "cerrar"),
+    ("sal", "salir"), ("sale", "salir"), ("salte", "salir"), ("salir", "salir"),
+    ("mata", "matar"), ("matar", "matar"),
+    ("termina", "terminar"), ("terminar", "terminar"),
     ("guarda", "guardar"), ("guardar", "guardar"),
     ("copia", "copiar"), ("copiar", "copiar"),
     ("pega", "pegar"), ("pegar", "pegar"),
@@ -81,6 +84,14 @@ pub fn canonical_verb(word: &str) -> &str {
         .map_or(word, |(_, root)| root)
 }
 
+/// Whether the word is a verb this vocabulary knows.
+///
+/// Used to tell "cierra Safari" from "abre Safari": naming an application
+/// must not be enough to launch it when the verb asked for something else.
+pub fn is_known_verb(word: &str) -> bool {
+    VERBS.iter().any(|(form, root)| *form == word || *root == word)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,6 +107,15 @@ mod tests {
     fn unknown_words_pass_through() {
         assert_eq!(canonical_verb("chrome"), "chrome");
         assert_eq!(canonical_verb("ventana"), "ventana");
+    }
+
+    #[test]
+    fn recognises_its_own_verbs() {
+        assert!(is_known_verb("cierra"));
+        assert!(is_known_verb("cerrar"));
+        assert!(is_known_verb("sal"));
+        assert!(!is_known_verb("safari"));
+        assert!(!is_known_verb("ventana"));
     }
 
     #[test]

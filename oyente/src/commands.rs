@@ -10,6 +10,7 @@ use std::sync::OnceLock;
 
 use crate::actions::{self, key, Mods};
 use crate::config::Config;
+use crate::spanish;
 use crate::text::{keywords, normalise, similarity};
 
 /// Words that mark a sentence as a command. Only counted at the start.
@@ -65,6 +66,9 @@ const APP_VERBS: &[&str] = &[
     "abrir", "ir", "cambiar", "poner", "dar", "traer", "mostrar", "enfocar",
     "sacar", "lanzar", "buscar",
 ];
+
+/// Verbs asking for an application to be closed.
+const QUIT_VERBS: &[&str] = &["cerrar", "salir", "matar", "terminar"];
 
 #[derive(Clone, Copy, Debug)]
 pub enum Action {
@@ -232,6 +236,8 @@ pub const COMMANDS: &[Command] = &[
 pub enum Decision {
     /// Launch or focus an application.
     Launch { name: &'static str, bundle_id: &'static str },
+    /// Quit an application.
+    Quit { name: &'static str, bundle_id: &'static str },
     /// Run a command from the table, identified by name.
     Run(&'static str),
     /// Started with the wake word, but nothing was recognised.
@@ -289,14 +295,29 @@ pub fn decide(transcript: &str) -> (Decision, f32) {
         }
     }
 
-    // Applications: either introduced by a verb, or named outright.
+    // Applications. The leading verb decides what happens to the one named:
+    // opening it, closing it, or nothing at all. Without this check, "cierra
+    // Safari" would launch Safari, because the name alone used to be enough.
     let spoken_words = keywords(rest);
-    let asks_for_app = spoken_words
-        .first()
-        .is_some_and(|first| APP_VERBS.contains(&first.as_str()));
+    let leading_verb = spoken_words.first().map(String::as_str);
+    let asks_to_open = leading_verb.is_some_and(|v| APP_VERBS.contains(&v));
+    let asks_to_quit = leading_verb.is_some_and(|v| QUIT_VERBS.contains(&v));
+    // A verb we know that asks for neither: the sentence is about something
+    // else, even if an application happens to be named in it.
+    let other_verb = leading_verb
+        .is_some_and(|v| spanish::is_known_verb(v) && !asks_to_open && !asks_to_quit);
+
     if let Some((app, score)) = find_app(rest) {
         let app_wins = best.is_none_or(|(_, b)| score > b);
-        if (asks_for_app || score > 0.85) && app_wins {
+        if asks_to_quit && app_wins {
+            return (
+                Decision::Quit { name: app.name, bundle_id: app.bundle_id },
+                score,
+            );
+        }
+        // Named without a verb ("ordenador, Safari") still means open it.
+        let named_outright = score > 0.85 && leading_verb.is_none_or(|v| !spanish::is_known_verb(v));
+        if (asks_to_open || named_outright) && !other_verb && app_wins {
             return (
                 Decision::Launch { name: app.name, bundle_id: app.bundle_id },
                 score,
@@ -316,6 +337,10 @@ pub fn perform(decision: &Decision) -> Option<String> {
         Decision::Launch { name, bundle_id } => {
             actions::open_app(bundle_id);
             Some(format!("abrir {name}"))
+        }
+        Decision::Quit { name, bundle_id } => {
+            actions::quit_app(bundle_id);
+            Some(format!("cerrar {name}"))
         }
         Decision::Run(name) => {
             let command = COMMANDS.iter().find(|c| c.name == *name)?;
@@ -375,6 +400,32 @@ mod tests {
         // Both seen in the real log.
         launches("Ordenador Abrecrome.", "Chrome");
         launches("ordenador abre cromo", "Chrome");
+    }
+
+    fn quits(phrase: &str, expected: &str) {
+        match decision(phrase) {
+            Decision::Quit { name, .. } => assert_eq!(name, expected, "for «{phrase}»"),
+            other => panic!("«{phrase}» should quit {expected}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn closes_applications() {
+        // Straight from the log: these used to LAUNCH Safari, because
+        // naming an application was enough regardless of the verb.
+        quits("Ordenador cierra Safari.", "Safari");
+        quits("Ordenador Cierra Safari.", "Safari");
+        quits("Ordenador Sal de Safari.", "Safari");
+        quits("ordenador cierra chrome", "Chrome");
+        quits("ordenador sal de spotify", "Spotify");
+    }
+
+    #[test]
+    fn naming_an_app_does_not_override_the_verb() {
+        // The window and tab commands must survive an app name nearby.
+        assert_eq!(decision("Ordenador cierra la pestaña."), Decision::Run("cerrar pestaña"));
+        assert_eq!(decision("Ordenador cierra la ventana."), Decision::Run("cerrar ventana"));
+        assert_eq!(decision("Ordenador minimiza la ventana."), Decision::Run("minimizar"));
     }
 
     #[test]

@@ -82,6 +82,15 @@ actually speak:
 pon, ponme, dame, trae, tráeme, muestra, enfoca, saca, lanza*. Or just name
 it: «ordenador, Spotify».
 
+To close one: «ordenador, **cierra** Safari» — also *sal de, termina, mata*.
+It is a polite quit, so an app with unsaved work still puts up its own save
+dialog.
+
+The verb decides what happens to the application named. "cierra Safari"
+quits it; "cierra la pestaña" closes a tab even though no app is named;
+"minimiza la ventana" does neither. Naming an app is not on its own an
+instruction to open it.
+
 Chrome · Safari · Terminal · Orca · Finder · Mail · Notas · Calendario ·
 Spotify · WhatsApp · Telegram · Figma · Obsidian · Discord · Teams ·
 VS Code · Claude · ChatGPT · Ajustes · Vista Previa · Monitor de Actividad

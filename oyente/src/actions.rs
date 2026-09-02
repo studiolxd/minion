@@ -117,6 +117,15 @@ pub fn open_app(bundle_id: &str) -> bool {
         .is_ok()
 }
 
+/// Asks an application to quit.
+///
+/// A polite quit, not a kill: if there is unsaved work the app puts up its
+/// own save dialog, exactly as ⌘Q would. Nothing is lost without being
+/// asked about first.
+pub fn quit_app(bundle_id: &str) -> bool {
+    applescript(&format!("tell application id \"{bundle_id}\" to quit"))
+}
+
 /// Runs an AppleScript snippet.
 pub fn applescript(script: &str) -> bool {
     Command::new("/usr/bin/osascript")
