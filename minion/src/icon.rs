@@ -17,20 +17,31 @@ use tray_icon::Icon;
 const AWAKE: &str = include_str!("../assets/awake.svg");
 const ASLEEP: &str = include_str!("../assets/asleep.svg");
 
-/// Drawn at twice the menu bar's 22 points, for Retina displays.
-const SIZE: u32 = 44;
+/// Height in pixels: twice the menu bar's usable height, for Retina.
+///
+/// The width follows from the drawing's proportions rather than being
+/// forced square — a square canvas would leave the face floating in empty
+/// space and looking smaller than the room it takes up.
+const HEIGHT: u32 = 40;
 
 /// Renders one of the faces into an icon the tray can show.
+///
+/// The drawing is black on transparent, which is what a macOS template
+/// image wants: the system reads the alpha and tints it — black on a light
+/// menu bar, white on a dark one — so the icon follows the theme without
+/// needing two versions.
 fn render(svg: &str) -> Result<Icon> {
     let tree = Tree::from_str(svg, &Options::default())
         .map_err(|e| anyhow!("the icon will not parse: {e}"))?;
 
-    let mut pixmap = Pixmap::new(SIZE, SIZE).ok_or_else(|| anyhow!("no room for the icon"))?;
     let size = tree.size();
-    let scale = SIZE as f32 / size.width().max(size.height());
+    let scale = HEIGHT as f32 / size.height();
+    let width = (size.width() * scale).round().max(1.0) as u32;
+
+    let mut pixmap = Pixmap::new(width, HEIGHT).ok_or_else(|| anyhow!("no room for the icon"))?;
     resvg::render(&tree, Transform::from_scale(scale, scale), &mut pixmap.as_mut());
 
-    Icon::from_rgba(pixmap.take(), SIZE, SIZE)
+    Icon::from_rgba(pixmap.take(), width, HEIGHT)
         .map_err(|e| anyhow!("the icon will not load: {e}"))
 }
 
@@ -58,9 +69,9 @@ pub fn export_iconset(directory: &str) -> Result<()> {
             let mut pixmap =
                 Pixmap::new(pixels, pixels).ok_or_else(|| anyhow!("no room for the icon"))?;
             // A little breathing room, or the drawing touches the edges.
-            let margin = pixels as f32 * 0.08;
+            let margin = pixels as f32 * 0.12;
             let drawn = pixels as f32 - margin * 2.0;
-            let factor = drawn / tree.size().width();
+            let factor = drawn / tree.size().width().max(tree.size().height());
             let transform = Transform::from_translate(margin, margin)
                 .pre_scale(factor, factor);
             resvg::render(&tree, transform, &mut pixmap.as_mut());
@@ -83,17 +94,47 @@ mod tests {
         assert!(asleep().is_ok(), "the sleeping face should draw");
     }
 
+    fn draw(svg: &str) -> Vec<u8> {
+        let tree = Tree::from_str(svg, &Options::default()).unwrap();
+        let scale = HEIGHT as f32 / tree.size().height();
+        let width = (tree.size().width() * scale).round() as u32;
+        let mut pixmap = Pixmap::new(width, HEIGHT).unwrap();
+        resvg::render(&tree, Transform::from_scale(scale, scale), &mut pixmap.as_mut());
+        pixmap.take()
+    }
+
     #[test]
     fn the_faces_differ() {
         // Same head, different eye and mouth: the drawings must not be
         // identical, or pausing would show no change at all.
-        let draw = |svg| {
-            let tree = Tree::from_str(svg, &Options::default()).unwrap();
-            let mut pixmap = Pixmap::new(SIZE, SIZE).unwrap();
-            let scale = SIZE as f32 / tree.size().width();
-            resvg::render(&tree, Transform::from_scale(scale, scale), &mut pixmap.as_mut());
-            pixmap.take()
-        };
         assert_ne!(draw(AWAKE), draw(ASLEEP));
+    }
+
+    #[test]
+    fn the_drawing_fills_the_canvas() {
+        // Empty margins make the icon look smaller than the space it takes.
+        // Check that ink reaches close to the top and bottom rows.
+        let pixels = draw(AWAKE);
+        let width = pixels.len() / 4 / HEIGHT as usize;
+        let row_has_ink = |row: usize| {
+            (0..width).any(|x| pixels[(row * width + x) * 4 + 3] > 16)
+        };
+        assert!(row_has_ink(1), "the drawing should reach the top");
+        assert!(row_has_ink(HEIGHT as usize - 2), "and the bottom");
+    }
+
+    #[test]
+    fn the_drawing_is_black_on_transparent() {
+        // A template image is tinted by macOS from its alpha channel; any
+        // colour of its own would fight that.
+        let pixels = draw(AWAKE);
+        for chunk in pixels.chunks(4) {
+            if chunk[3] > 200 {
+                assert!(
+                    chunk[0] < 40 && chunk[1] < 40 && chunk[2] < 40,
+                    "solid pixels should be black, found {chunk:?}"
+                );
+            }
+        }
     }
 }

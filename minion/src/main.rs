@@ -441,6 +441,9 @@ fn run_menu_bar(
         TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_icon(icon::awake()?)
+            // A template image: macOS tints it to match the menu bar, so it
+            // is black on a light one and white on a dark one.
+            .with_icon_as_template(true)
             .with_tooltip("Minion — control por voz")
             .build()?,
     );
@@ -461,7 +464,7 @@ fn run_menu_bar(
         shown_as_listening.set(listening);
         let face = if listening { icon::awake() } else { icon::asleep() };
         if let Ok(face) = face {
-            let _ = tray_for_timer.set_icon(Some(face));
+            let _ = tray_for_timer.set_icon_with_as_template(Some(face), true);
         }
         toggle_for_timer.set_text(if listening { MENU_PAUSE } else { MENU_LISTEN });
     });
