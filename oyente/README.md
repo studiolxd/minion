@@ -108,6 +108,24 @@ VS Code · Claude · ChatGPT · Ajustes · Vista Previa · Monitor de Actividad
 | pon la música · para la música | deja de escuchar |
 | siguiente canción · canción anterior | (resume from the menu bar) |
 
+## The log
+
+`~/Library/Logs/oyente.log` records every utterance it heard and what it
+did with it, whichever way the app was started:
+
+```
+21:24:02  Listening. Say: «ordenador, abre Chrome»
+21:24:31  ran      «Ordenador, abre Chrome.»  ->  abrir Chrome  [96% · 1.8s audio · 240 ms]
+21:25:04  heard    «pues no sé qué decirte»  (not addressed to me)
+21:25:19  unknown  «Ordenador, haz un pino.»  ->  not understood
+```
+
+This is the tool for tuning. `heard` lines that are noise mean
+`speech_threshold` is too low; `unknown` lines show what the recogniser
+really produces, which is what should go into the alias list.
+
+It rotates at 5 MB, keeping one previous copy.
+
 ## Configuration
 
 Copy `config.example.toml` to

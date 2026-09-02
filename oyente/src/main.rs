@@ -11,6 +11,7 @@ mod actions;
 mod audio;
 mod commands;
 mod config;
+mod journal;
 mod spanish;
 mod text;
 
@@ -98,16 +99,17 @@ fn listen_and_obey(
     let mut model = ParakeetTDT::from_pretrained(&model_path, None)
         .map_err(|e| anyhow!("{e}"))
         .with_context(|| format!("loading the model from '{model_path}'"))?;
-    println!("Model loaded.");
+    note!("Model loaded.");
 
     let listener =
         audio::start(settings, Arc::clone(&active)).context("opening the microphone")?;
-    println!(
-        "Microphone: {} Hz, {} channel(s)",
-        listener.source_hz, listener.channels
+    note!(
+        "Microphone: {} Hz, {} channel(s). {} phrases understood.",
+        listener.source_hz,
+        listener.channels,
+        commands::phrase_count()
     );
-    println!("{} phrases understood.\n", commands::phrase_count());
-    println!("Say: «ordenador, abre Chrome»\n");
+    note!("Listening. Say: «ordenador, abre Chrome»");
 
     for utterance in listener.utterances {
         if !active.load(Ordering::Relaxed) {
@@ -130,15 +132,15 @@ fn listen_and_obey(
 
         let (decision, confidence) = commands::decide(&transcript);
         match &decision {
-            Decision::Ignored => println!("  «{transcript}»  (not addressed to me)"),
+            Decision::Ignored => note!("heard    «{transcript}»  (not addressed to me)"),
             Decision::Unrecognised => {
-                println!("  «{transcript}»  ->  not understood");
+                note!("unknown  «{transcript}»  ->  not understood");
                 actions::play_sound(sounds::UNSURE);
             }
             _ => {
                 if let Some(description) = commands::perform(&decision) {
-                    println!(
-                        "  «{transcript}»  ->  {description}  \
+                    note!(
+                        "ran      «{transcript}»  ->  {description}  \
                          [{:.0}% · {seconds:.1}s audio · {elapsed_ms} ms]",
                         confidence * 100.0
                     );
@@ -146,7 +148,7 @@ fn listen_and_obey(
                 }
                 if commands::is_sleep(&decision) {
                     active.store(false, Ordering::Relaxed);
-                    println!("  (paused — resume from the menu bar)");
+                    note!("paused by voice — resume from the menu bar");
                 }
             }
         }
@@ -218,12 +220,12 @@ fn run_menu_bar(active: Arc<AtomicBool>) -> Result<()> {
         while let Ok(event) = events.recv() {
             if event.id == listen_id {
                 active.store(true, Ordering::Relaxed);
-                println!("(listening)");
+                note!("resumed from the menu");
             } else if event.id == pause_id {
                 active.store(false, Ordering::Relaxed);
-                println!("(paused)");
+                note!("paused from the menu");
             } else if event.id == quit_id {
-                println!("Goodbye.");
+                note!("quit from the menu");
                 std::process::exit(0);
             }
         }
@@ -240,7 +242,10 @@ fn main() -> Result<()> {
     commands::configure(&config);
     let audio_settings = config.audio_settings();
 
-    println!("Oyente — loading model…");
+    note!("Oyente starting — loading model…");
+    if let Some(log) = journal::path() {
+        println!("Log: {}", log.display());
+    }
     if !actions::has_accessibility_permission() {
         eprintln!(
             "Warning: no Accessibility permission. Commands that open apps\n\
