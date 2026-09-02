@@ -30,7 +30,7 @@ const WIDTH: f64 = 380.0;
 /// The layout runs downwards from the top, so the window has to be as tall
 /// as everything in it plus a margin; too short and the final line simply
 /// falls off, which is what it did.
-const HEIGHT: f64 = 516.0;
+const HEIGHT: f64 = 620.0;
 const MARGIN: f64 = 22.0;
 
 /// A slider's range and the setting behind it.
@@ -90,6 +90,11 @@ pub struct Preferences {
     shortcut_value: std::cell::RefCell<String>,
     /// True while waiting for the user to press a combination.
     capturing: Cell<bool>,
+    /// Starts and reports voice training.
+    train: Retained<NSButton>,
+    train_clicks: Cell<isize>,
+    train_status: Retained<NSTextField>,
+    train_requested: Cell<bool>,
     /// The button's state last time it was read, to notice a click without
     /// an Objective-C target — see the note at the top of this file.
     button_clicks: Cell<isize>,
@@ -180,14 +185,37 @@ fn slider(mtm: MainThreadMarker, y: f64, range: (f64, f64), value: f64, steps: u
     Dial { control, readout, last: Cell::new(settled) }
 }
 
-/// How the sensitivity number reads to a person.
-fn sensitivity_words(value: f64) -> String {
-    match value {
-        v if v <= 0.6 => "Alta".into(),
-        v if v <= 0.7 => "Normal".into(),
-        v if v <= 0.8 => "Baja".into(),
-        _ => "Muy baja".into(),
-    }
+/// The sensitivity settings, in the order they appear on the slider.
+///
+/// Discrete steps with a name each, rather than a range mapped to words:
+/// with seven positions and four names, two thirds of the travel changed
+/// nothing that could be seen.
+const SENSITIVITY: &[(&str, f32)] = &[
+    ("Muy alta", 0.58),
+    ("Alta", 0.64),
+    ("Normal", 0.70),
+    ("Baja", 0.78),
+    ("Muy baja", 0.86),
+];
+
+/// The slider position closest to a stored threshold.
+fn sensitivity_step(threshold: f32) -> f64 {
+    SENSITIVITY
+        .iter()
+        .enumerate()
+        .min_by(|(_, (_, a)), (_, (_, b))| {
+            (a - threshold)
+                .abs()
+                .partial_cmp(&(b - threshold).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map_or(2.0, |(i, _)| i as f64)
+}
+
+/// The name and value at a slider position.
+fn sensitivity_at(step: f64) -> (&'static str, f32) {
+    let index = (step.round().max(0.0) as usize).min(SENSITIVITY.len() - 1);
+    SENSITIVITY[index]
 }
 
 impl Preferences {
@@ -263,7 +291,14 @@ impl Preferences {
             false,
         ));
         y -= 26.0;
-        let sensitivity = slider(mtm, y, (0.55, 0.85), f64::from(settings.command_threshold()), 7);
+        // Positions rather than a raw range: each step has its own name.
+        let sensitivity = slider(
+            mtm,
+            y,
+            (0.0, (SENSITIVITY.len() - 1) as f64),
+            sensitivity_step(settings.command_threshold()),
+            SENSITIVITY.len(),
+        );
         add(&sensitivity.control);
         add(&sensitivity.readout);
         y -= 22.0;
@@ -348,6 +383,46 @@ impl Preferences {
             NSRect::new(NSPoint::new(MARGIN, y), NSSize::new(WIDTH - MARGIN * 2.0, 16.0)),
             true,
         ));
+        y -= 40.0;
+
+        add(&label(
+            mtm,
+            "Tu voz",
+            NSRect::new(NSPoint::new(MARGIN, y), NSSize::new(200.0, 18.0)),
+            true,
+        ));
+        y -= 28.0;
+        let trained = crate::speaker::load_profile().is_some();
+        // Safety: no target and no action, so nothing is called back into.
+        let train = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str(if trained {
+                    "Volver a entrenar"
+                } else {
+                    "Entrenar mi voz"
+                }),
+                None,
+                None,
+                mtm,
+            )
+        };
+        train.setFrame(NSRect::new(
+            NSPoint::new(MARGIN, y),
+            NSSize::new(170.0, 26.0),
+        ));
+        add(&train);
+        y -= 40.0;
+        let train_status = label(
+            mtm,
+            if trained {
+                "Minion solo obedece a tu voz."
+            } else {
+                "Ahora obedece a cualquiera que diga «minion»."
+            },
+            NSRect::new(NSPoint::new(MARGIN, y), NSSize::new(WIDTH - MARGIN * 2.0, 34.0)),
+            true,
+        );
+        add(&train_status);
 
         let preferences = Self {
             window,
@@ -361,6 +436,10 @@ impl Preferences {
             shortcut_value: std::cell::RefCell::new(current),
             capturing: Cell::new(false),
             button_clicks: Cell::new(0),
+            train,
+            train_clicks: Cell::new(0),
+            train_status,
+            train_requested: Cell::new(false),
         };
         preferences.update_readouts();
         preferences
@@ -388,7 +467,7 @@ impl Preferences {
         };
         set(
             &self.sensitivity.readout,
-            sensitivity_words(self.sensitivity.control.doubleValue()),
+            sensitivity_at(self.sensitivity.control.doubleValue()).0.to_string(),
         );
         set(
             &self.pause.readout,
@@ -426,8 +505,8 @@ impl Preferences {
             }
             changed = true;
         }
-        if let Some(value) = self.sensitivity.moved() {
-            save("threshold", &format!("{value:.2}"));
+        if let Some(step) = self.sensitivity.moved() {
+            save("threshold", &format!("{:.2}", sensitivity_at(step).1));
             changed = true;
         }
         if let Some(value) = self.pause.moved() {
@@ -457,6 +536,30 @@ impl Preferences {
             self.update_readouts();
         }
         changed
+    }
+
+    /// Whether the person just asked to train their voice.
+    ///
+    /// Cleared by asking, since only the loop that owns the microphone can
+    /// act on it.
+    pub fn take_training_request(&self) -> bool {
+        let clicks = self.train.state();
+        if clicks != self.train_clicks.get() {
+            self.train_clicks.set(clicks);
+            if clicks != 0 {
+                self.train_requested.set(true);
+            }
+        }
+        self.train_requested.replace(false)
+    }
+
+    /// Shows how training is going.
+    pub fn show_training(&self, message: &str, finished: bool) {
+        self.train_status.setStringValue(&NSString::from_str(message));
+        if finished {
+            self.train
+                .setTitle(&NSString::from_str("Volver a entrenar"));
+        }
     }
 
     /// Waits for the next key combination and stores it.
@@ -622,11 +725,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sensitivity_reads_as_words() {
-        // The number means nothing to a person; the word does.
-        assert_eq!(sensitivity_words(0.55), "Alta");
-        assert_eq!(sensitivity_words(0.70), "Normal");
-        assert_eq!(sensitivity_words(0.80), "Baja");
-        assert_eq!(sensitivity_words(0.85), "Muy baja");
+    fn every_slider_position_has_its_own_name() {
+        // Two positions showing the same word means part of the slider
+        // does nothing a person can see.
+        let mut seen = std::collections::HashSet::new();
+        for step in 0..SENSITIVITY.len() {
+            let (name, _) = sensitivity_at(step as f64);
+            assert!(seen.insert(name), "«{name}» appears at more than one position");
+        }
+    }
+
+    #[test]
+    fn sensitivity_rises_along_the_slider() {
+        // Left is more willing to act, right is more cautious.
+        for pair in SENSITIVITY.windows(2) {
+            assert!(pair[0].1 < pair[1].1, "the values should climb");
+        }
+    }
+
+    #[test]
+    fn a_stored_value_finds_its_position() {
+        for (index, (_, value)) in SENSITIVITY.iter().enumerate() {
+            assert_eq!(sensitivity_step(*value), index as f64);
+        }
+        // And something in between lands on the nearest.
+        assert_eq!(sensitivity_step(0.71), 2.0);
     }
 }

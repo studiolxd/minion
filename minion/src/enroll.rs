@@ -16,17 +16,92 @@ use anyhow::{anyhow, Result};
 use crate::{audio, speaker};
 
 /// How many sentences to collect.
-const SENTENCES: usize = 5;
+pub const SENTENCES: usize = 5;
 
 /// Prompts to read. Varied on purpose — different sounds, different
 /// lengths — so the average is a voice and not one turn of phrase.
-const PROMPTS: &[&str] = &[
+pub const PROMPTS: &[&str] = &[
     "Hola, esta es mi voz para el ordenador.",
     "Quiero que solo me haga caso a mí cuando hablo.",
     "El reconocimiento funciona mejor si hablo con naturalidad.",
     "Abre el navegador y busca lo que te pido.",
     "Con esto ya debería saber quién soy.",
 ];
+
+/// Training in progress, shared between the window and the listening loop.
+///
+/// The window cannot record: the microphone belongs to the recognition
+/// thread, which is already receiving utterances. So the window asks, and
+/// that thread does the work and reports back through here.
+#[derive(Default)]
+pub struct Session {
+    /// Voices collected so far.
+    pub collected: Vec<crate::speaker::Embedding>,
+    /// What to show the person right now.
+    pub message: String,
+    /// Set when there is nothing left to do, successfully or not.
+    pub finished: bool,
+}
+
+impl Session {
+    pub fn starting() -> Self {
+        Self {
+            collected: Vec::new(),
+            message: format!("Di: «{}»", PROMPTS[0]),
+            finished: false,
+        }
+    }
+
+    /// Takes one utterance. Returns true when training is over.
+    pub fn accept(&mut self, embedding: Option<crate::speaker::Embedding>) -> bool {
+        let Some(embedding) = embedding else {
+            self.message = "Demasiado corto. Repite la frase.".into();
+            return false;
+        };
+        self.collected.push(embedding);
+
+        if self.collected.len() < SENTENCES {
+            self.message = format!(
+                "{}/{SENTENCES} — di: «{}»",
+                self.collected.len(),
+                PROMPTS[self.collected.len()]
+            );
+            return false;
+        }
+
+        self.finished = true;
+        self.message = match finish(&self.collected) {
+            Ok(agreement) => format!(
+                "Listo. Tu voz queda registrada (coherencia {:.0}%).\n\
+                 A partir de ahora solo te hará caso a ti.",
+                agreement * 100.0
+            ),
+            Err(problem) => problem,
+        };
+        true
+    }
+}
+
+/// Averages, checks and stores what was collected.
+fn finish(collected: &[crate::speaker::Embedding]) -> Result<f32, String> {
+    let voice = crate::speaker::average(collected).ok_or("No se recogió nada.")?;
+    let agreement = collected
+        .iter()
+        .map(|sample| crate::speaker::similarity(sample, &voice))
+        .fold(f32::MAX, f32::min);
+
+    // Samples that disagree with each other come from a noisy room. Saving
+    // them would filter out the very person they are meant to admit.
+    if agreement < 0.5 {
+        return Err(format!(
+            "Las muestras no se parecen entre sí ({:.0}%).\n\
+             Prueba en un sitio más silencioso, sin música ni gente cerca.",
+            agreement * 100.0
+        ));
+    }
+    crate::speaker::save_profile(&voice).map_err(|e| format!("No se pudo guardar: {e}"))?;
+    Ok(agreement)
+}
 
 pub fn run(model_path: &str) -> Result<()> {
     let mut model = speaker::Speaker::load(model_path)?;

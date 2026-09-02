@@ -28,7 +28,7 @@ use std::path::Path;
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -172,15 +172,36 @@ struct Voice {
     threshold: f32,
 }
 
-fn listen_and_obey(
+/// Voice training, shared between the window and the listening loop.
+///
+/// `Some` while training is under way. The window sets it going and reads
+/// the message; the loop that owns the microphone does the work.
+type Training = Arc<Mutex<Option<enroll::Session>>>;
+
+/// Everything the listening loop needs, gathered rather than passed one by
+/// one: eight parameters in a row is a list nobody reads.
+struct Listening {
     model_path: String,
-    settings: audio::Settings,
+    audio: audio::Settings,
     log_ignored_speech: Arc<AtomicBool>,
     play_sounds: Arc<AtomicBool>,
     idle_unload: Option<Duration>,
-    mut voice: Option<Voice>,
+    voice: Option<Voice>,
+    training: Training,
     active: Arc<AtomicBool>,
-) -> Result<()> {
+}
+
+fn listen_and_obey(setup: Listening) -> Result<()> {
+    let Listening {
+        model_path,
+        audio: settings,
+        log_ignored_speech,
+        play_sounds,
+        idle_unload,
+        mut voice,
+        training,
+        active,
+    } = setup;
     // Held in an Option so it can be dropped while idle. It is loaded now
     // rather than on first use, so the first thing said after starting is
     // as quick as the rest.
@@ -225,10 +246,58 @@ fn listen_and_obey(
         let seconds = utterance.len() as f32 / audio::TARGET_HZ as f32;
         let started = Instant::now();
 
+        // Training takes precedence: while it runs, every utterance is a
+        // sample of the person's voice rather than something to obey.
+        let training_now = training.lock().is_ok_and(|session| session.is_some());
+        if training_now {
+            // The speaker model may not be loaded yet — it is only kept
+            // when there is a profile to compare against.
+            if voice.is_none() {
+                match speaker::Speaker::load(&model_path) {
+                    Ok(model) => {
+                        voice = Some(Voice {
+                            model,
+                            profile: Vec::new(),
+                            threshold: f32::MAX, // nothing matches until trained
+                        });
+                    }
+                    Err(e) => {
+                        note!("cannot train: {e:#}");
+                        if let Ok(mut session) = training.lock() {
+                            *session = None;
+                        }
+                        continue;
+                    }
+                }
+            }
+            let embedding = voice.as_mut().and_then(|v| v.model.embed(&utterance));
+            if let Ok(mut session) = training.lock() {
+                if let Some(active_session) = session.as_mut() {
+                    if active_session.accept(embedding) {
+                        note!("voice training finished");
+                        // Adopt what was just learned, without a restart.
+                        if let Some(profile) = speaker::load_profile() {
+                            if let Some(v) = voice.as_mut() {
+                                v.profile = profile;
+                                v.threshold = config_voice_threshold();
+                            }
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
         // Whose voice this is, decided before transcribing: someone else's
         // speech should not reach the recogniser at all, let alone the log.
         if let Some(voice) = voice.as_mut() {
-            if let Some(heard) = voice.model.embed(&utterance) {
+            // A model loaded for training but with no profile yet means
+            // there is nothing to compare against, so anyone is obeyed.
+            let known_voice = !voice.profile.is_empty();
+            if let Some(heard) = known_voice
+                .then(|| voice.model.embed(&utterance))
+                .flatten()
+            {
                 let likeness = speaker::similarity(&heard, &voice.profile);
                 if likeness < voice.threshold {
                     note!("heard    {seconds:.1}s in another voice ({likeness:.2})");
@@ -384,10 +453,16 @@ fn report(
 }
 
 /// Builds the menu bar item and hands control to AppKit. Never returns.
+/// The voice threshold as configured, read fresh.
+fn config_voice_threshold() -> f32 {
+    config::load().voice_threshold()
+}
+
 fn run_menu_bar(
     active: Arc<AtomicBool>,
     sounds_on: Arc<AtomicBool>,
     log_voices_on: Arc<AtomicBool>,
+    training: Training,
 ) -> Result<()> {
     let mtm = MainThreadMarker::new()
         .ok_or_else(|| anyhow!("the menu bar must be built on the main thread"))?;
@@ -429,6 +504,21 @@ fn run_menu_bar(
     // Built once and reused: reopening should bring back the same window,
     // not stack another one behind it.
     let panel = Rc::new(preferences::Preferences::new(mtm));
+
+    // On a fresh install there is nothing to discover from a menu bar icon
+    // and a wake word nobody has been told about, so the window opens once
+    // by itself. The marker goes in the configuration file, which is also
+    // what creates it.
+    let first_run = config::path().is_none_or(|path| !path.exists());
+    if first_run {
+        let _ = config::set_option("sounds", "true");
+        actions::show_message(
+            "Minion escucha por el micrófono y obedece cuando empiezas por \
+             «minion».\n\nPrueba: «minion, abre Chrome».\n\nEn esta ventana \
+             puedes ajustar cómo escucha y enseñarle tu voz.",
+        );
+        panel.show();
+    }
     let report = Rc::new(preferences::Report::new(mtm));
 
     // Watches this application's keys, so the shortcut button can be set by
@@ -464,6 +554,7 @@ fn run_menu_bar(
     let panel_for_timer = Rc::clone(&panel);
     let open_for_timer = Arc::clone(&open_requested);
     let learn_for_timer = Arc::clone(&learn_requested);
+    let training_for_timer = Arc::clone(&training);
     let report_for_timer = Rc::clone(&report);
     let sounds_for_timer = Arc::clone(&sounds_on);
     let voices_for_timer = Arc::clone(&log_voices_on);
@@ -471,6 +562,28 @@ fn run_menu_bar(
         if open_for_timer.swap(false, Ordering::Relaxed) {
             panel_for_timer.show();
         }
+        // Voice training: the window asks, the listening loop answers.
+        if panel_for_timer.take_training_request() {
+            if let Ok(mut session) = training_for_timer.lock() {
+                *session = Some(enroll::Session::starting());
+                panel_for_timer.show_training(
+                    &session.as_ref().map_or(String::new(), |s| s.message.clone()),
+                    false,
+                );
+            }
+        } else if let Ok(session) = training_for_timer.lock() {
+            if let Some(active_session) = session.as_ref() {
+                panel_for_timer
+                    .show_training(&active_session.message, active_session.finished);
+            }
+        }
+        // Clear a finished session once its message has been shown.
+        if let Ok(mut session) = training_for_timer.lock() {
+            if session.as_ref().is_some_and(|s| s.finished) {
+                *session = None;
+            }
+        }
+
         if learn_for_timer.swap(false, Ordering::Relaxed) {
             let config = config::load();
             let lesson = learn::analyse(&config);
@@ -667,6 +780,9 @@ fn main() -> Result<()> {
     // Voice recognition is opt-in: it exists only once someone has run
     // `minion enroll`. Without a profile Minion answers anyone who says the
     // wake word, which is the right default for a machine with one user.
+    let training: Training = Arc::new(Mutex::new(None));
+    let worker_training = Arc::clone(&training);
+
     let voice = match speaker::load_profile() {
         Some(profile) => match speaker::Speaker::load(&model_path) {
             Ok(model) => {
@@ -692,15 +808,16 @@ fn main() -> Result<()> {
     let worker_log_ignored = Arc::clone(&log_ignored);
     let worker_sounds = Arc::clone(&play_sounds);
     std::thread::spawn(move || {
-        if let Err(e) = listen_and_obey(
+        if let Err(e) = listen_and_obey(Listening {
             model_path,
-            audio_settings,
-            worker_log_ignored,
-            worker_sounds,
+            audio: audio_settings,
+            log_ignored_speech: worker_log_ignored,
+            play_sounds: worker_sounds,
             idle_unload,
             voice,
-            worker_active,
-        ) {
+            training: worker_training,
+            active: worker_active,
+        }) {
             eprintln!("Error: {e:#}");
             std::process::exit(1);
         }
@@ -715,5 +832,5 @@ fn main() -> Result<()> {
         }
     }
 
-    run_menu_bar(active, play_sounds, log_ignored)
+    run_menu_bar(active, play_sounds, log_ignored, training)
 }
