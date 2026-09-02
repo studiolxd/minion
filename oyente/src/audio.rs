@@ -26,6 +26,9 @@ const QUEUE_LIMIT_SECONDS: usize = 30;
 #[derive(Clone, Copy, Debug)]
 pub struct Settings {
     /// RMS energy above which someone is considered to be speaking.
+    ///
+    /// Used as a floor. The working threshold rises above it when the room
+    /// is noisy — see [`NoiseFloor`].
     pub speech_threshold: f32,
     /// Silence that ends an utterance.
     pub silence_end_ms: usize,
@@ -85,6 +88,54 @@ fn rms(block: &[f32]) -> f32 {
     (block.iter().map(|s| s * s).sum::<f32>() / block.len() as f32).sqrt()
 }
 
+/// Tracks how loud the room is when nobody is speaking.
+///
+/// A fixed threshold only suits the room it was measured in: 0.015 is
+/// generous in a quiet study and deaf in a café. This follows the quiet
+/// moments and lifts the bar above them, so the same setting works in both.
+struct NoiseFloor {
+    /// Slow-moving estimate of background level.
+    level: f32,
+    /// Blocks seen, so the estimate can settle before it is trusted.
+    samples: usize,
+}
+
+impl NoiseFloor {
+    /// How much louder than the background speech must be.
+    const MARGIN: f32 = 3.0;
+    /// Weight of each new quiet block. Small, so a pause in speech does not
+    /// drag the estimate up and deafen the detector mid-sentence.
+    const ADAPT: f32 = 0.02;
+    /// Blocks needed before the estimate is used at all (about a second).
+    const SETTLE: usize = 50;
+    /// Never let the adaptive threshold climb beyond this multiple of the
+    /// configured floor: a persistently loud room should not silence
+    /// everything, it should just be harder to talk over.
+    const MAX_LIFT: f32 = 4.0;
+
+    fn new() -> Self {
+        Self { level: 0.0, samples: 0 }
+    }
+
+    /// Feeds a block that was judged not to be speech.
+    fn observe_quiet(&mut self, rms: f32) {
+        self.level = if self.samples == 0 {
+            rms
+        } else {
+            self.level * (1.0 - Self::ADAPT) + rms * Self::ADAPT
+        };
+        self.samples += 1;
+    }
+
+    /// The level speech must exceed, given the configured floor.
+    fn threshold(&self, floor: f32) -> f32 {
+        if self.samples < Self::SETTLE {
+            return floor;
+        }
+        (self.level * Self::MARGIN).clamp(floor, floor * Self::MAX_LIFT)
+    }
+}
+
 /// Splits a stream of blocks into utterances.
 ///
 /// Kept separate from the audio plumbing so its behaviour can be tested
@@ -95,6 +146,7 @@ struct Segmenter {
     speech_blocks: usize,
     silence_blocks: usize,
     speaking: bool,
+    noise: NoiseFloor,
 }
 
 impl Segmenter {
@@ -105,12 +157,21 @@ impl Segmenter {
             speech_blocks: 0,
             silence_blocks: 0,
             speaking: false,
+            noise: NoiseFloor::new(),
         }
     }
 
     /// Feeds one block. Returns a finished utterance when there is one.
     fn push(&mut self, block: &[f32]) -> Option<Vec<f32>> {
-        let has_speech = rms(block) > self.settings.speech_threshold;
+        let level = rms(block);
+        let threshold = self.noise.threshold(self.settings.speech_threshold);
+        let has_speech = level > threshold;
+
+        // Only quiet blocks outside an utterance update the estimate: the
+        // gaps between words are not the room, they are part of speech.
+        if !has_speech && !self.speaking {
+            self.noise.observe_quiet(level);
+        }
 
         if has_speech {
             self.speaking = true;
@@ -279,6 +340,59 @@ mod tests {
             done[0].len() <= 600 * TARGET_HZ as usize / 1000 + BLOCK_SAMPLES,
             "the cut should respect max_utterance_ms"
         );
+    }
+
+    #[test]
+    fn quiet_rooms_keep_the_configured_floor() {
+        let mut segmenter = Segmenter::new(Settings::default());
+        // Near-silence for a while: the floor should not move.
+        feed(&mut segmenter, blocks_of(0.001, 100));
+        let threshold = segmenter.noise.threshold(Settings::default().speech_threshold);
+        assert!(
+            (threshold - Settings::default().speech_threshold).abs() < 1e-6,
+            "a quiet room should not raise the bar"
+        );
+    }
+
+    #[test]
+    fn a_noisy_room_raises_the_bar() {
+        let mut segmenter = Segmenter::new(Settings::default());
+        // Steady background hum, well under the speech threshold but not
+        // silence — a fan, a café, a fridge.
+        feed(&mut segmenter, blocks_of(0.012, 400));
+        let raised = segmenter.noise.threshold(Settings::default().speech_threshold);
+        assert!(
+            raised > Settings::default().speech_threshold,
+            "background noise should lift the threshold, got {raised}"
+        );
+        assert!(
+            raised <= Settings::default().speech_threshold * NoiseFloor::MAX_LIFT,
+            "but never past the cap"
+        );
+    }
+
+    #[test]
+    fn speech_still_gets_through_a_noisy_room() {
+        let mut segmenter = Segmenter::new(Settings::default());
+        feed(&mut segmenter, blocks_of(0.012, 400));
+        // Speaking up over that background must still register.
+        assert!(feed(&mut segmenter, blocks_of(0.2, 50)).is_empty());
+        let done = feed(&mut segmenter, blocks_of(0.012, 60));
+        assert_eq!(done.len(), 1, "speech over noise should still be caught");
+    }
+
+    #[test]
+    fn pauses_between_words_do_not_deafen_it() {
+        // The gaps inside a sentence are not the room; if they fed the
+        // estimate, the threshold would climb mid-sentence and cut it off.
+        let mut segmenter = Segmenter::new(Settings::default());
+        feed(&mut segmenter, blocks_of(0.001, 100));
+        let before = segmenter.noise.threshold(0.015);
+        feed(&mut segmenter, blocks_of(0.3, 20));
+        feed(&mut segmenter, blocks_of(0.0, 10));
+        feed(&mut segmenter, blocks_of(0.3, 20));
+        let after = segmenter.noise.threshold(0.015);
+        assert!((before - after).abs() < 1e-6, "speech gaps must not move the floor");
     }
 
     #[test]

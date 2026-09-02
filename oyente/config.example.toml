@@ -129,6 +129,16 @@ not a search for it.
 front and it opens in Chrome, not in whichever browser the system considers
 default. Ask from anywhere else and the default applies.
 
+### Doing it again, and doing several things
+
+«ordenador, **otra vez**» repeats the last command — also *repite*, *hazlo*.
+With a count: «ordenador, repite tres veces».
+
+Two instructions in one breath: «ordenador, cierra la pestaña **y luego**
+recarga» — also *y después*, *y ahora*, *y también*. Only those explicit
+joiners split a sentence; a bare "y" does not, or "pon la canción tú y yo"
+would become two commands.
+
 ### Dictating text
 
 «ordenador, **escribe** hola qué tal» types the words that follow —
@@ -224,8 +234,9 @@ Copy `config.example.toml` to
 optional, and it is read once at startup.
 
 It covers the wake words, the confidence threshold, the speech detection
-numbers, and extra applications — so adding your own apps or retuning the
-listener needs no Rust toolchain:
+numbers, extra applications, aliases for existing commands, and commands of
+your own bound to a shortcut — so extending the vocabulary needs no Rust
+toolchain:
 
 ```toml
 threshold = 0.75
@@ -237,6 +248,11 @@ silence_end_ms = 900
 name = "Notion"
 bundle_id = "notion.id"
 aliases = ["notion", "nocion"]
+
+[[commands]]
+name = "compilar"
+phrases = ["compila el proyecto"]
+keys = "cmd-shift-b"
 ```
 
 A typo in the file is reported at startup and then ignored; it will not
@@ -248,22 +264,10 @@ The defaults for speech detection, overridable in the config file:
 
 | Setting | Default | If it is wrong |
 |---|---|---|
-| `speech_threshold` | 0.015 | Too high: clips words. Too low: transcribes the fan |
+| `speech_threshold` | 0.015 | A floor, not a fixed level — see below |
 | `silence_end_ms` | 700 | Too low: splits sentences mid-thought. Too high: sluggish |
 | `min_speech_ms` | 300 | Filters out door slams and coughs |
 | `max_utterance_ms` | 12000 | Safety cut against continuous noise |
-
-## Memory
-
-The speech model is most of what Oyente uses, so it is released after five
-minutes of silence and reloaded when you next speak — about a second, once.
-`unload_after_minutes = 0` keeps it loaded.
-
-Two ONNX Runtime settings do the rest. Prepacking rewrites weights into a
-layout that multiplies faster and keeps the original alongside, which
-halves nothing and doubles memory; turning it off took 1830 MB to 934 MB at
-a cost of roughly 40 ms per utterance. Memory patterns and thread count
-were tried first and changed nothing at all.
 
 `threshold` is the match confidence needed to act. It errs high on purpose:
 with an always-on microphone, firing a command that was never spoken is
@@ -357,7 +361,5 @@ rebuilding.
 - **Real VAD.** Energy cannot tell speech from a door slam, and background
   music keeps it triggering. Silero VAD is the next step.
 
-- **Custom key commands in the config file**: applications and aliases can
-  be added there, but not entirely new shortcuts.
 - **Developer ID signing**, so the app can be shared with other machines.
   The ad-hoc signature is enough for this one.

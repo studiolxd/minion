@@ -20,6 +20,7 @@ pub const DEFAULT_WAKE_WORDS: &[&str] =
 /// Set once at startup from the configuration file. Absent means defaults.
 static USER_APPS: OnceLock<Vec<App>> = OnceLock::new();
 static USER_ALIASES: OnceLock<Vec<(&'static str, &'static str)>> = OnceLock::new();
+static USER_COMMANDS: OnceLock<Vec<Command>> = OnceLock::new();
 static USER_WAKE_WORDS: OnceLock<Vec<&'static str>> = OnceLock::new();
 static USER_THRESHOLD: OnceLock<f32> = OnceLock::new();
 
@@ -28,6 +29,10 @@ pub fn configure(config: &Config) {
     let extra = config.extra_apps();
     if !extra.is_empty() {
         let _ = USER_APPS.set(extra);
+    }
+    let own = config.extra_commands();
+    if !own.is_empty() {
+        let _ = USER_COMMANDS.set(own);
     }
     let aliases = config.extra_aliases();
     if !aliases.is_empty() {
@@ -354,7 +359,25 @@ pub const COMMANDS: &[Command] = &[
 ///
 /// Deciding and acting are deliberately separate: it makes the vocabulary
 /// testable without applications opening for real.
-#[derive(Debug, PartialEq, Eq)]
+/// Words that join two instructions in one sentence.
+///
+/// Only explicit joiners. A bare "y" appears inside titles and dictated
+/// text — "pon la canción tú y yo" is one instruction, not two.
+const CHAIN_JOINERS: &[&str] = &[" y luego ", " y después ", " y despues ", " y ahora ", " y también ", " y tambien "];
+
+/// Spoken numbers, for "repite tres veces".
+const NUMBERS: &[(&str, usize)] = &[
+    ("una", 1), ("uno", 1), ("1", 1),
+    ("dos", 2), ("2", 2),
+    ("tres", 3), ("3", 3),
+    ("cuatro", 4), ("4", 4),
+    ("cinco", 5), ("5", 5),
+];
+
+/// Most times a command will be repeated in one go.
+const MAX_REPEATS: usize = 10;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Decision {
     /// Launch or focus an application.
     Launch { name: &'static str, bundle_id: &'static str },
@@ -369,6 +392,8 @@ pub enum Decision {
     Type(String),
     /// Look something up in Spotify.
     SearchMusic(String),
+    /// Do the last thing again, this many times.
+    Again(usize),
     /// Run a command from the table, identified by name.
     Run(&'static str),
     /// Started with the wake word, but nothing was recognised.
@@ -383,6 +408,57 @@ fn strip_wake_word(phrase: &str) -> Option<&str> {
     wake_words()
         .contains(&first)
         .then(|| phrase[first.len()..].trim())
+}
+
+/// Reads "otra vez", "repite", "hazlo tres veces" and the like.
+///
+/// Returns how many times. Absent a number, once.
+fn repeat_request(rest: &str) -> Option<usize> {
+    let words: Vec<&str> = rest.split_whitespace().collect();
+    let asks_again = rest.contains("otra vez")
+        || rest.starts_with("repite")
+        || rest.starts_with("repitelo")
+        || rest.starts_with("hazlo");
+    if !asks_again {
+        return None;
+    }
+    // "tres veces" — the number sits just before "veces".
+    let times = words
+        .iter()
+        .position(|w| *w == "veces")
+        .and_then(|i| i.checked_sub(1))
+        .and_then(|i| words.get(i))
+        .and_then(|word| NUMBERS.iter().find(|(name, _)| name == word))
+        .map_or(1, |(_, n)| *n);
+    Some(times.min(MAX_REPEATS))
+}
+
+/// Splits a sentence that holds more than one instruction.
+///
+/// The wake word is carried onto each part, since only the first was
+/// spoken with it: "ordenador cierra la pestaña y luego recarga" becomes
+/// two sentences that each stand on their own.
+pub fn split_chain(transcript: &str) -> Vec<String> {
+    let lowered = transcript.to_lowercase();
+    let Some(joiner) = CHAIN_JOINERS.iter().find(|j| lowered.contains(*j)) else {
+        return vec![transcript.to_string()];
+    };
+    // Find where the joiner sits in the original, to keep its casing.
+    let Some(at) = lowered.find(*joiner) else {
+        return vec![transcript.to_string()];
+    };
+    let head = transcript[..at].trim().to_string();
+    let tail = transcript[at + joiner.len()..].trim();
+
+    let Some(wake) = head.split_whitespace().next() else {
+        return vec![transcript.to_string()];
+    };
+    let mut parts = vec![head.clone()];
+    // The rest may itself be a chain.
+    for piece in split_chain(&format!("{wake} {tail}")) {
+        parts.push(piece);
+    }
+    parts
 }
 
 /// Extracts a song, album or artist name from the sentence.
@@ -550,14 +626,21 @@ pub fn decide_in(transcript: &str, context: Option<&str>) -> (Decision, f32) {
     }
 
     // Table commands next: they are more specific than "open something".
+    // The user's own are searched alongside the built-in ones.
     let mut best: Option<(&Command, f32)> = None;
-    for command in COMMANDS {
+    for command in COMMANDS.iter().chain(USER_COMMANDS.get().into_iter().flatten()) {
         for phrase in command.phrases {
             let score = similarity(rest, phrase);
             if score >= threshold() && best.is_none_or(|(_, b)| score > b) {
                 best = Some((command, score));
             }
         }
+    }
+
+    // "otra vez", "repite dos veces": refers to whatever came before, so it
+    // is resolved by the caller, which is the only place that remembers.
+    if let Some(times) = repeat_request(rest) {
+        return (Decision::Again(times), 1.0);
     }
 
     // A named song, but only if nothing in the vocabulary fits. Otherwise
@@ -682,7 +765,10 @@ pub fn perform(decision: &Decision) -> Option<Done> {
             })
         }
         Decision::Run(name) => {
-            let command = COMMANDS.iter().find(|c| c.name == *name)?;
+            let command = COMMANDS
+                .iter()
+                .chain(USER_COMMANDS.get().into_iter().flatten())
+                .find(|c| c.name == *name)?;
             Some(Done {
                 description: (*name).to_string(),
                 succeeded: run_action(command.action),
@@ -1086,6 +1172,54 @@ mod tests {
     fn short_phrases_stay_commands() {
         // "pon la música" must not become a request to type "la música".
         assert_eq!(decision("Ordenador pon la música."), Decision::Run("reproducir"));
+    }
+
+    #[test]
+    fn asks_to_repeat() {
+        assert_eq!(decision("ordenador otra vez"), Decision::Again(1));
+        assert_eq!(decision("ordenador repite"), Decision::Again(1));
+        assert_eq!(decision("ordenador hazlo tres veces"), Decision::Again(3));
+        assert_eq!(decision("ordenador repite dos veces"), Decision::Again(2));
+    }
+
+    #[test]
+    fn a_repeat_is_capped() {
+        // Spoken numbers stop at five; anything else falls back to once.
+        assert_eq!(decision("ordenador repite cien veces"), Decision::Again(1));
+    }
+
+    #[test]
+    fn splits_chained_instructions() {
+        assert_eq!(
+            split_chain("Ordenador cierra la pestaña y luego recarga"),
+            vec!["Ordenador cierra la pestaña", "Ordenador recarga"]
+        );
+        // Three in a row.
+        assert_eq!(
+            split_chain("Ordenador copia esto y luego abre Chrome y después pega esto"),
+            vec![
+                "Ordenador copia esto",
+                "Ordenador abre Chrome",
+                "Ordenador pega esto"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_bare_y_does_not_split() {
+        // Titles and dictated text are full of "y"; only explicit joiners
+        // count, or "pon la canción tú y yo" would become two commands.
+        assert_eq!(
+            split_chain("Ordenador pon la canción tú y yo"),
+            vec!["Ordenador pon la canción tú y yo"]
+        );
+    }
+
+    #[test]
+    fn each_part_of_a_chain_still_resolves() {
+        let parts = split_chain("Ordenador cierra la pestaña y luego recarga");
+        assert_eq!(decide(&parts[0]).0, Decision::Run("cerrar pestaña"));
+        assert_eq!(decide(&parts[1]).0, Decision::Run("recargar"));
     }
 
     #[test]

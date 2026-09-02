@@ -70,6 +70,22 @@ pub struct Config {
     /// and where you add a phrasing the recogniser keeps producing.
     #[serde(default)]
     pub aliases: Vec<AliasConfig>,
+
+    /// Entirely new commands, bound to a keyboard shortcut.
+    #[serde(default)]
+    pub commands: Vec<CommandConfig>,
+}
+
+/// A command of your own: what to say, and which keys to press.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandConfig {
+    /// Shown in the log when it runs.
+    pub name: String,
+    /// Ways of saying it.
+    pub phrases: Vec<String>,
+    /// The shortcut, as written on a menu: "cmd-shift-b", "ctrl+alt+left".
+    pub keys: String,
 }
 
 /// Another way of saying an existing command.
@@ -110,6 +126,7 @@ impl Default for Config {
             audio: AudioConfig::default(),
             apps: Vec::new(),
             aliases: Vec::new(),
+            commands: Vec::new(),
             unload_after_minutes: None,
         }
     }
@@ -186,6 +203,35 @@ impl Config {
             0 => None,
             minutes => Some(Duration::from_secs(minutes * 60)),
         }
+    }
+
+    /// Commands defined in the file, as `'static` entries.
+    ///
+    /// Anything whose shortcut cannot be read is reported and skipped: one
+    /// typo should cost that command, not the whole file.
+    pub fn extra_commands(&self) -> Vec<crate::commands::Command> {
+        self.commands
+            .iter()
+            .filter_map(|entry| {
+                let Some((code, mods)) = crate::actions::parse_shortcut(&entry.keys) else {
+                    crate::journal::write(&format!(
+                        "Ignoring command «{}»: cannot read the shortcut «{}»",
+                        entry.name, entry.keys
+                    ));
+                    return None;
+                };
+                let phrases: Vec<&'static str> = entry
+                    .phrases
+                    .iter()
+                    .map(|p| &*Box::leak(crate::text::normalise(p).into_boxed_str()))
+                    .collect();
+                Some(crate::commands::Command {
+                    phrases: Box::leak(phrases.into_boxed_slice()),
+                    name: Box::leak(entry.name.clone().into_boxed_str()),
+                    action: crate::commands::Action::Key(code, mods),
+                })
+            })
+            .collect()
     }
 
     /// User aliases as `(command name, phrase)`, both normalised.
@@ -297,6 +343,44 @@ mod tests {
         // Aliases are compared against normalised speech, so they are stored
         // normalised too — otherwise an accent in the file would never match.
         assert_eq!(apps[0].aliases, ["nocion", "notion"]);
+    }
+
+    #[test]
+    fn reads_commands_of_your_own() {
+        let config: Config = toml::from_str(
+            r#"
+            [[commands]]
+            name = "compilar"
+            phrases = ["Compila el proyecto", "compila"]
+            keys = "cmd-shift-b"
+            "#,
+        )
+        .expect("command config should parse");
+        let commands = config.extra_commands();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].name, "compilar");
+        assert_eq!(commands[0].phrases, ["compila el proyecto", "compila"]);
+    }
+
+    #[test]
+    fn an_unreadable_shortcut_costs_only_that_command() {
+        let config: Config = toml::from_str(
+            r#"
+            [[commands]]
+            name = "roto"
+            phrases = ["esto no va"]
+            keys = "cmd-shift"
+
+            [[commands]]
+            name = "bueno"
+            phrases = ["esto si"]
+            keys = "cmd-k"
+            "#,
+        )
+        .expect("should parse");
+        let commands = config.extra_commands();
+        assert_eq!(commands.len(), 1, "the good one should survive");
+        assert_eq!(commands[0].name, "bueno");
     }
 
     #[test]

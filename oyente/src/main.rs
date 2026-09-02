@@ -175,6 +175,8 @@ fn listen_and_obey(
     // as quick as the rest.
     let mut model = Some(load_model(&model_path)?);
     let mut last_used = Instant::now();
+    // What "otra vez" refers to.
+    let mut last_command: Option<Decision> = None;
     note!("Model loaded. {}", resident_memory());
 
     let listener =
@@ -242,12 +244,69 @@ fn listen_and_obey(
         }
         let elapsed_ms = started.elapsed().as_millis();
 
-        // Which application is in front decides what some phrases mean, so
-        // it is read now rather than when the command runs: by then the
-        // command itself may have changed it.
-        let context = actions::frontmost_app();
-        let (decision, confidence) = commands::decide_in(&transcript, context.as_deref());
-        match &decision {
+        // One sentence can hold several instructions joined by "y luego".
+        for part in commands::split_chain(&transcript) {
+            // Which application is in front decides what some phrases mean,
+            // and it is read per instruction: the first of a chain may well
+            // have changed which application that is.
+            let context = actions::frontmost_app();
+            let (mut decision, confidence) = commands::decide_in(&part, context.as_deref());
+
+            // "otra vez" means whatever was said before it.
+            let mut repeats = 1;
+            if let commands::Decision::Again(times) = decision {
+                match &last_command {
+                    Some(previous) => {
+                        repeats = times;
+                        decision = previous.clone();
+                    }
+                    None => {
+                        note!("unknown  «{part}»  ->  nothing to repeat yet");
+                        continue;
+                    }
+                }
+            }
+
+            report(
+                &part,
+                &decision,
+                confidence,
+                repeats,
+                seconds,
+                elapsed_ms,
+                log_ignored_speech,
+                play_sounds,
+            );
+
+            if commands::is_sleep(&decision) {
+                active.store(false, Ordering::Relaxed);
+                note!("paused by voice — resume from the menu bar");
+            }
+            // Only real actions are worth repeating later.
+            if !matches!(
+                decision,
+                commands::Decision::Ignored | commands::Decision::Unrecognised
+            ) {
+                last_command = Some(decision);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Carries out a decision and writes down what happened.
+#[allow(clippy::too_many_arguments)]
+fn report(
+    transcript: &str,
+    decision: &Decision,
+    confidence: f32,
+    repeats: usize,
+    seconds: f32,
+    elapsed_ms: u128,
+    log_ignored_speech: bool,
+    play_sounds: bool,
+) {
+        match decision {
             Decision::Ignored => {
                 // Speech that was not for us. The wording is only written
                 // down when explicitly asked for: see log_ignored_speech.
@@ -264,10 +323,19 @@ fn listen_and_obey(
                 }
             }
             _ => {
-                if let Some(done) = commands::perform(&decision) {
+                let mut outcome = None;
+                for _ in 0..repeats.max(1) {
+                    outcome = commands::perform(decision);
+                }
+                if let Some(done) = outcome {
                     if done.succeeded {
+                        let again = if repeats > 1 {
+                            format!(" ×{repeats}")
+                        } else {
+                            String::new()
+                        };
                         note!(
-                            "ran      «{transcript}»  ->  {}  \
+                            "ran      «{transcript}»  ->  {}{again}  \
                              [{:.0}% · {seconds:.1}s audio · {elapsed_ms} ms]",
                             done.description,
                             confidence * 100.0
@@ -288,14 +356,8 @@ fn listen_and_obey(
                         }
                     }
                 }
-                if commands::is_sleep(&decision) {
-                    active.store(false, Ordering::Relaxed);
-                    note!("paused by voice — resume from the menu bar");
-                }
             }
         }
-    }
-    Ok(())
 }
 
 /// Builds the menu bar item and hands control to AppKit. Never returns.

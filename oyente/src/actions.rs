@@ -41,6 +41,7 @@ pub mod key {
     pub const L: u16 = 37;
     pub const M: u16 = 46;
     pub const N: u16 = 45;
+    pub const DIGIT_0: u16 = 29;
     pub const DIGIT_1: u16 = 18;
     pub const DIGIT_2: u16 = 19;
     pub const DIGIT_3: u16 = 20;
@@ -55,6 +56,55 @@ pub mod key {
     pub const RIGHT: u16 = 124;
     pub const DOWN: u16 = 125;
     pub const UP: u16 = 126;
+}
+
+/// Parses a shortcut such as "cmd-shift-b" into a key and its modifiers.
+///
+/// Accepts the names people actually write: cmd or command, alt or option,
+/// ctrl or control. The key itself comes last.
+pub fn parse_shortcut(text: &str) -> Option<(u16, Mods)> {
+    let mut mods = Mods::NONE;
+    let mut code = None;
+
+    for part in text.split(['-', '+']).map(str::trim) {
+        match part.to_lowercase().as_str() {
+            "cmd" | "command" | "meta" | "super" => mods.command = true,
+            "shift" => mods.shift = true,
+            "alt" | "option" | "opt" => mods.option = true,
+            "ctrl" | "control" => mods.control = true,
+            name => code = key_named(name),
+        }
+    }
+    code.map(|code| (code, mods))
+}
+
+/// The virtual key code for a key's spoken or written name.
+fn key_named(name: &str) -> Option<u16> {
+    // Letters and digits sit where a US layout puts them, which is also
+    // where a Spanish ISO keyboard puts them for these purposes.
+    const NAMED: &[(&str, u16)] = &[
+        ("a", key::A), ("b", key::B), ("c", key::C), ("d", 2), ("e", key::E),
+        ("f", key::F), ("g", 5), ("h", key::H), ("i", key::I), ("j", 38),
+        ("k", 40), ("l", key::L), ("m", key::M), ("n", key::N), ("o", 31),
+        ("p", 35), ("q", key::Q), ("r", key::R), ("s", key::S), ("t", key::T),
+        ("u", 32), ("v", key::V), ("w", key::W), ("x", key::X), ("y", key::Y),
+        ("z", key::Z),
+        ("0", key::DIGIT_0), ("1", key::DIGIT_1), ("2", key::DIGIT_2),
+        ("3", key::DIGIT_3), ("4", key::DIGIT_4), ("5", key::DIGIT_5),
+        ("6", 22), ("7", 26), ("8", 28), ("9", key::DIGIT_9),
+        ("tab", key::TAB), ("space", key::SPACE), ("escape", key::ESCAPE),
+        ("esc", key::ESCAPE), ("delete", key::DELETE), ("backspace", key::DELETE),
+        ("return", 36), ("enter", 36),
+        ("left", key::LEFT), ("right", key::RIGHT),
+        ("up", key::UP), ("down", key::DOWN),
+        ("f1", 122), ("f2", 120), ("f3", 99), ("f4", 118), ("f5", 96),
+        ("f6", 97), ("f7", 98), ("f8", 100), ("f9", 101), ("f10", 109),
+        ("f11", 103), ("f12", 111),
+    ];
+    NAMED
+        .iter()
+        .find(|(candidate, _)| *candidate == name)
+        .map(|(_, code)| *code)
 }
 
 /// Modifier keys held during a keystroke.
@@ -338,4 +388,26 @@ pub fn open_accessibility_settings() -> bool {
         "open location \"x-apple.systempreferences:com.apple.preference.security\
          ?Privacy_Accessibility\"",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_shortcuts_as_written() {
+        assert_eq!(parse_shortcut("cmd-s"), Some((key::S, Mods::CMD)));
+        assert_eq!(parse_shortcut("cmd-shift-b"), Some((key::B, Mods::CMD_SHIFT)));
+        assert_eq!(parse_shortcut("command+option+left"), {
+            let mods = Mods { command: true, option: true, ..Mods::NONE };
+            Some((key::LEFT, mods))
+        });
+        assert_eq!(parse_shortcut("f5"), Some((96, Mods::NONE)));
+    }
+
+    #[test]
+    fn rejects_a_shortcut_with_no_key() {
+        assert_eq!(parse_shortcut("cmd-shift"), None);
+        assert_eq!(parse_shortcut("nonsense"), None);
+    }
 }
