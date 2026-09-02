@@ -112,6 +112,27 @@ Chrome · Safari · Terminal · Orca · Finder · Mail · Notas · Calendario ·
 Spotify · WhatsApp · Telegram · Figma · Obsidian · Discord · Teams ·
 VS Code · Claude · ChatGPT · Ajustes · Vista Previa · Monitor de Actividad
 
+### Web addresses
+
+«ordenador, **ve a** google.com» — spelled out, or spoken with the dot as a
+word ("github punto com"). Well-known sites work by name alone: google,
+youtube, gmail, github, wikipedia, drive, maps, calendar, linkedin, amazon,
+netflix.
+
+An application always wins over a site: "abre Chrome" opens the browser,
+not a search for it.
+
+### Inside particular applications
+
+Some phrases only exist where they mean something, and beat the global
+command of the same name:
+
+| In | Say |
+|---|---|
+| Terminal | limpia la pantalla · cancela · principio de línea · final de línea |
+| Chrome, Safari | abre los favoritos · abre el historial · ventana de incógnito |
+| Finder | crea una carpeta · muestra la información |
+
 ### Commands
 
 | Editing | Tabs and windows |
@@ -201,7 +222,7 @@ much worse than missing one.
 
 ## Design notes
 
-**Deciding and acting are separate.** `commands::decide` is pure and
+**Deciding and acting are separate.** `commands::decide_in` is pure and
 returns a `Decision`; `commands::perform` carries it out. That is what
 makes the vocabulary testable without applications opening for real —
 the test suite checks all 970 phrases without touching the system.
@@ -239,13 +260,22 @@ They have already earned their keep: they caught "cortar" being executed as
 on "deshacer" — all from an edit-distance allowance that was one step too
 generous.
 
+## Signing
+
+`build-app.sh` signs with an Apple Development certificate when one is in
+the keychain, and falls back to ad-hoc otherwise. The difference matters
+more than it looks: an ad-hoc signature ties the Accessibility grant to the
+exact bytes of the binary, so **every rebuild silently revokes it** and the
+app goes back to being ignored by the window server with no error anywhere.
+A real certificate ties the grant to the team and bundle id, which survive
+rebuilding.
+
 ## Not done yet
 
 - **Real VAD.** Energy cannot tell speech from a door slam, and background
   music keeps it triggering. Silero VAD is the next step.
 - **Dictation.** Oyente runs commands; it does not type text.
-- **Per-application context**, so one phrase means different things
-  depending on what is in front.
+
 - **Custom key commands in the config file**, not just applications.
 - **Developer ID signing**, so the app can be shared with other machines.
   The ad-hoc signature is enough for this one.

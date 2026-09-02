@@ -8,6 +8,7 @@
 use std::process::Command;
 
 use core_foundation::base::TCFType;
+use objc2_app_kit::NSWorkspace;
 use core_foundation::boolean::CFBoolean;
 use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
 use core_foundation::string::CFString;
@@ -33,6 +34,10 @@ pub mod key {
     pub const W: u16 = 13;
     pub const R: u16 = 15;
     pub const T: u16 = 17;
+    pub const Y: u16 = 16;
+    pub const I: u16 = 34;
+    pub const B: u16 = 11;
+    pub const E: u16 = 14;
     pub const L: u16 = 37;
     pub const M: u16 = 46;
     pub const N: u16 = 45;
@@ -139,6 +144,21 @@ pub fn open_app(bundle_id: &str) -> bool {
 /// asked about first.
 pub fn quit_app(bundle_id: &str) -> bool {
     applescript(&format!("tell application id \"{bundle_id}\" to quit"))
+}
+
+/// Bundle identifier of the application currently in front.
+///
+/// What makes a command mean different things in different places: "limpia
+/// la pantalla" is ⌃L in a terminal and nothing anywhere else.
+pub fn frontmost_app() -> Option<String> {
+    let workspace = NSWorkspace::sharedWorkspace();
+    let app = workspace.frontmostApplication()?;
+    Some(app.bundleIdentifier()?.to_string())
+}
+
+/// Opens a web address in the default browser.
+pub fn open_url(url: &str) -> bool {
+    Command::new("/usr/bin/open").arg(url).spawn().is_ok()
 }
 
 /// Runs an AppleScript snippet.

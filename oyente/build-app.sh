@@ -54,11 +54,25 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# Ad-hoc signature. Enough for macOS to keep permissions attached to this
-# bundle across rebuilds; a Developer ID would be needed to distribute it.
-codesign --force --deep --sign - "$APP" 2>/dev/null \
-  && echo "Signed (ad-hoc)." \
-  || echo "Warning: could not sign; permissions may reset on each rebuild."
+# Signing identity decides whether permissions survive a rebuild.
+#
+# An ad-hoc signature ties the grant to the exact bytes of the binary, so
+# every rebuild silently revokes Accessibility and the app goes back to
+# being ignored by the window server — with no error anywhere. A real
+# certificate ties it to the team and bundle id instead, which stay put.
+IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null \
+  | grep -m1 "Apple Development" | awk '{print $2}')
+
+if [ -n "$IDENTITY" ]; then
+  codesign --force --deep --sign "$IDENTITY" "$APP" \
+    && echo "Signed with Apple Development ($IDENTITY)." \
+    || { echo "Signing failed; falling back to ad-hoc." >&2; \
+         codesign --force --deep --sign - "$APP"; }
+else
+  codesign --force --deep --sign - "$APP" 2>/dev/null \
+    && echo "Signed (ad-hoc). Accessibility will need re-granting after each rebuild." \
+    || echo "Warning: could not sign at all."
+fi
 
 echo
 echo "Built $APP  ($(du -sh "$APP" | cut -f1))"

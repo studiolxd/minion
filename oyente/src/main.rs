@@ -186,7 +186,11 @@ fn listen_and_obey(
         }
         let elapsed_ms = started.elapsed().as_millis();
 
-        let (decision, confidence) = commands::decide(&transcript);
+        // Which application is in front decides what some phrases mean, so
+        // it is read now rather than when the command runs: by then the
+        // command itself may have changed it.
+        let context = actions::frontmost_app();
+        let (decision, confidence) = commands::decide_in(&transcript, context.as_deref());
         match &decision {
             Decision::Ignored => {
                 // Speech that was not for us. The wording is only written

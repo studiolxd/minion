@@ -70,6 +70,29 @@ const APP_VERBS: &[&str] = &[
 /// Verbs asking for an application to be closed.
 const QUIT_VERBS: &[&str] = &["cerrar", "salir", "matar", "terminar"];
 
+/// Top-level domains recognised when a web address is spoken.
+///
+/// The recogniser writes "google.com" with the dot, which normalisation
+/// turns into two words, so a domain arrives here as "google com". Saying
+/// it out loud gives "google punto com", handled the same way.
+const TLDS: &[&str] = &["com", "es", "org", "net", "io", "dev", "app", "co", "ai"];
+
+/// Sites common enough to name without a domain.
+const SITES: &[(&str, &str)] = &[
+    ("google", "https://www.google.com"),
+    ("youtube", "https://www.youtube.com"),
+    ("gmail", "https://mail.google.com"),
+    ("github", "https://github.com"),
+    ("wikipedia", "https://es.wikipedia.org"),
+    ("drive", "https://drive.google.com"),
+    ("maps", "https://maps.google.com"),
+    ("mapas", "https://maps.google.com"),
+    ("calendar", "https://calendar.google.com"),
+    ("linkedin", "https://www.linkedin.com"),
+    ("amazon", "https://www.amazon.es"),
+    ("netflix", "https://www.netflix.com"),
+];
+
 #[derive(Clone, Copy, Debug)]
 pub enum Action {
     Key(u16, Mods),
@@ -134,6 +157,50 @@ pub const APPS: &[App] = &[
           aliases: &["vista previa", "previsualizacion"] },
     App { name: "Monitor de Actividad", bundle_id: "com.apple.ActivityMonitor",
           aliases: &["monitor de actividad", "actividad"] },
+];
+
+/// Commands that only exist inside particular applications.
+///
+/// Kept apart from the global table rather than adding a context field to
+/// every entry: most commands are global, and this way the exceptions are
+/// visible in one place. A contextual command beats a global one with the
+/// same phrase, which is what lets an app reinterpret a general word.
+pub struct ContextualCommand {
+    /// Bundle identifiers this applies in.
+    pub bundles: &'static [&'static str],
+    pub phrases: &'static [&'static str],
+    pub name: &'static str,
+    pub action: Action,
+}
+
+const BROWSERS: &[&str] = &["com.google.Chrome", "com.apple.Safari"];
+const TERMINALS: &[&str] = &["com.apple.Terminal"];
+const FINDERS: &[&str] = &["com.apple.finder"];
+
+pub const CONTEXTUAL_COMMANDS: &[ContextualCommand] = &[
+    // --- Terminal ---
+    ContextualCommand { bundles: TERMINALS, phrases: &["limpia la pantalla", "limpia"],
+                        name: "limpiar terminal", action: Action::Key(key::L, Mods::CTRL) },
+    ContextualCommand { bundles: TERMINALS, phrases: &["cancela esto", "cancela"],
+                        name: "cancelar", action: Action::Key(key::C, Mods::CTRL) },
+    ContextualCommand { bundles: TERMINALS, phrases: &["principio de linea"],
+                        name: "inicio de línea", action: Action::Key(key::A, Mods::CTRL) },
+    ContextualCommand { bundles: TERMINALS, phrases: &["final de linea"],
+                        name: "fin de línea", action: Action::Key(key::E, Mods::CTRL) },
+
+    // --- Navegadores ---
+    ContextualCommand { bundles: BROWSERS, phrases: &["abre los favoritos", "marcadores"],
+                        name: "favoritos", action: Action::Key(key::B, Mods::CMD_SHIFT) },
+    ContextualCommand { bundles: BROWSERS, phrases: &["abre el historial"],
+                        name: "historial", action: Action::Key(key::Y, Mods::CMD) },
+    ContextualCommand { bundles: BROWSERS, phrases: &["ventana de incognito", "modo incognito"],
+                        name: "ventana privada", action: Action::Key(key::N, Mods::CMD_SHIFT) },
+
+    // --- Finder ---
+    ContextualCommand { bundles: FINDERS, phrases: &["crea una carpeta", "nueva carpeta"],
+                        name: "carpeta nueva", action: Action::Key(key::N, Mods::CMD_SHIFT) },
+    ContextualCommand { bundles: FINDERS, phrases: &["muestra la informacion", "informacion"],
+                        name: "obtener información", action: Action::Key(key::I, Mods::CMD) },
 ];
 
 pub const COMMANDS: &[Command] = &[
@@ -256,6 +323,10 @@ pub enum Decision {
     Launch { name: &'static str, bundle_id: &'static str },
     /// Quit an application.
     Quit { name: &'static str, bundle_id: &'static str },
+    /// Open a web address in the default browser.
+    Browse(String),
+    /// Run a command that only exists in the current application.
+    RunHere(&'static str),
     /// Run a command from the table, identified by name.
     Run(&'static str),
     /// Started with the wake word, but nothing was recognised.
@@ -270,6 +341,35 @@ fn strip_wake_word(phrase: &str) -> Option<&str> {
     wake_words()
         .contains(&first)
         .then(|| phrase[first.len()..].trim())
+}
+
+/// Finds a web address in the sentence.
+///
+/// Two shapes: a spelled-out domain ("google com", "studiolxd punto es") or
+/// one of the sites in [`SITES`] named on its own.
+fn find_website(words: &[String]) -> Option<String> {
+    // A domain: some word followed by a top-level domain.
+    for (i, word) in words.iter().enumerate() {
+        if !TLDS.contains(&word.as_str()) || i == 0 {
+            continue;
+        }
+        let previous = words[i - 1].as_str();
+        let name = if previous == "punto" && i >= 2 {
+            words[i - 2].as_str()
+        } else {
+            previous
+        };
+        // "punto" alone is not a domain, and neither is a lone verb.
+        if name != "punto" && !spanish::is_known_verb(name) {
+            return Some(format!("https://{name}.{word}"));
+        }
+    }
+
+    // A site named without its domain.
+    words
+        .iter()
+        .find_map(|w| SITES.iter().find(|(name, _)| name == w))
+        .map(|(_, url)| (*url).to_string())
 }
 
 /// Finds an application named in the sentence, with its match score.
@@ -292,8 +392,17 @@ fn find_app(rest: &str) -> Option<(&'static App, f32)> {
     best
 }
 
-/// Works out what a transcription means. Performs no action.
+/// Works out what a transcription means with no application context.
+#[cfg(test)]
 pub fn decide(transcript: &str) -> (Decision, f32) {
+    decide_in(transcript, None)
+}
+
+/// Works out what a transcription means inside a given application.
+///
+/// `context` is a bundle identifier. Contextual commands are tried first:
+/// inside Terminal, "limpia" is ⌃L; anywhere else it means nothing.
+pub fn decide_in(transcript: &str, context: Option<&str>) -> (Decision, f32) {
     let normalised = normalise(transcript);
     let Some(rest) = strip_wake_word(&normalised) else {
         return (Decision::Ignored, 0.0);
@@ -302,7 +411,27 @@ pub fn decide(transcript: &str) -> (Decision, f32) {
         return (Decision::Unrecognised, 0.0);
     }
 
-    // Table commands first: they are more specific than "open something".
+    // Commands belonging to the application in front come first: they are
+    // the most specific thing that can match.
+    if let Some(bundle) = context {
+        let mut best_here: Option<(&ContextualCommand, f32)> = None;
+        for command in CONTEXTUAL_COMMANDS {
+            if !command.bundles.contains(&bundle) {
+                continue;
+            }
+            for phrase in command.phrases {
+                let score = similarity(rest, phrase);
+                if score >= threshold() && best_here.is_none_or(|(_, b)| score > b) {
+                    best_here = Some((command, score));
+                }
+            }
+        }
+        if let Some((command, score)) = best_here {
+            return (Decision::RunHere(command.name), score);
+        }
+    }
+
+    // Table commands next: they are more specific than "open something".
     let mut best: Option<(&Command, f32)> = None;
     for command in COMMANDS {
         for phrase in command.phrases {
@@ -324,6 +453,14 @@ pub fn decide(transcript: &str) -> (Decision, f32) {
     // else, even if an application happens to be named in it.
     let other_verb = leading_verb
         .is_some_and(|v| spanish::is_known_verb(v) && !asks_to_open && !asks_to_quit);
+
+    // A web address beats an application name: "abre github" means the site,
+    // since there is no GitHub app in the table to confuse it with.
+    if asks_to_open && find_app(rest).is_none() {
+        if let Some(url) = find_website(&spoken_words) {
+            return (Decision::Browse(url), 0.9);
+        }
+    }
 
     if let Some((app, score)) = find_app(rest) {
         let app_wins = best.is_none_or(|(_, b)| score > b);
@@ -368,18 +505,35 @@ pub fn perform(decision: &Decision) -> Option<Done> {
             description: format!("cerrar {name}"),
             succeeded: actions::quit_app(bundle_id),
         }),
+        Decision::Browse(url) => Some(Done {
+            description: format!("abrir {url}"),
+            succeeded: actions::open_url(url),
+        }),
+        Decision::RunHere(name) => {
+            let command = CONTEXTUAL_COMMANDS.iter().find(|c| c.name == *name)?;
+            Some(Done {
+                description: (*name).to_string(),
+                succeeded: run_action(command.action),
+            })
+        }
         Decision::Run(name) => {
             let command = COMMANDS.iter().find(|c| c.name == *name)?;
-            let succeeded = match command.action {
-                Action::Key(code, mods) => actions::press(code, mods),
-                Action::Volume(delta) => actions::adjust_volume(delta),
-                Action::Mute(muted) => actions::set_muted(muted),
-                Action::Script(script) => actions::applescript(script),
-                Action::Sleep => true,
-            };
-            Some(Done { description: (*name).to_string(), succeeded })
+            Some(Done {
+                description: (*name).to_string(),
+                succeeded: run_action(command.action),
+            })
         }
         _ => None,
+    }
+}
+
+fn run_action(action: Action) -> bool {
+    match action {
+        Action::Key(code, mods) => actions::press(code, mods),
+        Action::Volume(delta) => actions::adjust_volume(delta),
+        Action::Mute(muted) => actions::set_muted(muted),
+        Action::Script(script) => actions::applescript(script),
+        Action::Sleep => true,
     }
 }
 
@@ -538,6 +692,89 @@ mod tests {
             match decide(spoken).0 {
                 Decision::Run(name) if name == *expected => {}
                 other => panic!("«{spoken}» should be «{expected}», got {other:?}"),
+            }
+        }
+    }
+
+    fn browses(phrase: &str, expected: &str) {
+        match decision(phrase) {
+            Decision::Browse(url) => assert_eq!(url, expected, "for «{phrase}»"),
+            other => panic!("«{phrase}» should open {expected}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn opens_web_addresses() {
+        // From the log: this came back not understood.
+        browses("Ordenador ir a google.com", "https://google.com");
+        browses("ordenador abre studiolxd.es", "https://studiolxd.es");
+        // Spoken aloud, the dot becomes a word.
+        browses("ordenador ve a github punto com", "https://github.com");
+    }
+
+    #[test]
+    fn opens_well_known_sites_by_name() {
+        browses("ordenador abre youtube", "https://www.youtube.com");
+        browses("ordenador ve a wikipedia", "https://es.wikipedia.org");
+    }
+
+    #[test]
+    fn applications_still_win_over_sites() {
+        // Chrome is an app in the table; it must not become a web search.
+        launches("ordenador abre chrome", "Chrome");
+        launches("ordenador abre safari", "Safari");
+    }
+
+    #[test]
+    fn commands_belong_to_their_application() {
+        // Inside Terminal these mean something; nowhere else do they.
+        assert_eq!(
+            decide_in("ordenador limpia la pantalla", Some("com.apple.Terminal")).0,
+            Decision::RunHere("limpiar terminal")
+        );
+        assert_eq!(
+            decide_in("ordenador limpia la pantalla", Some("com.google.Chrome")).0,
+            Decision::Unrecognised
+        );
+        assert_eq!(
+            decide_in("ordenador limpia la pantalla", None).0,
+            Decision::Unrecognised
+        );
+    }
+
+    #[test]
+    fn the_same_phrase_can_differ_by_application() {
+        // Chrome and Finder both know "nueva ventana", but only Finder
+        // knows "nueva carpeta".
+        assert_eq!(
+            decide_in("ordenador nueva carpeta", Some("com.apple.finder")).0,
+            Decision::RunHere("carpeta nueva")
+        );
+        assert_eq!(
+            decide_in("ordenador abre una ventana nueva", Some("com.apple.finder")).0,
+            Decision::Run("ventana nueva")
+        );
+    }
+
+    #[test]
+    fn global_commands_still_work_inside_an_application() {
+        assert_eq!(
+            decide_in("ordenador guarda esto", Some("com.apple.Terminal")).0,
+            Decision::Run("guardar")
+        );
+    }
+
+    #[test]
+    fn every_contextual_command_recognises_itself() {
+        for command in CONTEXTUAL_COMMANDS {
+            for phrase in command.phrases {
+                let spoken = format!("ordenador {phrase}");
+                let bundle = command.bundles[0];
+                match decide_in(&spoken, Some(bundle)).0 {
+                    Decision::RunHere(name) if name == command.name => {}
+                    other => panic!("«{spoken}» in {bundle} should be «{}», got {other:?}",
+                                    command.name),
+                }
             }
         }
     }
