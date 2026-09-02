@@ -30,7 +30,10 @@ const WIDTH: f64 = 380.0;
 /// The layout runs downwards from the top, so the window has to be as tall
 /// as everything in it plus a margin; too short and the final line simply
 /// falls off, which is what it did.
-const HEIGHT: f64 = 688.0;
+/// Tall enough for everything plus a bottom margin matching the top one.
+/// `everything_fits_in_the_window` checks it, since a control that lands
+/// below the edge does not look like a bug — it simply is not there.
+const HEIGHT: f64 = 644.0;
 const MARGIN: f64 = 22.0;
 
 /// A slider's range and the setting behind it.
@@ -275,19 +278,21 @@ impl Preferences {
             settings.log_ignored_speech,
         );
         add(&log_voices.control);
-        y -= 34.0;
+        // The hint belongs to the checkbox above it, so it sits close under
+        // it — and the gap to the next control matches the one between the
+        // checkboxes, so the group reads as one thing.
+        y -= 30.0;
         add(&label(
             mtm,
             "Con el micrófono abierto se transcribe todo lo que se habla cerca. \
              Normalmente solo se cuenta cuánto se oyó, no qué se dijo.",
             NSRect::new(
                 NSPoint::new(MARGIN + 20.0, y),
-                NSSize::new(WIDTH - MARGIN * 2.0 - 20.0, 30.0),
+                NSSize::new(WIDTH - MARGIN * 2.0 - 20.0, 28.0),
             ),
             true,
         ));
-        // Clear of the hint's two lines before the next control.
-        y -= 40.0;
+        y -= 26.0;
 
         let at_login = checkbox(mtm, "Abrir al iniciar sesión", y, startup::enabled());
         add(&at_login.control);
@@ -747,7 +752,7 @@ mod tests {
     #[test]
     fn everything_fits_in_the_window() {
         const STEPS: &[f64] = &[
-            26.0, 26.0, 34.0, 40.0, 40.0, // behaviour
+            26.0, 26.0, 30.0, 26.0, 40.0, // behaviour
             28.0, 26.0, 22.0, 34.0, // sensitivity
             26.0, 22.0, 34.0, // pause
             26.0, 40.0, // memory
@@ -758,6 +763,11 @@ mod tests {
         assert!(
             bottom >= MARGIN,
             "the last control ends at {bottom}, below the {MARGIN} margin"
+        );
+        // And not so much room that the window looks half empty.
+        assert!(
+            bottom <= MARGIN * 2.0,
+            "there is {bottom} of space at the bottom, more than the layout needs"
         );
     }
 
