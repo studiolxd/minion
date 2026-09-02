@@ -30,7 +30,7 @@ const WIDTH: f64 = 380.0;
 /// The layout runs downwards from the top, so the window has to be as tall
 /// as everything in it plus a margin; too short and the final line simply
 /// falls off, which is what it did.
-const HEIGHT: f64 = 664.0;
+const HEIGHT: f64 = 688.0;
 const MARGIN: f64 = 22.0;
 
 /// A slider's range and the setting behind it.
@@ -275,15 +275,19 @@ impl Preferences {
             settings.log_ignored_speech,
         );
         add(&log_voices.control);
-        y -= 20.0;
+        y -= 34.0;
         add(&label(
             mtm,
             "Con el micrófono abierto se transcribe todo lo que se habla cerca. \
              Normalmente solo se cuenta cuánto se oyó, no qué se dijo.",
-            NSRect::new(NSPoint::new(MARGIN + 20.0, y - 14.0), NSSize::new(WIDTH - MARGIN * 2.0 - 20.0, 30.0)),
+            NSRect::new(
+                NSPoint::new(MARGIN + 20.0, y),
+                NSSize::new(WIDTH - MARGIN * 2.0 - 20.0, 30.0),
+            ),
             true,
         ));
-        y -= 30.0;
+        // Clear of the hint's two lines before the next control.
+        y -= 40.0;
 
         let at_login = checkbox(mtm, "Abrir al iniciar sesión", y, startup::enabled());
         add(&at_login.control);
@@ -736,6 +740,26 @@ impl Report {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The layout runs downwards from the top, so nothing may end up below
+    /// the bottom margin — and getting it wrong just makes a control
+    /// vanish rather than fail. This mirrors the constructor's steps.
+    #[test]
+    fn everything_fits_in_the_window() {
+        const STEPS: &[f64] = &[
+            26.0, 26.0, 34.0, 40.0, 40.0, // behaviour
+            28.0, 26.0, 22.0, 34.0, // sensitivity
+            26.0, 22.0, 34.0, // pause
+            26.0, 40.0, // memory
+            28.0, 22.0, 40.0, // shortcut
+            28.0, 40.0, // voice
+        ];
+        let bottom = STEPS.iter().fold(HEIGHT - 52.0, |y, step| y - step);
+        assert!(
+            bottom >= MARGIN,
+            "the last control ends at {bottom}, below the {MARGIN} margin"
+        );
+    }
 
     #[test]
     fn every_slider_position_has_its_own_name() {
