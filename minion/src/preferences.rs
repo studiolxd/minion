@@ -17,7 +17,7 @@ use std::cell::Cell;
 use objc2::rc::Retained;
 use objc2::MainThreadMarker;
 use objc2_app_kit::{
-    NSBackingStoreType, NSButton, NSColor, NSFont, NSSlider, NSTextField, NSView,
+    NSApplication, NSBackingStoreType, NSButton, NSColor, NSFont, NSSlider, NSTextField, NSView,
     NSWindow, NSWindowStyleMask,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
@@ -80,8 +80,48 @@ pub struct Preferences {
     sensitivity: Dial,
     pause: Dial,
     memory: Dial,
-    shortcut: Retained<NSTextField>,
-    last_shortcut: std::cell::RefCell<String>,
+    shortcut: Retained<NSButton>,
+    /// The shortcut as stored, e.g. "alt-space".
+    shortcut_value: std::cell::RefCell<String>,
+    /// True while waiting for the user to press a combination.
+    capturing: Cell<bool>,
+    /// The button's state last time it was read, to notice a click without
+    /// an Objective-C target — see the note at the top of this file.
+    button_clicks: Cell<isize>,
+}
+
+/// A shortcut written the way macOS shows it: ⌥Space, ⇧⌘B.
+fn pretty(shortcut: &str) -> String {
+    let Some((code, mods)) = crate::actions::parse_shortcut(shortcut) else {
+        return "Ninguno".into();
+    };
+    let mut out = String::new();
+    if mods.control {
+        out.push('⌃');
+    }
+    if mods.option {
+        out.push('⌥');
+    }
+    if mods.shift {
+        out.push('⇧');
+    }
+    if mods.command {
+        out.push('⌘');
+    }
+    let key = crate::actions::name_of_key(code).unwrap_or("?");
+    out.push_str(&match key {
+        "space" => "Espacio".to_string(),
+        "left" => "←".to_string(),
+        "right" => "→".to_string(),
+        "up" => "↑".to_string(),
+        "down" => "↓".to_string(),
+        "escape" => "Esc".to_string(),
+        "return" | "enter" => "↩".to_string(),
+        "tab" => "⇥".to_string(),
+        "delete" | "backspace" => "⌫".to_string(),
+        other => other.to_uppercase(),
+    });
+    out
 }
 
 fn label(mtm: MainThreadMarker, text: &str, frame: NSRect, small: bool) -> Retained<NSTextField> {
@@ -280,20 +320,27 @@ impl Preferences {
         let current = settings
             .resume_shortcut()
             .unwrap_or_else(|| config::DEFAULT_RESUME_SHORTCUT.to_string());
-        let shortcut = NSTextField::new(mtm);
-        shortcut.setStringValue(&NSString::from_str(&current));
+        // A button rather than a text field: a shortcut is something you
+        // press, and nobody should have to know it is spelled "alt-space".
+        // Safety: no target and no action, so nothing is called back into.
+        let shortcut = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str(&pretty(&current)),
+                None,
+                None,
+                mtm,
+            )
+        };
         shortcut.setFrame(NSRect::new(
             NSPoint::new(MARGIN, y),
-            NSSize::new(150.0, 24.0),
+            NSSize::new(170.0, 26.0),
         ));
         add(&shortcut);
+        y -= 22.0;
         add(&label(
             mtm,
-            "Escríbelo como en un menú: alt-space, ctrl+shift+m.",
-            NSRect::new(
-                NSPoint::new(MARGIN + 162.0, y + 4.0),
-                NSSize::new(WIDTH - MARGIN * 2.0 - 162.0, 32.0),
-            ),
+            "Pulsa el botón y luego la combinación que quieras.",
+            NSRect::new(NSPoint::new(MARGIN, y), NSSize::new(WIDTH - MARGIN * 2.0, 16.0)),
             true,
         ));
 
@@ -306,14 +353,26 @@ impl Preferences {
             pause,
             memory,
             shortcut,
-            last_shortcut: std::cell::RefCell::new(current),
+            shortcut_value: std::cell::RefCell::new(current),
+            capturing: Cell::new(false),
+            button_clicks: Cell::new(0),
         };
         preferences.update_readouts();
         preferences
     }
 
     /// Brings the window forward, creating nothing new.
+    ///
+    /// The activation matters: Minion runs as an accessory, with no Dock
+    /// icon, and such an application is never the active one. Ordering a
+    /// window to the front without activating first leaves it behind
+    /// whatever you were using — which looks exactly like nothing happened.
     pub fn show(&self) {
+        if let Some(mtm) = MainThreadMarker::new() {
+            let app = NSApplication::sharedApplication(mtm);
+            #[allow(deprecated)]
+            app.activateIgnoringOtherApps(true);
+        }
         self.window.makeKeyAndOrderFront(None);
         self.window.orderFrontRegardless();
     }
@@ -375,23 +434,62 @@ impl Preferences {
             changed = true;
         }
 
-        // The shortcut is text, so it is only worth saving once it reads as
-        // a shortcut — otherwise every keystroke of typing "alt-space"
-        // would be written, and most of them are not valid.
-        let typed = self.shortcut.stringValue().to_string();
-        let unchanged = typed == *self.last_shortcut.borrow();
-        let readable =
-            typed.trim().is_empty() || crate::actions::parse_shortcut(&typed).is_some();
-        if !unchanged && readable {
-            save("resume_shortcut", &format!("\"{}\"", typed.trim()));
-            *self.last_shortcut.borrow_mut() = typed;
-            changed = true;
+        // A click on the shortcut button starts capture. NSButton counts
+        // its own clicks in its cell's tag only when a target is set, so
+        // instead the highlight state is read: pressed and released between
+        // two polls shows up as a change in the button's state.
+        if !self.capturing.get() {
+            let clicks = self.shortcut.state();
+            if clicks != self.button_clicks.get() {
+                self.button_clicks.set(clicks);
+                if clicks != 0 {
+                    self.begin_capture();
+                }
+            }
         }
 
         if changed {
             self.update_readouts();
         }
         changed
+    }
+
+    /// Waits for the next key combination and stores it.
+    ///
+    /// Uses a local event monitor, which only sees events aimed at this
+    /// application — the preferences window has focus while it is open, so
+    /// the keystroke lands here and nowhere else. The monitor swallows the
+    /// event by returning nothing, or pressing ⌘Q to set a shortcut would
+    /// also quit something.
+    fn begin_capture(&self) {
+        self.capturing.set(true);
+        self.shortcut
+            .setTitle(&NSString::from_str("Pulsa la combinación…"));
+    }
+
+    /// Called from the run loop with whatever key was pressed, if capturing.
+    pub fn capture(&self, code: u16, mods: crate::actions::Mods) -> bool {
+        if !self.capturing.get() {
+            return false;
+        }
+        self.capturing.set(false);
+        self.button_clicks.set(self.shortcut.state());
+
+        let Some(text) = crate::actions::shortcut_text(code, mods) else {
+            // A key with no name: leave what was there.
+            let current = self.shortcut_value.borrow().clone();
+            self.shortcut.setTitle(&NSString::from_str(&pretty(&current)));
+            return true;
+        };
+        self.shortcut.setTitle(&NSString::from_str(&pretty(&text)));
+        save("resume_shortcut", &format!("\"{text}\""));
+        *self.shortcut_value.borrow_mut() = text;
+        true
+    }
+
+    /// Whether a key press should be taken as the new shortcut.
+    pub fn is_capturing(&self) -> bool {
+        self.capturing.get()
     }
 
     pub fn sounds_on(&self) -> bool {
@@ -416,6 +514,63 @@ fn save_audio(key: &str, value: &str) {
         crate::journal::write(&format!("could not save audio.{key}: {e}"));
     } else {
         crate::journal::write(&format!("audio.{key} = {value}"));
+    }
+}
+
+/// A window showing text, with the usual close button.
+///
+/// The report used to appear in an AppleScript dialog, which has no window
+/// controls and blocks everything behind it until dismissed. A report is
+/// something to read next to the log, not a demand for attention.
+pub struct Report {
+    window: Retained<NSWindow>,
+    text: Retained<NSTextField>,
+}
+
+impl Report {
+    pub fn new(mtm: MainThreadMarker) -> Self {
+        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(460.0, 380.0));
+        let style = NSWindowStyleMask::Titled
+            | NSWindowStyleMask::Closable
+            | NSWindowStyleMask::Resizable;
+        let window = unsafe {
+            NSWindow::initWithContentRect_styleMask_backing_defer(
+                mtm.alloc::<NSWindow>(),
+                frame,
+                style,
+                NSBackingStoreType::Buffered,
+                false,
+            )
+        };
+        window.setTitle(&NSString::from_str("Aprender del registro"));
+        unsafe { window.setReleasedWhenClosed(false) };
+        window.center();
+
+        let text = label(
+            mtm,
+            "",
+            NSRect::new(
+                NSPoint::new(MARGIN, MARGIN),
+                NSSize::new(460.0 - MARGIN * 2.0, 380.0 - MARGIN * 2.0),
+            ),
+            false,
+        );
+        text.setFont(Some(&NSFont::monospacedSystemFontOfSize_weight(11.0, 0.0)));
+        if let Some(content) = window.contentView() {
+            content.addSubview(&text);
+        }
+        Self { window, text }
+    }
+
+    pub fn show(&self, body: &str) {
+        self.text.setStringValue(&NSString::from_str(body));
+        if let Some(mtm) = MainThreadMarker::new() {
+            let app = NSApplication::sharedApplication(mtm);
+            #[allow(deprecated)]
+            app.activateIgnoringOtherApps(true);
+        }
+        self.window.makeKeyAndOrderFront(None);
+        self.window.orderFrontRegardless();
     }
 }
 

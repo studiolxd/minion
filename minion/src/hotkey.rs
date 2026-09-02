@@ -22,6 +22,11 @@ use crate::actions::Mods;
 /// The returned token must be kept alive; dropping it stops the watch.
 pub struct Watch {
     _monitor: Option<objc2::rc::Retained<objc2::runtime::AnyObject>>,
+    /// The handler must outlive the monitor. AppKit is documented to copy
+    /// the block, but holding it here costs nothing and removes any doubt:
+    /// a freed block called on the next keystroke would corrupt the run
+    /// loop in ways that show up far from the cause.
+    _handler: RcBlock<dyn Fn(std::ptr::NonNull<NSEvent>)>,
 }
 
 /// Starts watching. Returns `None` if the shortcut cannot be read.
@@ -47,7 +52,44 @@ pub fn watch(shortcut: &str, active: Arc<AtomicBool>) -> Option<Watch> {
 
     let monitor =
         NSEvent::addGlobalMonitorForEventsMatchingMask_handler(NSEventMask::KeyDown, &handler);
-    Some(Watch { _monitor: monitor })
+    Some(Watch { _monitor: monitor, _handler: handler })
+}
+
+/// Watches this application's own key presses, for capturing a shortcut.
+///
+/// A local monitor rather than a global one: it only sees events aimed at
+/// Minion, which while the preferences window has focus is exactly the
+/// keystroke being offered. It swallows the event, or pressing ⌘Q to set a
+/// shortcut would also quit something.
+pub fn capture_next<F>(handle: F) -> LocalWatch
+where
+    F: Fn(u16, Mods) -> bool + 'static,
+{
+    // Returns a raw pointer: null to swallow the event, or the event itself
+    // to pass it on. AppKit does not take ownership of what comes back.
+    let handler = RcBlock::new(move |event: std::ptr::NonNull<NSEvent>| -> *mut NSEvent {
+        let borrowed = unsafe { event.as_ref() };
+        let flags = borrowed.modifierFlags();
+        let mods = Mods {
+            command: flags.contains(NSEventModifierFlags::Command),
+            shift: flags.contains(NSEventModifierFlags::Shift),
+            option: flags.contains(NSEventModifierFlags::Option),
+            control: flags.contains(NSEventModifierFlags::Control),
+        };
+        if handle(borrowed.keyCode(), mods) {
+            return std::ptr::null_mut(); // taken: do not pass it on
+        }
+        event.as_ptr()
+    });
+    let monitor = unsafe {
+        NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::KeyDown, &handler)
+    };
+    LocalWatch { _monitor: monitor, _handler: handler }
+}
+
+pub struct LocalWatch {
+    _monitor: Option<objc2::rc::Retained<objc2::runtime::AnyObject>>,
+    _handler: RcBlock<dyn Fn(std::ptr::NonNull<NSEvent>) -> *mut NSEvent>,
 }
 
 /// Whether the event's modifiers are exactly the ones wanted.

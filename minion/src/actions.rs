@@ -78,11 +78,45 @@ pub fn parse_shortcut(text: &str) -> Option<(u16, Mods)> {
     code.map(|code| (code, mods))
 }
 
+/// The name of a key, for writing a shortcut back out.
+pub fn name_of_key(code: u16) -> Option<&'static str> {
+    NAMED
+        .iter()
+        .find(|(_, candidate)| *candidate == code)
+        .map(|(name, _)| *name)
+}
+
+/// Writes a shortcut the way it is read back in.
+pub fn shortcut_text(code: u16, mods: Mods) -> Option<String> {
+    let key = name_of_key(code)?;
+    let mut parts = Vec::new();
+    if mods.control {
+        parts.push("ctrl");
+    }
+    if mods.option {
+        parts.push("alt");
+    }
+    if mods.shift {
+        parts.push("shift");
+    }
+    if mods.command {
+        parts.push("cmd");
+    }
+    parts.push(key);
+    Some(parts.join("-"))
+}
+
 /// The virtual key code for a key's spoken or written name.
 fn key_named(name: &str) -> Option<u16> {
-    // Letters and digits sit where a US layout puts them, which is also
-    // where a Spanish ISO keyboard puts them for these purposes.
-    const NAMED: &[(&str, u16)] = &[
+    NAMED
+        .iter()
+        .find(|(candidate, _)| *candidate == name)
+        .map(|(_, code)| *code)
+}
+
+/// Letters and digits sit where a US layout puts them, which is also where
+/// a Spanish ISO keyboard puts them for these purposes.
+const NAMED: &[(&str, u16)] = &[
         ("a", key::A), ("b", key::B), ("c", key::C), ("d", 2), ("e", key::E),
         ("f", key::F), ("g", 5), ("h", key::H), ("i", key::I), ("j", 38),
         ("k", 40), ("l", key::L), ("m", key::M), ("n", key::N), ("o", 31),
@@ -99,13 +133,8 @@ fn key_named(name: &str) -> Option<u16> {
         ("up", key::UP), ("down", key::DOWN),
         ("f1", 122), ("f2", 120), ("f3", 99), ("f4", 118), ("f5", 96),
         ("f6", 97), ("f7", 98), ("f8", 100), ("f9", 101), ("f10", 109),
-        ("f11", 103), ("f12", 111),
-    ];
-    NAMED
-        .iter()
-        .find(|(candidate, _)| *candidate == name)
-        .map(|(_, code)| *code)
-}
+    ("f11", 103), ("f12", 111),
+];
 
 /// Modifier keys held during a keystroke.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -393,6 +422,20 @@ pub fn open_accessibility_settings() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn writes_shortcuts_the_way_it_reads_them() {
+        // Round trip: what the capture writes must parse back the same.
+        for text in ["cmd-s", "ctrl-alt-shift-cmd-b", "alt-space", "f5"] {
+            let (code, mods) = parse_shortcut(text).expect("should parse");
+            let written = shortcut_text(code, mods).expect("should write");
+            assert_eq!(
+                parse_shortcut(&written),
+                Some((code, mods)),
+                "«{text}» became «{written}»"
+            );
+        }
+    }
 
     #[test]
     fn reads_shortcuts_as_written() {

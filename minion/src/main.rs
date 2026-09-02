@@ -55,8 +55,11 @@ mod sounds {
 const MENU_PAUSE: &str = "Pausar";
 const MENU_LISTEN: &str = "Escuchar";
 
-/// How often the menu bar checks whether the state changed.
-const ICON_REFRESH_SECONDS: f64 = 0.4;
+/// How often the run loop checks for changes.
+///
+/// Fast enough that a slider's readout keeps up with the thumb, which is
+/// what makes the preferences window feel like a window rather than a form.
+const UI_REFRESH_SECONDS: f64 = 0.05;
 
 /// How often the recognition loop wakes up to see whether it has gone idle.
 const IDLE_CHECK: Duration = Duration::from_secs(20);
@@ -403,7 +406,8 @@ fn run_menu_bar(
 
     let preferences = MenuItem::new("Preferencias…", true, None);
 
-    // The two things you do with the log, together.
+    // The two things you do with the log, together. Kept in scope for the
+    // life of the menu, like every other item.
     let log_menu = Submenu::new("Registro", true);
     log_menu.append(&learn)?;
     log_menu.append(&show_log)?;
@@ -425,8 +429,17 @@ fn run_menu_bar(
     // Built once and reused: reopening should bring back the same window,
     // not stack another one behind it.
     let panel = Rc::new(preferences::Preferences::new(mtm));
+    let report = Rc::new(preferences::Report::new(mtm));
+
+    // Watches this application's keys, so the shortcut button can be set by
+    // pressing a combination rather than typing its name.
+    let panel_for_capture = Rc::clone(&panel);
+    let _capture = hotkey::capture_next(move |code, mods| {
+        panel_for_capture.is_capturing() && panel_for_capture.capture(code, mods)
+    });
     // Requests from the menu thread, which must not touch AppKit itself.
     let open_requested = Arc::new(AtomicBool::new(false));
+    let learn_requested = Arc::new(AtomicBool::new(false));
 
     // Held for the lifetime of the process: dropping it removes the icon.
     let tray = Rc::new(
@@ -450,11 +463,39 @@ fn run_menu_bar(
     let shown_as_listening = Cell::new(true);
     let panel_for_timer = Rc::clone(&panel);
     let open_for_timer = Arc::clone(&open_requested);
+    let learn_for_timer = Arc::clone(&learn_requested);
+    let report_for_timer = Rc::clone(&report);
     let sounds_for_timer = Arc::clone(&sounds_on);
     let voices_for_timer = Arc::clone(&log_voices_on);
     let repaint = RcBlock::new(move |_timer: NonNull<NSTimer>| {
         if open_for_timer.swap(false, Ordering::Relaxed) {
             panel_for_timer.show();
+        }
+        if learn_for_timer.swap(false, Ordering::Relaxed) {
+            let config = config::load();
+            let lesson = learn::analyse(&config);
+            report_for_timer.show(&lesson.summary());
+            if !lesson.teachable.is_empty()
+                && actions::ask(
+                    &format!(
+                        "{} frase(s) se parecen a una orden que ya existe.\n\
+                         ¿Añadirlas como alias?",
+                        lesson.teachable.len()
+                    ),
+                    "Añadir",
+                )
+            {
+                match learn::apply(&lesson) {
+                    Ok(n) if n > 0 => {
+                        note!("learned {n} alias(es) from the log");
+                        actions::show_message(&format!(
+                            "Añadidos {n}. Reinicia Minion para que se apliquen."
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(e) => actions::show_message(&e),
+                }
+            }
         }
         // Controls report by being read: see preferences.rs for why.
         if panel_for_timer.poll() {
@@ -477,7 +518,7 @@ fn run_menu_bar(
     // atomic flag, and the timer fires on the main thread, where they live.
     let _timer = unsafe {
         NSTimer::scheduledTimerWithTimeInterval_repeats_block(
-            ICON_REFRESH_SECONDS,
+            UI_REFRESH_SECONDS,
             true,
             &repaint,
         )
@@ -487,6 +528,7 @@ fn run_menu_bar(
     // serviced from another thread while AppKit owns the main one. The icon
     // and the item's text are repainted by the timer above, not from here.
     let open_from_menu = Arc::clone(&open_requested);
+    let learn_from_menu = Arc::clone(&learn_requested);
     std::thread::spawn(move || {
         let events = MenuEvent::receiver();
         while let Ok(event) = events.recv() {
@@ -498,7 +540,7 @@ fn run_menu_bar(
                     if now_listening { "resumed" } else { "paused" }
                 );
             } else if event.id == learn_id {
-                show_lesson();
+                learn_from_menu.store(true, Ordering::Relaxed);
             } else if event.id == preferences_id {
                 // Windows belong to the main thread; the timer opens it.
                 open_from_menu.store(true, Ordering::Relaxed);
@@ -515,42 +557,6 @@ fn run_menu_bar(
 
     app.run();
     Ok(())
-}
-
-/// Shows what the log has to teach, and offers to apply it.
-///
-/// A menu bar app has nowhere to print, so the report goes in a dialog. The
-/// alternative — writing aliases straight from the menu — would change the
-/// vocabulary without showing what changed.
-fn show_lesson() {
-    let config = config::load();
-    let lesson = learn::analyse(&config);
-
-    if lesson.is_empty() {
-        actions::show_message("Nada que aprender: no hay frases sin entender en el registro.");
-        return;
-    }
-
-    let mut body = lesson.summary();
-    if lesson.teachable.is_empty() {
-        actions::show_message(&body);
-        return;
-    }
-    body.push_str("\n¿Añadir las primeras como alias?");
-
-    if !actions::ask(&body, "Añadir") {
-        return;
-    }
-    match learn::apply(&lesson) {
-        Ok(0) => {}
-        Ok(n) => {
-            note!("learned {n} alias(es) from the log");
-            actions::show_message(&format!(
-                "Añadidos {n}. Reinicia Minion desde el menú para que se apliquen."
-            ));
-        }
-        Err(e) => actions::show_message(&e),
-    }
 }
 
 /// Refuses to start if another copy is already running.
@@ -583,7 +589,6 @@ fn claim_sole_instance() -> bool {
     let fd = file.into_raw_fd();
     let locked = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0;
     if !locked {
-        // Someone else holds it; let go of our descriptor.
         unsafe { libc::close(fd) };
     }
     locked

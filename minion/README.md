@@ -318,8 +318,9 @@ Every phrase Minion failed to understand is in the log. `minion learn`
 reads them back, works out what each was probably meant to be, and offers
 to add it as an alias:
 
-From the menu bar: **Aprender del registro…**. It shows what it found and
-asks before changing anything.
+From the menu bar: **Registro → Aprender**. It opens a window with what it
+found — a real window with a close button, not a dialog that blocks
+everything until dismissed — and asks before changing anything.
 
 From a terminal:
 
