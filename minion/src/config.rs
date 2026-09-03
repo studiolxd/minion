@@ -17,6 +17,11 @@ const DEFAULT_UNLOAD_MINUTES: u64 = 5;
 /// Seconds the conversation window stays open when the file says nothing.
 const DEFAULT_CONVERSATION_SECONDS: u64 = 5;
 
+/// How close a runner-up has to be before a near-tie is asked about,
+/// when the file says nothing. Measured on the same confidence scale the
+/// commands are scored on.
+const DEFAULT_DISAMBIGUATION_MARGIN: f32 = 0.08;
+
 /// Shortcut that pauses and resumes when nothing is set.
 pub const DEFAULT_RESUME_SHORTCUT: &str = "ctrl-alt-m";
 
@@ -201,6 +206,15 @@ pub struct Config {
     #[serde(default = "yes")]
     pub ask_before_learning: bool,
 
+    /// How close a second reading of a phrase has to be to the winning
+    /// one before Minion stops and asks which was meant.
+    ///
+    /// A margin in the same units as the confidence scores: 0.08 means
+    /// "within eight hundredths". `None` is the default of 0.08; zero
+    /// disables asking entirely, for someone who would rather Minion take
+    /// its best guess than talk back.
+    pub disambiguation_margin: Option<f32>,
+
     /// Post a Notification Center banner for answers, timers and blocked
     /// commands — see `notify.rs`.
     ///
@@ -320,6 +334,7 @@ impl Default for Config {
             macros: Vec::new(),
             search_engine: None,
             ask_before_learning: true,
+            disambiguation_margin: None,
             notifications: true,
         }
     }
@@ -734,6 +749,12 @@ impl Config {
         Duration::from_secs(self.conversation_seconds.unwrap_or(DEFAULT_CONVERSATION_SECONDS))
     }
 
+    /// How close the runner-up has to be before a near-tie is put to the
+    /// user instead of acted on. Zero never asks.
+    pub fn disambiguation_margin(&self) -> f32 {
+        self.disambiguation_margin.unwrap_or(DEFAULT_DISAMBIGUATION_MARGIN).clamp(0.0, 0.5)
+    }
+
     /// Whether to listen continuously or only while the shortcut is held.
     ///
     /// Anything other than "hold" — including a typo — falls back to
@@ -1042,6 +1063,22 @@ mod tests {
         let disabled: Config =
             toml::from_str("conversation_seconds = 0").expect("should parse");
         assert_eq!(disabled.conversation_window(), Duration::ZERO);
+    }
+
+    #[test]
+    fn the_disambiguation_margin_is_read_from_the_file_and_zero_never_asks() {
+        let default: Config = toml::from_str("").expect("empty config should parse");
+        assert_eq!(default.disambiguation_margin(), 0.08);
+
+        let never: Config = toml::from_str("disambiguation_margin = 0.0").expect("should parse");
+        assert_eq!(never.disambiguation_margin(), 0.0);
+
+        let wide: Config = toml::from_str("disambiguation_margin = 0.15").expect("should parse");
+        assert_eq!(wide.disambiguation_margin(), 0.15);
+
+        // Half the scale is as far as it goes: past that everything ties.
+        let absurd: Config = toml::from_str("disambiguation_margin = 9.0").expect("should parse");
+        assert_eq!(absurd.disambiguation_margin(), 0.5);
     }
 
     #[test]
