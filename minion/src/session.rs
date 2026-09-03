@@ -846,7 +846,7 @@ mod tests {
     fn a_weak_guess_is_not_worth_asking_about() {
         // Nothing in the vocabulary is within reach of these, so a
         // question would only be noise.
-        for phrase in ["minion de sad", "minion abrecron", "minion escribe"] {
+        for phrase in ["minion de sad", "minion abrecasa", "minion escribe"] {
             assert!(asking().ask_about(phrase, Instant::now()).is_none(), "«{phrase}» is not worth a question");
         }
         // And with the setting off, nothing is ever asked.

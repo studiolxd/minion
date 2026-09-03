@@ -21,11 +21,21 @@ use crate::{commands, config, journal};
 /// that would make navigation fire on web addresses.
 const SUGGEST_ABOVE: f32 = 0.55;
 
+/// What a failed phrase was probably meant to invoke.
+#[derive(Clone, Debug)]
+pub enum Target {
+    /// A command already in the table, by name.
+    Command(String),
+    /// An application, by name — `spoken` is the word worth remembering as
+    /// one more way its name gets said.
+    App { app: String, spoken: String },
+}
+
 /// A phrase that failed, with what it was probably meant to be.
 pub struct Candidate {
     pub phrase: String,
     pub times: usize,
-    pub command: String,
+    pub target: Target,
     pub score: f32,
 }
 
@@ -56,10 +66,17 @@ impl Lesson {
                 } else {
                     String::new()
                 };
+                let what = match &candidate.target {
+                    Target::Command(command) => command.clone(),
+                    Target::App { app, .. } => format!("abrir {app}"),
+                };
                 let _ = writeln!(
                     out,
                     "  «{}»{}\n      → {} ({:.0}%)",
-                    candidate.phrase, repeats, candidate.command, candidate.score * 100.0
+                    candidate.phrase,
+                    repeats,
+                    what,
+                    candidate.score * 100.0
                 );
             }
         }
@@ -93,7 +110,16 @@ pub fn apply(lesson: &Lesson) -> Result<usize, String> {
     }
     let mut addition = String::from("\n# Aprendido del registro con `minion learn`.\n");
     for candidate in &lesson.teachable {
-        addition.push_str(&alias_entry(&without_wake_word(&candidate.phrase), &candidate.command));
+        match &candidate.target {
+            Target::Command(command) => {
+                addition.push_str(&alias_entry(&without_wake_word(&candidate.phrase), command));
+            }
+            Target::App { app, spoken } => {
+                if let Some(entry) = app_override_entry(app, spoken) {
+                    addition.push_str(&entry);
+                }
+            }
+        }
     }
     append(&addition).map(|()| lesson.teachable.len())
 }
@@ -119,21 +145,28 @@ pub fn teach(phrase: &str, command: &str) -> Result<(), String> {
 /// one by name, which is the price of this route: later versions of Minion
 /// can add aliases to the shipped table without them being seen here.
 fn teach_app(app: &str, spoken: &str) -> Result<(), String> {
-    let known = commands::vocabulary()
-        .apps
-        .iter()
-        .find(|a| a.name == app)
-        .ok_or_else(|| format!("No hay ninguna aplicación llamada «{app}»."))?;
+    if commands::vocabulary().apps.iter().all(|a| a.name != app) {
+        return Err(format!("No hay ninguna aplicación llamada «{app}»."));
+    }
+    let Some(entry) = app_override_entry(app, spoken) else {
+        return Ok(());
+    };
+    append(&format!("\n# Aprendido al preguntar en voz alta.\n{entry}"))
+}
+
+/// The `[[apps]]` override that would teach `app` one more way its name
+/// gets said, copying its existing aliases so the new one adds to them
+/// rather than replacing them — `None` if `app` is not a known
+/// application, `spoken` normalises to nothing, or it is already known.
+fn app_override_entry(app: &str, spoken: &str) -> Option<String> {
+    let known = commands::vocabulary().apps.iter().find(|a| a.name == app)?;
     let spoken = crate::text::normalise(spoken);
     if spoken.is_empty() || known.aliases.contains(&spoken.as_str()) {
-        return Ok(());
+        return None;
     }
     let mut aliases: Vec<&str> = known.aliases.to_vec();
     aliases.push(&spoken);
-    append(&format!(
-        "\n# Aprendido al preguntar en voz alta.\n{}",
-        app_entry(known.name, known.bundle_id, &aliases)
-    ))
+    Some(app_entry(known.name, known.bundle_id, &aliases))
 }
 
 /// One `[[apps]]` entry, quoted so that whatever was heard parses.
@@ -295,7 +328,8 @@ fn failed_phrases_in(contents: &str) -> Vec<(String, usize)> {
     phrases
 }
 
-/// Pairs each failed phrase with its closest command.
+/// Pairs each failed phrase with what it most likely meant — a command or
+/// an application, whichever is the closer guess.
 ///
 /// Skips anything the current vocabulary already handles: the log holds
 /// every failure ever recorded, including the ones since fixed, and
@@ -326,13 +360,13 @@ fn candidates(config: &config::Config) -> Vec<Candidate> {
             if known.contains(&normalised) {
                 return None; // already taught
             }
-            let (command, score) = commands::closest_command(&phrase)?;
-            Some(Candidate {
-                phrase,
-                times,
-                command: command.to_string(),
-                score,
-            })
+            let command = commands::closest_command(&phrase)
+                .map(|(name, score)| (Target::Command(name.to_string()), score));
+            let app = commands::closest_app(&phrase)
+                .map(|guess| (Target::App { app: guess.app.to_string(), spoken: guess.spoken }, guess.score));
+            let (target, score) =
+                [command, app].into_iter().flatten().max_by(|a, b| a.1.total_cmp(&b.1))?;
+            Some(Candidate { phrase, times, target, score })
         })
         .collect()
 }
@@ -410,6 +444,31 @@ mod tests {
         assert_eq!(config.aliases.len(), 1);
         assert_eq!(config.aliases[0].phrase, r#"di "hola" \ adios"#);
         assert_eq!(config.aliases[0].command, "guardar");
+    }
+
+    #[test]
+    fn the_lesson_offers_applications_as_well_as_commands() {
+        // "minion abrecron" no longer falls through both halves of
+        // `suggest`'s search — `commands::closest_app` guesses Chrome from
+        // it now, and the lesson has to carry that guess through to the
+        // report and to what gets written, not just the command half.
+        let candidate = Candidate {
+            phrase: "Minion abrecron.".to_string(),
+            times: 1,
+            target: Target::App { app: "Chrome".to_string(), spoken: "abrecron".to_string() },
+            score: 0.75,
+        };
+        let lesson = Lesson { teachable: vec![candidate], missing: Vec::new() };
+        assert!(lesson.summary().contains("abrir Chrome"));
+
+        let entry = app_override_entry("Chrome", "abrecron").expect("Chrome is a known app");
+        let written = appended("", &entry).expect("should still parse");
+        let config: config::Config = toml::from_str(&written).expect("should parse");
+        let app = &config.extra_apps()[0];
+        assert_eq!(app.name, "Chrome");
+        // The built-in aliases came along, not just the new one.
+        assert!(app.aliases.len() > 1);
+        assert!(app.aliases.contains(&"abrecron"));
     }
 
     #[test]

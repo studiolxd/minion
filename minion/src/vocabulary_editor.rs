@@ -45,6 +45,10 @@ const HEIGHT: f64 = 460.0;
 const ROW: f64 = 20.0;
 /// Width of the trailing «Olvidar» button.
 const FORGET_WIDTH: f64 = 66.0;
+/// Width of the trailing «Añadir alias…»/«Añadir frase…» button, on a
+/// built-in row — wider than «Olvidar», which is the only other thing
+/// that column ever holds.
+const TEACH_WIDTH: f64 = 120.0;
 
 /// What one row's «Olvidar» button removes, once clicked.
 enum RowTarget {
@@ -59,11 +63,27 @@ struct Row {
     target: RowTarget,
 }
 
+/// What one built-in row's «Añadir alias…»/«Añadir frase…» button teaches,
+/// once clicked.
+enum TeachTarget {
+    /// An application, by bundle id and its current name.
+    App { bundle_id: String, name: String },
+    /// A command, by name.
+    Command(String),
+}
+
+/// A built-in row with a button to teach it one more alias or phrase.
+struct TeachRow {
+    button: Press,
+    target: TeachTarget,
+}
+
 /// One tab's scroll view and the rows currently shown in it.
 struct Tab {
     scroll: Retained<NSScrollView>,
     width: f64,
     rows: RefCell<Vec<Row>>,
+    teach: RefCell<Vec<TeachRow>>,
     add: RefCell<Press>,
 }
 
@@ -98,13 +118,24 @@ fn column(row: &NSRect, x: f64, width: f64) -> NSRect {
     NSRect::new(NSPoint::new(row.origin.x + x, row.origin.y), NSSize::new(width, row.size.height))
 }
 
-/// Lays out a table row across the widths given, adding a trailing
-/// «Olvidar» button when `removable` is true. Returns that button.
+/// What a row's trailing button does, if it has one.
+enum Trailing<'a> {
+    /// No trailing button — the header row.
+    None,
+    /// «Olvidar», for a row you added yourself.
+    Forget,
+    /// A row from the built-in vocabulary cannot be removed, but can be
+    /// taught one more alias or phrase — the title names which.
+    Teach(&'a str),
+}
+
+/// Lays out a table row across the widths given, adding the trailing
+/// button `trailing` asks for. Returns that button.
 fn table_row(
     layout: &mut Layout,
     mtm: MainThreadMarker,
     columns: &[(&str, f64)],
-    removable: bool,
+    trailing: Trailing,
     header: bool,
 ) -> Option<Retained<NSButton>> {
     let frame = layout.place(ROW, 0.0);
@@ -118,18 +149,22 @@ fn table_row(
         layout.gap(spacing::SIBLING);
         return None;
     }
-    if !removable {
-        layout.gap(4.0);
-        return None;
-    }
+    let (title, width) = match trailing {
+        Trailing::None => {
+            layout.gap(4.0);
+            return None;
+        }
+        Trailing::Forget => ("Olvidar", FORGET_WIDTH),
+        Trailing::Teach(title) => (title, TEACH_WIDTH),
+    };
     // Safety: no target and no action — see the note at the top of this
     // file and `preferences.rs`.
     let button = unsafe {
-        NSButton::buttonWithTitle_target_action(&NSString::from_str("Olvidar"), None, None, mtm)
+        NSButton::buttonWithTitle_target_action(&NSString::from_str(title), None, None, mtm)
     };
-    button.setFrame(column(&frame, x, FORGET_WIDTH));
+    button.setFrame(column(&frame, x, width));
     button.setFont(Some(&NSFont::systemFontOfSize(11.0)));
-    layout.add_control(&button, "Olvidar");
+    layout.add_control(&button, title);
     layout.gap(4.0);
     Some(button)
 }
@@ -216,18 +251,21 @@ impl VocabularyEditor {
                 scroll: apps_scroll,
                 width: WIDTH - 20.0,
                 rows: RefCell::new(Vec::new()),
+                teach: RefCell::new(Vec::new()),
                 add: RefCell::new(Press::new(placeholder_button(mtm))),
             },
             commands: Tab {
                 scroll: commands_scroll,
                 width: WIDTH - 20.0,
                 rows: RefCell::new(Vec::new()),
+                teach: RefCell::new(Vec::new()),
                 add: RefCell::new(Press::new(placeholder_button(mtm))),
             },
             aliases: Tab {
                 scroll: aliases_scroll,
                 width: WIDTH - 20.0,
                 rows: RefCell::new(Vec::new()),
+                teach: RefCell::new(Vec::new()),
                 add: RefCell::new(Press::new(placeholder_button(mtm))),
             },
             restart_requested: Cell::new(false),
@@ -272,7 +310,7 @@ impl VocabularyEditor {
     fn rebuild_apps(&self) {
         let mtm = self.mtm;
         let mut layout = Layout::new(mtm, self.apps.width);
-        let w = layout.content_width() - FORGET_WIDTH - spacing::SIBLING * 4.0;
+        let w = layout.content_width() - TEACH_WIDTH - spacing::SIBLING * 4.0;
         let widths = [w * 0.26, w * 0.24, w * 0.34, w * 0.16];
         layout.heading("Aplicaciones");
         table_row(
@@ -284,16 +322,18 @@ impl VocabularyEditor {
                 ("Alias", widths[2]),
                 ("Origen", widths[3]),
             ],
-            false,
+            Trailing::None,
             true,
         );
 
         let mut apps: Vec<_> = commands::vocabulary().apps.iter().collect();
         apps.sort_by_key(|a| a.name);
         let mut rows = Vec::new();
+        let mut teach = Vec::new();
         for app in apps {
             let is_user = app.category == crate::vocabulary::USER_CATEGORY;
             let source = if is_user { "Tuyo" } else { "Minion" };
+            let trailing = if is_user { Trailing::Forget } else { Trailing::Teach("Añadir alias…") };
             let button = table_row(
                 &mut layout,
                 mtm,
@@ -303,15 +343,25 @@ impl VocabularyEditor {
                     (&app.aliases.join(", "), widths[2]),
                     (source, widths[3]),
                 ],
-                is_user,
+                trailing,
                 false,
             );
-            if let Some(button) = button {
+            let Some(button) = button else { continue };
+            if is_user {
                 rows.push(Row { button: Press::new(button), target: RowTarget::App(app.bundle_id.to_string()) });
+            } else {
+                teach.push(TeachRow {
+                    button: Press::new(button),
+                    target: TeachTarget::App {
+                        bundle_id: app.bundle_id.to_string(),
+                        name: app.name.to_string(),
+                    },
+                });
             }
         }
         let add = add_button(&mut layout, mtm, "Añadir aplicación…");
         *self.apps.rows.borrow_mut() = rows;
+        *self.apps.teach.borrow_mut() = teach;
         *self.apps.add.borrow_mut() = Press::new(add);
         self.apps.scroll.setDocumentView(Some(&layout.finish().0));
     }
@@ -319,7 +369,7 @@ impl VocabularyEditor {
     fn rebuild_commands(&self) {
         let mtm = self.mtm;
         let mut layout = Layout::new(mtm, self.commands.width);
-        let w = layout.content_width() - FORGET_WIDTH - spacing::SIBLING * 4.0;
+        let w = layout.content_width() - TEACH_WIDTH - spacing::SIBLING * 4.0;
         let widths = [w * 0.20, w * 0.32, w * 0.30, w * 0.18];
         layout.heading("Órdenes");
         table_row(
@@ -331,7 +381,7 @@ impl VocabularyEditor {
                 ("Acción", widths[2]),
                 ("Categoría", widths[3]),
             ],
-            false,
+            Trailing::None,
             true,
         );
 
@@ -358,20 +408,29 @@ impl VocabularyEditor {
         all.sort_by(|a, b| a.0.cmp(b.0));
 
         let mut rows = Vec::new();
+        let mut teach = Vec::new();
         for (name, phrases, action, category, is_user) in all {
+            let trailing = if is_user { Trailing::Forget } else { Trailing::Teach("Añadir frase…") };
             let button = table_row(
                 &mut layout,
                 mtm,
                 &[(name, widths[0]), (&phrases, widths[1]), (&action, widths[2]), (category, widths[3])],
-                is_user,
+                trailing,
                 false,
             );
-            if let Some(button) = button {
+            let Some(button) = button else { continue };
+            if is_user {
                 rows.push(Row { button: Press::new(button), target: RowTarget::Command(name.to_string()) });
+            } else {
+                teach.push(TeachRow {
+                    button: Press::new(button),
+                    target: TeachTarget::Command(name.to_string()),
+                });
             }
         }
         let add = add_button(&mut layout, mtm, "Añadir orden…");
         *self.commands.rows.borrow_mut() = rows;
+        *self.commands.teach.borrow_mut() = teach;
         *self.commands.add.borrow_mut() = Press::new(add);
         self.commands.scroll.setDocumentView(Some(&layout.finish().0));
     }
@@ -382,7 +441,7 @@ impl VocabularyEditor {
         let w = layout.content_width() - FORGET_WIDTH - spacing::SIBLING * 2.0;
         let widths = [w * 0.55, w * 0.45];
         layout.heading("Alias");
-        table_row(&mut layout, mtm, &[("Frase", widths[0]), ("Orden", widths[1])], false, true);
+        table_row(&mut layout, mtm, &[("Frase", widths[0]), ("Orden", widths[1])], Trailing::None, true);
 
         let settings = config::load();
         let mut rows = Vec::new();
@@ -391,7 +450,7 @@ impl VocabularyEditor {
                 &mut layout,
                 mtm,
                 &[(alias.phrase.as_str(), widths[0]), (alias.command.as_str(), widths[1])],
-                true,
+                Trailing::Forget,
                 false,
             );
             if let Some(button) = button {
@@ -450,6 +509,23 @@ impl VocabularyEditor {
                         }
                         Err(e) => crate::journal::write(&format!("could not forget alias: {e}")),
                     }
+                }
+            }
+        }
+
+        for target in clicked_teach_targets(&self.apps.teach) {
+            if let TeachTarget::App { bundle_id, name } = target {
+                if self.add_app_alias(&bundle_id, &name) {
+                    changed = true;
+                    needs_restart = true;
+                }
+            }
+        }
+        for target in clicked_teach_targets(&self.commands.teach) {
+            if let TeachTarget::Command(name) = target {
+                if self.add_command_phrase(&name) {
+                    changed = true;
+                    needs_restart = true;
                 }
             }
         }
@@ -673,6 +749,85 @@ impl VocabularyEditor {
             }
         }
     }
+
+    /// «Añadir alias…», on a built-in application row: one more way the
+    /// recogniser's spelling of `name` gets said, joining whatever aliases
+    /// it already answers to — see [`config::learn_app_alias`].
+    fn add_app_alias(&self, bundle_id: &str, name: &str) -> bool {
+        let mtm = self.mtm;
+
+        let alert = NSAlert::new(mtm);
+        alert.setMessageText(&NSString::from_str(&format!("Añadir alias para {name}")));
+        alert.setInformativeText(&NSString::from_str("Otra forma de decir su nombre."));
+        alert.addButtonWithTitle(&NSString::from_str("Añadir"));
+        alert.addButtonWithTitle(&NSString::from_str("Cancelar"));
+
+        let accessory = NSView::new(mtm);
+        accessory.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(280.0, 24.0)));
+        let alias_field = NSTextField::new(mtm);
+        alias_field.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(280.0, 24.0)));
+        alias_field.setPlaceholderString(Some(&NSString::from_str("Alias: cron")));
+        accessory.addSubview(&alias_field);
+        alert.setAccessoryView(Some(&accessory));
+
+        if alert.runModal() != NSAlertFirstButtonReturn {
+            return false;
+        }
+        let alias = alias_field.stringValue().to_string().trim().to_string();
+        if alias.is_empty() {
+            crate::actions::show_message("Hace falta un alias.");
+            return false;
+        }
+        let built_in = commands::vocabulary().apps.iter().find(|a| a.bundle_id == bundle_id);
+        let Some(built_in) = built_in else {
+            crate::actions::show_message("No se encuentra la aplicación.");
+            return false;
+        };
+        match config::learn_app_alias(bundle_id, &alias, built_in.name, built_in.aliases) {
+            Ok(()) => true,
+            Err(e) => {
+                crate::actions::show_message(&format!("No se pudo añadir el alias: {e}"));
+                false
+            }
+        }
+    }
+
+    /// «Añadir frase…», on a built-in command row: one more way of asking
+    /// for `command`, written as an `[[aliases]]` entry the same way
+    /// «Añadir alias…» in the Alias tab does.
+    fn add_command_phrase(&self, command: &str) -> bool {
+        let mtm = self.mtm;
+
+        let alert = NSAlert::new(mtm);
+        alert.setMessageText(&NSString::from_str(&format!("Añadir frase para {command}")));
+        alert.setInformativeText(&NSString::from_str("Otra forma de pedirla."));
+        alert.addButtonWithTitle(&NSString::from_str("Añadir"));
+        alert.addButtonWithTitle(&NSString::from_str("Cancelar"));
+
+        let accessory = NSView::new(mtm);
+        accessory.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(280.0, 24.0)));
+        let phrase_field = NSTextField::new(mtm);
+        phrase_field.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(280.0, 24.0)));
+        phrase_field.setPlaceholderString(Some(&NSString::from_str("Frase: abre cromo")));
+        accessory.addSubview(&phrase_field);
+        alert.setAccessoryView(Some(&accessory));
+
+        if alert.runModal() != NSAlertFirstButtonReturn {
+            return false;
+        }
+        let phrase = phrase_field.stringValue().to_string().trim().to_string();
+        if phrase.is_empty() {
+            crate::actions::show_message("Hace falta una frase.");
+            return false;
+        }
+        match config::add_alias(command, &phrase) {
+            Ok(()) => true,
+            Err(e) => {
+                crate::actions::show_message(&format!("No se pudo añadir la frase: {e}"));
+                false
+            }
+        }
+    }
 }
 
 /// A throwaway button, so a `Tab`'s `add` field has something to hold
@@ -694,6 +849,22 @@ fn clicked_targets(rows: &RefCell<Vec<Row>>) -> Vec<RowTarget> {
             RowTarget::App(id) => RowTarget::App(id.clone()),
             RowTarget::Command(name) => RowTarget::Command(name.clone()),
             RowTarget::Alias(phrase) => RowTarget::Alias(phrase.clone()),
+        })
+        .collect()
+}
+
+/// Every built-in row whose «Añadir alias…»/«Añadir frase…» button was
+/// clicked since it was last read, as the target it should teach — see
+/// [`clicked_targets`], which does the same for «Olvidar».
+fn clicked_teach_targets(rows: &RefCell<Vec<TeachRow>>) -> Vec<TeachTarget> {
+    rows.borrow()
+        .iter()
+        .filter(|row| row.button.clicked())
+        .map(|row| match &row.target {
+            TeachTarget::App { bundle_id, name } => {
+                TeachTarget::App { bundle_id: bundle_id.clone(), name: name.clone() }
+            }
+            TeachTarget::Command(name) => TeachTarget::Command(name.clone()),
         })
         .collect()
 }

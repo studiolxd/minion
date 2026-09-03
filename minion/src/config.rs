@@ -684,13 +684,13 @@ struct CommandName {
     name: String,
 }
 
-/// Removes the first `[[table]]` block that parses as `T` and satisfies
-/// `matches`, from already-read file contents. Pure: takes and returns
-/// text, touches no file. Leaves the file untouched if nothing matches.
+/// Finds the first `[[table]]` block that parses as `T` and satisfies
+/// `matches`, in already-read file contents, as the line range it spans
+/// and the value it parsed to. Pure, and touches no file.
 ///
-/// Shared by [`without_alias`], [`without_app`] and [`without_command`],
-/// which differ only in the table name and what identifies a block.
-fn without_block<T, F>(contents: &str, table: &str, matches: F) -> String
+/// Shared by [`without_block`] (which only needs the range, to delete it)
+/// and [`add_alias_to_app`] (which needs the value too, to add to it).
+fn find_block<T, F>(contents: &str, table: &str, matches: F) -> Option<(usize, usize, T)>
 where
     T: serde::de::DeserializeOwned,
     F: Fn(&T) -> bool,
@@ -715,11 +715,27 @@ where
         }
     }
 
-    let found = blocks.into_iter().find(|(start, end)| {
-        toml::from_str::<T>(&lines[start + 1..*end].join("\n")).is_ok_and(|item| matches(&item))
-    });
+    blocks.into_iter().find_map(|(start, end)| {
+        toml::from_str::<T>(&lines[start + 1..end].join("\n"))
+            .ok()
+            .filter(&matches)
+            .map(|item| (start, end, item))
+    })
+}
 
-    let Some((start, end)) = found else {
+/// Removes the first `[[table]]` block that parses as `T` and satisfies
+/// `matches`, from already-read file contents. Pure: takes and returns
+/// text, touches no file. Leaves the file untouched if nothing matches.
+///
+/// Shared by [`without_alias`], [`without_app`] and [`without_command`],
+/// which differ only in the table name and what identifies a block.
+fn without_block<T, F>(contents: &str, table: &str, matches: F) -> String
+where
+    T: serde::de::DeserializeOwned,
+    F: Fn(&T) -> bool,
+{
+    let lines: Vec<&str> = contents.lines().collect();
+    let Some((start, end, _)) = find_block::<T, F>(contents, table, matches) else {
         return contents.to_string();
     };
 
@@ -812,6 +828,62 @@ fn app_block(name: &str, bundle_id: &str, aliases: &[String]) -> String {
     )
 }
 
+/// One `[[apps]]` block, read on its own with its aliases — see
+/// [`AppBundleId`], which only reads the `bundle_id`.
+#[derive(Deserialize)]
+struct AppOverride {
+    name: String,
+    bundle_id: String,
+    aliases: Vec<String>,
+}
+
+/// Adds one more way an application's name is said, in already-read file
+/// contents. Pure: takes and returns text, touches no file.
+///
+/// `built_in_name` and `built_in_aliases` are what the application answers
+/// to before any override — the caller reads them from
+/// [`crate::commands::vocabulary`], since this module knows nothing of the
+/// built-in table.
+///
+/// If `config.toml` already has its own `[[apps]]` block for this
+/// `bundle_id`, the alias joins its aliases in place: that block is
+/// removed and rewritten, rather than a second block being appended next
+/// to it, which would leave two overrides for the same application and,
+/// since later wins by name, silently drop whichever alias was learned
+/// first the next time Minion restarted. With no override yet, a new one
+/// is created copying the built-in name and aliases, so the new one adds
+/// to them rather than replacing them — the same shape `learn.rs`'s
+/// `teach_app` writes when a spoken guess is confirmed.
+pub fn add_alias_to_app(
+    contents: &str,
+    bundle_id: &str,
+    alias: &str,
+    built_in_name: &str,
+    built_in_aliases: &[&str],
+) -> Result<String, String> {
+    let alias = crate::text::normalise(alias);
+    if alias.is_empty() {
+        return Err("Hace falta un alias.".to_string());
+    }
+
+    let existing = find_block::<AppOverride, _>(contents, "apps", |app| app.bundle_id == bundle_id);
+    let (name, mut aliases, without_old) = match existing {
+        Some((_, _, app)) => {
+            let name = app.name.clone();
+            (name, app.aliases, without_app(contents, bundle_id))
+        }
+        None => {
+            let aliases = built_in_aliases.iter().map(|a| a.to_string()).collect();
+            (built_in_name.to_string(), aliases, contents.to_string())
+        }
+    };
+    if aliases.contains(&alias) {
+        return Ok(contents.to_string()); // already said this way
+    }
+    aliases.push(alias);
+    appended(&without_old, &app_block(&name, bundle_id, &aliases))
+}
+
 /// Adds an application, appended to `config.toml`. Refuses to write if the
 /// result would not parse — an empty name or bundle id parses fine as a
 /// `Config`, so that is checked by the caller, not here.
@@ -822,6 +894,25 @@ pub fn add_app(name: &str, bundle_id: &str, aliases: &[String]) -> Result<(), St
     }
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     let updated = appended(&existing, &app_block(name, bundle_id, aliases))?;
+    write_config(&path, updated)
+}
+
+/// Teaches an application already in the vocabulary one more way its name
+/// gets said — see [`add_alias_to_app`]. `built_in_name` and
+/// `built_in_aliases` come from [`crate::commands::vocabulary`]; refuses
+/// to write if the result would not parse.
+pub fn learn_app_alias(
+    bundle_id: &str,
+    alias: &str,
+    built_in_name: &str,
+    built_in_aliases: &[&str],
+) -> Result<(), String> {
+    let path = path().ok_or("no home directory")?;
+    if let Some(parent) = path.parent() {
+        secure_config_dir(parent)?;
+    }
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let updated = add_alias_to_app(&existing, bundle_id, alias, built_in_name, built_in_aliases)?;
     write_config(&path, updated)
 }
 
@@ -1906,6 +1997,51 @@ mod tests {
     fn removing_an_unknown_app_changes_nothing() {
         let before = "[[apps]]\nname = \"Notion\"\nbundle_id = \"notion.id\"\naliases = []\n";
         assert_eq!(without_app(before, "algo.que.no.existe"), before);
+    }
+
+    #[test]
+    fn a_built_in_apps_first_alias_creates_an_override_copying_the_built_in_list() {
+        // No override yet: the new block must carry the built-in aliases
+        // along, or teaching "cron" would leave Chrome answering to
+        // nothing else.
+        let updated = add_alias_to_app("sounds = true\n", "com.google.Chrome", "cron", "Chrome", &[
+            "chrome", "cromo",
+        ])
+        .expect("should parse");
+        let config: Config = toml::from_str(&updated).expect("should parse");
+        let apps = config.extra_apps();
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0].name, "Chrome");
+        assert_eq!(apps[0].aliases, ["chrome", "cromo", "cron"]);
+        assert!(updated.contains("sounds = true"), "the rest of the file survives");
+    }
+
+    #[test]
+    fn a_second_alias_joins_the_first_overrides_list_rather_than_shadowing_it() {
+        // Two overrides for the same bundle id would leave only the later
+        // one in effect once Minion restarted, silently dropping whatever
+        // the first taught it.
+        let first = add_alias_to_app("", "com.google.Chrome", "cron", "Chrome", &["chrome"])
+            .expect("should parse");
+        assert_eq!(first.matches("[[apps]]").count(), 1);
+
+        let second = add_alias_to_app(&first, "com.google.Chrome", "cromm", "Chrome", &["chrome"])
+            .expect("should parse");
+        assert_eq!(second.matches("[[apps]]").count(), 1, "still one override, not two");
+        let config: Config = toml::from_str(&second).expect("should parse");
+        let apps = config.extra_apps();
+        assert_eq!(apps.len(), 1);
+        // Both the first alias and the built-in one survived the second write.
+        assert_eq!(apps[0].aliases, ["chrome", "cron", "cromm"]);
+    }
+
+    #[test]
+    fn teaching_the_same_alias_twice_changes_nothing() {
+        let once = add_alias_to_app("", "com.google.Chrome", "cron", "Chrome", &["chrome"])
+            .expect("should parse");
+        let twice = add_alias_to_app(&once, "com.google.Chrome", "cron", "Chrome", &["chrome"])
+            .expect("should parse");
+        assert_eq!(once, twice);
     }
 
     #[test]
