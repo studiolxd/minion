@@ -32,8 +32,18 @@
 
 # Minutes of silence after which the speech model is released from memory.
 # Reloading costs about a second on the next thing you say. Zero keeps it
-# loaded for good. Default 5.
+# loaded for good. Default 5. Ignored on battery power and in "battery"
+# energy mode below, which use their own, shorter thresholds.
 # unload_after_minutes = 5
+
+# How eagerly to release memory when idle:
+#   "auto"        (default) the ordinary threshold above while plugged
+#                  in; on battery power, the model is released after 2
+#                  minutes idle and the speaker model after 10, regardless
+#                  of unload_after_minutes.
+#   "battery"     always behaves as if on battery power, plugged in or not.
+#   "performance" never unloads anything.
+# energy = "auto"
 
 # How alike a voice must sound to yours before Minion listens to it, once
 # `minion enroll` has recorded a voice profile. Zero to one, default 0.32
@@ -193,16 +203,36 @@
 # command = "abrir Chrome"
 # phrase = "abre cromo"
 
-# Entirely new commands, bound to a keyboard shortcut. Keys are written as
-# on a menu: "cmd-shift-b", "ctrl+alt+left". A command declared here
-# replaces a built-in one of the same `name`; a phrase claimed by two
+# Entirely new commands: bound to a keyboard shortcut, an AppleScript, or a
+# shell command — exactly one of `keys`, `script` or `shell`. Keys are
+# written as on a menu: "cmd-shift-b", "ctrl+alt+left". A command declared
+# here replaces a built-in one of the same `name`; a phrase claimed by two
 # different commands is reported in the log at startup, and the one read
 # last keeps it.
+#
+# `script` and `shell` are read ONLY here, in your own config.toml — never
+# from a built-in file or a downloaded vocabulary pack. A pack is data that
+# may have come from someone else, and running a script is not something
+# data gets to ask for; a pack that tries is refused command by command,
+# logged as "Ignoring script in pack X: scripts are only read from
+# config.toml". `shell` runs via `/bin/sh -c` with stdin closed (nothing
+# here can answer a prompt), its output written to the log, and a 30-second
+# ceiling — never in a visible Terminal window.
 
 # [[commands]]
 # name = "compilar"
 # phrases = ["compila el proyecto", "compila"]
 # keys = "cmd-shift-b"
+
+# [[commands]]
+# name = "vacía la papelera"
+# phrases = ["vacía la papelera"]
+# script = "tell application \"Finder\" to empty trash"
+
+# [[commands]]
+# name = "backup"
+# phrases = ["haz una copia de seguridad"]
+# shell = "rsync -a ~/Documents ~/Backup"
 
 # Names and other words the recogniser reliably mangles while dictating —
 # the fix for a log line like:

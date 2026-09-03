@@ -467,6 +467,23 @@ fn resident_memory() -> String {
     }
 }
 
+/// An idle duration, rounded to the minute, for the log.
+fn format_idle(idle: Duration) -> String {
+    format!("{} min", idle.as_secs() / 60)
+}
+
+/// Whether the machine is currently running on battery power.
+///
+/// `pmset -g batt` rather than IOKit/`ioreg`: it says "Battery Power" or
+/// "AC Power" on its first line and needs no framework linking for a value
+/// checked once every 30 seconds, not on a hot path.
+fn on_battery() -> bool {
+    std::process::Command::new("/usr/bin/pmset")
+        .args(["-g", "batt"])
+        .output()
+        .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains("Battery Power"))
+}
+
 /// The recognition loop. Owns the model and runs on its own thread.
 /// Loads the speech model.
 fn load_model(model_path: &str) -> Result<ParakeetTDT> {
@@ -603,6 +620,21 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
     // knows the pause is its own to lift — a manual pause never sets this,
     // and so never gets silently overridden once the reason clears.
     let mut auto_paused = false;
+    // Energy: "auto" follows the battery, "battery" always behaves as if
+    // on one, "performance" never unloads. Checking `pmset` on every 250 ms
+    // tick would be wasteful for a value that changes on the order of
+    // hours, so it is cached and refreshed every `BATTERY_POLL_TICKS`.
+    let energy_mode = startup.energy_mode();
+    let mut on_battery_now = on_battery();
+    let mut battery_poll_ticks: u32 = 0;
+    const BATTERY_POLL_TICKS: u32 = 120; // 120 * 250 ms = 30 s
+    let mut battery_like =
+        energy_mode == config::EnergyMode::Battery || on_battery_now;
+    // Set when the speaker model is released for being idle, so the next
+    // utterance knows to reload it rather than leave it unloaded for good
+    // (which `voice` starting as `None` — never enrolled — also looks
+    // like).
+    let mut voice_unloaded_for_idle = false;
     // The CoreAudio process objects that say who is recording arrived in
     // macOS 14. On 13 the question cannot be asked at all, so the setting
     // is lowered here — said once, rather than on every tick.
@@ -709,6 +741,29 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                         note!("resumed automatically — the reason has gone away");
                     }
                 }
+                // Battery state changes on the order of hours, not 250 ms —
+                // polled here, on the tick that already runs every quarter
+                // second for everything else above.
+                battery_poll_ticks += 1;
+                if battery_poll_ticks >= BATTERY_POLL_TICKS {
+                    battery_poll_ticks = 0;
+                    on_battery_now = on_battery();
+                    let now_battery_like =
+                        energy_mode == config::EnergyMode::Battery || on_battery_now;
+                    if now_battery_like != battery_like {
+                        battery_like = now_battery_like;
+                        if battery_like {
+                            note!(
+                                "energy   battery — model released after {} min idle, \
+                                 speaker after {} min",
+                                config::BATTERY_MODEL_UNLOAD_MINUTES,
+                                config::BATTERY_SPEAKER_UNLOAD_MINUTES
+                            );
+                        } else {
+                            note!("energy   AC power — the ordinary idle threshold applies again");
+                        }
+                    }
+                }
                 // Someone has started talking. If the model was released
                 // while idle, load it now: the sentence and the silence
                 // that closes it take longer than the load, so this hides
@@ -726,6 +781,30 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                         Err(e) => note!("error    could not reload the model: {e:#}"),
                     }
                 }
+                // Same idea for the speaker model, released separately (and
+                // later) on battery — see the energy decision below. Only
+                // reloaded here if it was this feature that let it go: a
+                // `voice` that is `None` because nothing was ever enrolled
+                // must stay that way.
+                if speech_starting
+                    && voice_unloaded_for_idle
+                    && voice.is_none()
+                    && active.load(Ordering::Relaxed)
+                {
+                    let started = Instant::now();
+                    match speaker::Speaker::load(&model_path) {
+                        Ok(model) => {
+                            let profile = speaker::load_profile_for(&model_path).unwrap_or_default();
+                            voice = Some(Voice { model, profile, threshold: config_voice_threshold() });
+                            voice_unloaded_for_idle = false;
+                            note!(
+                                "Speech starting — speaker model reloaded in {} ms.",
+                                started.elapsed().as_millis()
+                            );
+                        }
+                        Err(e) => note!("error    could not reload the speaker model: {e:#}"),
+                    }
+                }
                 // Nothing but exact zeros since the stream opened: macOS
                 // denied the microphone. Said once, with somewhere to go.
                 if listener.silent.swap(false, Ordering::Relaxed) {
@@ -738,12 +817,21 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                          Ajustes del Sistema → Privacidad y seguridad → Micrófono",
                     );
                 }
-                if let Some(idle_for) = idle_unload {
-                    if model.is_some() && last_used.elapsed() >= idle_for {
-                        model = None;
-                        note!("Idle for {} min — model released. {}",
-                              idle_for.as_secs() / 60, resident_memory());
-                    }
+                let energy = config::energy_decision(
+                    energy_mode,
+                    on_battery_now,
+                    last_used.elapsed(),
+                    idle_unload,
+                );
+                if energy.unload_model && model.is_some() {
+                    model = None;
+                    note!("Idle for {} — model released. {}",
+                          format_idle(last_used.elapsed()), resident_memory());
+                }
+                if energy.unload_speaker && voice.is_some() {
+                    voice = None;
+                    voice_unloaded_for_idle = true;
+                    note!("Idle for {} — speaker model released.", format_idle(last_used.elapsed()));
                 }
                 continue;
             }

@@ -5,7 +5,9 @@
 //!   - [`press`] to send key combinations
 //!   - [`applescript`] for what neither covers (volume, media transport)
 
-use std::process::Command;
+use std::io::Read as _;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use core_foundation::base::TCFType;
 use objc2::MainThreadMarker;
@@ -418,6 +420,65 @@ pub fn applescript(script: &str) -> Result<(), String> {
     run(Command::new("/usr/bin/osascript").arg("-e").arg(script))
 }
 
+/// The `shell = "…"` command in `config.toml` is trusted the way any other
+/// line the owner wrote there is, but it is still a shell command left
+/// running unattended, so it gets a hard ceiling rather than the run of
+/// the house: 30 seconds.
+const SHELL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Runs `command` through `/bin/sh -c`, never inside a terminal window —
+/// this spawns the shell directly rather than telling Terminal.app to open
+/// one, so nothing appears on screen. Stdin is closed, since nothing here
+/// can type an answer to a prompt. Output goes to the caller, who logs it;
+/// a command still running past [`SHELL_TIMEOUT`] is killed.
+pub fn run_shell(command: &str) -> Result<String, String> {
+    run_shell_with_timeout(command, SHELL_TIMEOUT)
+}
+
+/// Same as [`run_shell`], with the timeout as a parameter so a test can use
+/// one measured in milliseconds instead of waiting out the real ceiling.
+fn run_shell_with_timeout(command: &str, timeout: Duration) -> Result<String, String> {
+    let mut child = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(command)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err(format!("no terminó en {} ms", timeout.as_millis()));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(e) => break Err(e.to_string()),
+        }
+    }?;
+
+    let mut stdout = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        let _ = out.read_to_string(&mut stdout);
+    }
+    let mut stderr = String::new();
+    if let Some(mut err) = child.stderr.take() {
+        let _ = err.read_to_string(&mut stderr);
+    }
+    let output = format!("{}{}", stdout.trim_end(), stderr.trim_end());
+    if status.success() {
+        Ok(output)
+    } else if output.trim().is_empty() {
+        Err(format!("exited with {status}"))
+    } else {
+        Err(output)
+    }
+}
+
 /// Escapes a string for interpolation into an AppleScript string literal
 /// (inside the `"..."` quotes).
 ///
@@ -570,5 +631,35 @@ mod tests {
             applescript_string(r#"x" to quit application "Finder"#),
             r#"x\" to quit application \"Finder"#
         );
+    }
+
+    #[test]
+    fn shell_command_output_comes_back() {
+        let output = run_shell_with_timeout("echo hola", Duration::from_secs(5))
+            .expect("a plain echo should succeed");
+        assert_eq!(output, "hola");
+    }
+
+    #[test]
+    fn a_failing_shell_command_reports_it() {
+        let err = run_shell_with_timeout("exit 3", Duration::from_secs(5))
+            .expect_err("a non-zero exit should be an error");
+        assert!(err.contains('3'), "should say something about the exit status: {err}");
+    }
+
+    #[test]
+    fn a_shell_command_that_reads_stdin_gets_nothing() {
+        // Stdin is closed, not just empty, so a command that reads it (e.g.
+        // `cat`) sees EOF immediately rather than hanging.
+        let output = run_shell_with_timeout("cat", Duration::from_secs(5))
+            .expect("cat on a closed stdin should exit cleanly");
+        assert_eq!(output, "");
+    }
+
+    #[test]
+    fn a_shell_command_that_runs_too_long_is_killed() {
+        let err = run_shell_with_timeout("sleep 5", Duration::from_millis(100))
+            .expect_err("should time out");
+        assert!(err.contains("100"), "should say how long it waited: {err}");
     }
 }
