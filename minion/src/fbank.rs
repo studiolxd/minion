@@ -217,7 +217,9 @@ mod tests {
         let loudest = first_frame
             .iter()
             .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            // total_cmp, not partial_cmp().unwrap(): a NaN anywhere in
+            // the bank would otherwise abort the process.
+            .max_by(|a, b| a.1.total_cmp(b.1))
             .map(|(i, _)| i)
             .unwrap();
         assert!(

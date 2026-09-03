@@ -46,11 +46,45 @@ use tray_icon::TrayIconBuilder;
 
 use commands::Decision;
 
+/// What the tooltip says when there is nothing more particular to report.
+const TOOLTIP_IDLE: &str = "Minion — control por voz";
+const TOOLTIP_LISTENING: &str = "Minion — escuchando";
+const TOOLTIP_PAUSED: &str = "Minion — en pausa";
+
+/// How much of a transcript the tooltip carries.
+///
+/// Long enough to recognise the sentence, short enough that the tooltip
+/// stays one line. What was heard in full is in the log.
+const TOOLTIP_TRANSCRIPT: usize = 48;
+
+/// The tooltip line for an utterance and what came of it.
+///
+/// This is the whole visible trace of what Minion just did: the sounds can
+/// be turned off, the icon only blinks, and the log is a file. Pure, so
+/// the shortening can be tested.
+fn last_utterance_tooltip(transcript: &str, outcome: &str) -> String {
+    let trimmed = transcript.trim();
+    let short: String = if trimmed.chars().count() > TOOLTIP_TRANSCRIPT {
+        trimmed.chars().take(TOOLTIP_TRANSCRIPT - 1).collect::<String>() + "…"
+    } else {
+        trimmed.to_string()
+    };
+    format!("Minion — última: “{short}” → {outcome}")
+}
+
+/// Where to send someone whose microphone Minion cannot use.
+const MICROPHONE_SETTINGS: &str =
+    "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone";
+
 /// System sounds used as feedback. A command that runs produces no visible
 /// output, so without these you cannot tell whether you were heard.
 mod sounds {
     pub const DONE: &str = "/System/Library/Sounds/Pop.aiff";
     pub const UNSURE: &str = "/System/Library/Sounds/Tink.aiff";
+    /// Understood perfectly and refused by macOS. A different sound from
+    /// UNSURE on purpose: "say it again" and "grant the permission" are
+    /// different problems, and they used to be indistinguishable.
+    pub const BLOCKED: &str = "/System/Library/Sounds/Basso.aiff";
 }
 
 /// The toggle's two faces. It names the action, not the state: a menu item
@@ -75,17 +109,27 @@ const UI_REFRESH_SECONDS: f64 = 0.05;
 /// speaker never waits for. The wake-up itself is one atomic read.
 const IDLE_CHECK: Duration = Duration::from_millis(250);
 
-/// Locates the speech model.
+/// Locates the speech model, without fetching anything.
 ///
-/// Order: explicit argument, `OYENTE_MODEL`, the app bundle's Resources,
+/// Order: explicit argument, `MINION_MODEL`, the app bundle's Resources,
 /// then the working directory. The bundle case is what makes double-click
 /// launching work, since a bundled app starts with `/` as its directory.
-fn locate_model(argument: Option<String>) -> Result<String> {
+///
+/// Separate from downloading it because the two belong to different
+/// moments: this answers "is it here?" in microseconds, while fetching it
+/// takes minutes and must happen where its progress can be shown.
+fn find_model(argument: Option<String>) -> Option<String> {
     if let Some(path) = argument {
-        return Ok(path);
+        return Some(path);
     }
+    if let Ok(path) = std::env::var("MINION_MODEL") {
+        return Some(path);
+    }
+    // The name from when this was called Oyente. Still read, so an
+    // existing shell profile keeps working, but it says so.
     if let Ok(path) = std::env::var("OYENTE_MODEL") {
-        return Ok(path);
+        note!("OYENTE_MODEL is deprecated — rename it to MINION_MODEL.");
+        return Some(path);
     }
 
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
@@ -108,10 +152,21 @@ fn locate_model(argument: Option<String>) -> Result<String> {
 
     for candidate in candidates {
         if models::present(&candidate) {
-            return Ok(candidate.to_string_lossy().into_owned());
+            return Some(candidate.to_string_lossy().into_owned());
         }
     }
-    // Nowhere yet: fetch it. First run, or someone deleted it.
+    None
+}
+
+/// Finds the model, downloading it if it is not there yet.
+///
+/// The command line — `minion enroll` — has a terminal to print to, so
+/// this is where the old behaviour lives on. The menu bar app cannot use
+/// it: it has to have an icon before a 670 MB download starts.
+fn locate_model(argument: Option<String>) -> Result<String> {
+    if let Some(found) = find_model(argument) {
+        return Ok(found);
+    }
     let target = models::directory()
         .ok_or_else(|| anyhow!("no home directory to download the model into"))?;
     println!("Descargando el modelo de reconocimiento (una sola vez, ~670 MB)…");
@@ -201,6 +256,20 @@ enum Undoable {
     Launched { previous: Option<String> },
 }
 
+/// What the tooltip should say, written by whoever knows and applied by
+/// the run loop. The menu bar belongs to the main thread; the download and
+/// the recognition loop do not.
+type Status = Arc<Mutex<String>>;
+
+/// Sets the tooltip text, if anyone can still read it.
+fn set_status(status: &Status, text: &str) {
+    if let Ok(mut current) = status.lock() {
+        if *current != text {
+            *current = text.to_string();
+        }
+    }
+}
+
 /// Voice training, shared between the window and the listening loop.
 ///
 /// `Some` while training is under way. The window sets it going and reads
@@ -228,6 +297,8 @@ struct Listening {
     show_catalogue: Arc<AtomicBool>,
     /// Keep a copy of what was heard, for diagnosis.
     save_recordings: bool,
+    /// What the tooltip should say.
+    status: Status,
 }
 
 /// Settings for speaking back.
@@ -252,6 +323,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
         microphone,
         show_catalogue,
         save_recordings,
+        status,
     } = setup;
 
     // While Minion is speaking it must not act on what it hears: it listens
@@ -270,8 +342,12 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
     let mut undoable: Option<Undoable> = None;
     note!("Model loaded. {}", resident_memory());
 
+    // How long to stay deaf after speaking: the segmenter needs
+    // `silence_end_ms` of quiet before it closes an utterance, so anything
+    // shorter hands Minion its own answer just after the flag comes down.
+    let speech_tail = Duration::from_millis(settings.silence_end_ms as u64 + 200);
     let listener =
-        audio::start(settings, Arc::clone(&active), microphone)
+        audio::start(settings, Arc::clone(&active), microphone, Arc::clone(&deaf))
             .context("opening the microphone")?;
     note!(
         "Microphone: {} Hz, {} channel(s). {} phrases understood.",
@@ -279,7 +355,11 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
         listener.channels,
         commands::phrase_count()
     );
-    note!("Listening. Say: «minion, abre Chrome»");
+    // The wake word can be changed in preferences, and telling someone to
+    // say «minion» when it no longer answers to that is worse than saying
+    // nothing.
+    let wake = commands::wake_words().first().copied().unwrap_or("minion");
+    note!("Listening. Say: «{wake}, abre Chrome»");
 
     loop {
         // A bounded wait, so idleness can be noticed while nothing is being
@@ -302,8 +382,20 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                             last_used = Instant::now();
                             note!("Speech starting — model reloaded. {}", resident_memory());
                         }
-                        Err(e) => eprintln!("could not reload the model: {e:#}"),
+                        Err(e) => note!("error    could not reload the model: {e:#}"),
                     }
+                }
+                // Nothing but exact zeros since the stream opened: macOS
+                // denied the microphone. Said once, with somewhere to go.
+                if listener.silent.swap(false, Ordering::Relaxed) {
+                    note!("deaf     the microphone delivers only silence — permission denied?");
+                    let _ = std::process::Command::new("/usr/bin/open")
+                        .arg(MICROPHONE_SETTINGS)
+                        .status();
+                    actions::show_message(
+                        "Minion no puede oír: activa el micrófono para Minion en \
+                         Ajustes del Sistema → Privacidad y seguridad → Micrófono",
+                    );
                 }
                 if let Some(idle_for) = idle_unload {
                     if model.is_some() && last_used.elapsed() >= idle_for {
@@ -410,7 +502,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                     note!("Speech heard — model reloaded. {}", resident_memory());
                 }
                 Err(e) => {
-                    eprintln!("could not reload the model: {e:#}");
+                    note!("error    could not reload the model: {e:#}");
                     continue;
                 }
             }
@@ -486,6 +578,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                     let listening = active.load(Ordering::Relaxed);
                     let reply = answers::answer(question, listening);
                     note!("asked    «{part}»  ->  {reply}");
+                    set_status(&status, &last_utterance_tooltip(&part, &reply));
                     acted.store(true, Ordering::Relaxed);
                     match &voice_reply {
                         Some(settings) => {
@@ -495,6 +588,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                                 settings.rate,
                                 settings.device.as_deref(),
                                 &deaf,
+                                speech_tail,
                             );
                             // Whatever arrived while it was talking is its
                             // own voice, or was said over it. Either way it
@@ -554,6 +648,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                 log_ignored_speech.load(Ordering::Relaxed),
                 play_sounds.load(Ordering::Relaxed),
                 &acted,
+                &status,
             );
 
             if commands::is_sleep(&decision) {
@@ -595,6 +690,7 @@ fn report(
     log_ignored_speech: bool,
     play_sounds: bool,
     acted: &AtomicBool,
+    status: &Status,
 ) {
         match decision {
             Decision::Ignored => {
@@ -605,9 +701,11 @@ fn report(
                 } else {
                     note!("heard    {seconds:.1}s of speech, not addressed to me");
                 }
+                set_status(status, &last_utterance_tooltip(transcript, "no era para mí"));
             }
             Decision::Unrecognised => {
                 note!("unknown  «{transcript}»  ->  not understood");
+                set_status(status, &last_utterance_tooltip(transcript, "no entendido"));
                 if play_sounds {
                     actions::play_sound(sounds::UNSURE);
                 }
@@ -631,6 +729,7 @@ fn report(
                             confidence * 100.0
                         );
                         acted.store(true, Ordering::Relaxed);
+                        set_status(status, &last_utterance_tooltip(transcript, &done.description));
                         if play_sounds {
                             actions::play_sound(sounds::DONE);
                         }
@@ -642,8 +741,12 @@ fn report(
                              Grant Accessibility in System Settings.",
                             done.description
                         );
+                        set_status(
+                            status,
+                            &last_utterance_tooltip(transcript, "bloqueado por macOS"),
+                        );
                         if play_sounds {
-                            actions::play_sound(sounds::UNSURE);
+                            actions::play_sound(sounds::BLOCKED);
                         }
                     }
                 }
@@ -657,7 +760,18 @@ fn config_voice_threshold() -> f32 {
     config::load().voice_threshold()
 }
 
+/// What the menu bar needs to know that is not a switch.
+struct Bar {
+    /// Where the model is, or will be once it has been downloaded.
+    model_path: String,
+    /// Set while the first download is running.
+    downloading: Arc<AtomicBool>,
+    /// The tooltip, as the rest of the program would like it.
+    status: Status,
+}
+
 fn run_menu_bar(
+    bar: Bar,
     active: Arc<AtomicBool>,
     sounds_on: Arc<AtomicBool>,
     log_voices_on: Arc<AtomicBool>,
@@ -666,6 +780,7 @@ fn run_menu_bar(
     // Raised when someone asks aloud what they can say.
     catalogue_asked: Arc<AtomicBool>,
 ) -> Result<()> {
+    let Bar { model_path, downloading, status } = bar;
     let mtm = MainThreadMarker::new()
         .ok_or_else(|| anyhow!("the menu bar must be built on the main thread"))?;
     let app = NSApplication::sharedApplication(mtm);
@@ -681,6 +796,10 @@ fn run_menu_bar(
     let learn = MenuItem::new("Aprender", true, None);
     let show_log = MenuItem::new("Ver el registro", true, None);
 
+    // The wake word, a learned alias and a voice profile are all read once
+    // at startup, so three different places tell the user to restart
+    // Minion from the menu. Until now the menu had no such item.
+    let restart = MenuItem::new("Reiniciar", true, None);
     let commands_item = MenuItem::new("Ayuda", true, None);
     let preferences = MenuItem::new("Preferencias…", true, None);
 
@@ -698,6 +817,7 @@ fn run_menu_bar(
     menu.append(&PredefinedMenuItem::separator())?;
     // Help sits with Quit rather than among the working items: it is where
     // you look when you do not know what to do, not part of the routine.
+    menu.append(&restart)?;
     menu.append(&commands_item)?;
     menu.append(&quit)?;
 
@@ -706,6 +826,7 @@ fn run_menu_bar(
     let preferences_id = preferences.id().clone();
     let commands_id = commands_item.id().clone();
     let show_log_id = show_log.id().clone();
+    let restart_id = restart.id().clone();
     let quit_id = quit.id().clone();
 
     // Built once and reused: reopening should bring back the same window,
@@ -748,15 +869,27 @@ fn run_menu_bar(
     let learn_requested = Arc::new(AtomicBool::new(false));
     let catalogue_requested = Arc::new(AtomicBool::new(false));
 
+    // Built before anything slow happens. On a first run the model has yet
+    // to be downloaded — 670 MB, several minutes — and the icon used to
+    // appear only afterwards: for all that time the menu bar showed
+    // nothing at all and the progress went to a stdout nobody sees.
+    let busy = downloading.load(Ordering::Relaxed);
+    let opening_face = if busy { icon::asleep()? } else { icon::awake()? };
+    let opening_tooltip = status
+        .lock()
+        .ok()
+        .filter(|text| !text.is_empty())
+        .map_or_else(|| TOOLTIP_IDLE.to_string(), |text| text.clone());
+
     // Held for the lifetime of the process: dropping it removes the icon.
     let tray = Rc::new(
         TrayIconBuilder::new()
             .with_menu(Box::new(menu))
-            .with_icon(icon::awake()?)
+            .with_icon(opening_face)
             // A template image: macOS tints it to match the menu bar, so it
             // is black on a light one and white on a dark one.
             .with_icon_as_template(true)
-            .with_tooltip("Minion — control por voz")
+            .with_tooltip(&opening_tooltip)
             .build()?,
     );
 
@@ -767,7 +900,10 @@ fn run_menu_bar(
     let tray_for_timer = Rc::clone(&tray);
     let toggle_for_timer = toggle.clone();
     let active_for_timer = Arc::clone(&active);
-    let shown_as_listening = Cell::new(true);
+    let shown_as_listening = Cell::new(!busy);
+    let shown_tooltip = std::cell::RefCell::new(opening_tooltip);
+    let status_for_timer = Arc::clone(&status);
+    let downloading_for_timer = Arc::clone(&downloading);
     let acted_for_timer = Arc::clone(&acted);
     let blink_until: Cell<Option<std::time::Instant>> = Cell::new(None);
     let panel_for_timer = Rc::clone(&panel);
@@ -777,7 +913,7 @@ fn run_menu_bar(
     let catalogue_for_timer = Arc::clone(&catalogue_requested);
     let catalogue_window = Rc::clone(&catalogue);
     let catalogue_asked_aloud = Arc::clone(&catalogue_asked);
-    let training_model_path = locate_model(None).unwrap_or_else(|_| "model".into());
+    let training_model_path = model_path;
     let report_for_timer = Rc::clone(&report);
     let sounds_for_timer = Arc::clone(&sounds_on);
     let voices_for_timer = Arc::clone(&log_voices_on);
@@ -830,7 +966,8 @@ fn run_menu_bar(
                     Ok(n) if n > 0 => {
                         note!("learned {n} alias(es) from the log");
                         actions::show_message(&format!(
-                            "Añadidos {n}. Reinicia Minion para que se apliquen."
+                            "Añadidos {n}. Reinicia Minion desde el menú para que \
+                             se apliquen."
                         ));
                     }
                     Ok(_) => {}
@@ -861,12 +998,31 @@ fn run_menu_bar(
             }
         }
 
+        // The tooltip is the only place a background app can say what it
+        // is doing without interrupting anyone.
+        if let Ok(wanted) = status_for_timer.lock() {
+            if !wanted.is_empty() && *wanted != *shown_tooltip.borrow() {
+                let _ = tray_for_timer.set_tooltip(Some(&*wanted));
+                shown_tooltip.replace(wanted.clone());
+            }
+        }
+
         let listening = active_for_timer.load(Ordering::Relaxed);
-        if listening == shown_as_listening.get() {
+        // Downloading is not listening, whatever the switch says.
+        let awake = listening && !downloading_for_timer.load(Ordering::Relaxed);
+        if awake == shown_as_listening.get() {
             return;
         }
-        shown_as_listening.set(listening);
-        let face = if listening { icon::awake() } else { icon::asleep() };
+        shown_as_listening.set(awake);
+        // Pausing and resuming happen from three places — the menu, the
+        // shortcut and a spoken order — and this is the one that sees all
+        // three, because they all end up flipping the same flag.
+        if !downloading_for_timer.load(Ordering::Relaxed) {
+            if let Ok(mut text) = status_for_timer.lock() {
+                *text = if awake { TOOLTIP_LISTENING } else { TOOLTIP_PAUSED }.to_string();
+            }
+        }
+        let face = if awake { icon::awake() } else { icon::asleep() };
         if let Ok(face) = face {
             let _ = tray_for_timer.set_icon_with_as_template(Some(face), true);
         }
@@ -911,6 +1067,12 @@ fn run_menu_bar(
                 if let Some(path) = journal::path() {
                     actions::reveal(&path.to_string_lossy());
                 }
+            } else if event.id == restart_id {
+                note!("restarting from the menu");
+                relaunch();
+                // Zero: a restart asked for is not a crash, and the launch
+                // agent must not race the copy that was just started.
+                std::process::exit(0);
             } else if event.id == quit_id {
                 note!("quit from the menu");
                 std::process::exit(0);
@@ -920,6 +1082,43 @@ fn run_menu_bar(
 
     app.run();
     Ok(())
+}
+
+/// How to start a fresh copy of Minion, as a command and its arguments.
+///
+/// Inside a bundle it has to be `open -n` on the `.app` rather than the
+/// binary: run directly, the executable loses its Info.plist, and with it
+/// the accessory activation policy — a Dock icon appears and the menu bar
+/// item does not.
+///
+/// Split out from [`relaunch`] so the shape can be checked without
+/// starting anything.
+fn relaunch_arguments(executable: &Path) -> Vec<std::path::PathBuf> {
+    let bundle = executable
+        .ancestors()
+        .find(|path| path.extension().is_some_and(|kind| kind == "app"));
+    match bundle {
+        Some(app) => vec!["/usr/bin/open".into(), "-n".into(), app.to_path_buf()],
+        None => vec![executable.to_path_buf()],
+    }
+}
+
+/// Starts a fresh copy, a moment after this one has gone.
+///
+/// The wait is not politeness: the single-instance lock is held by an open
+/// file descriptor and only released when the process ends, so a copy that
+/// starts too early finds the lock taken and quietly exits, leaving no
+/// Minion at all. The paths are passed as arguments rather than
+/// interpolated into the script, so nothing about them can be read as
+/// shell.
+fn relaunch() {
+    let Ok(executable) = std::env::current_exe() else {
+        return;
+    };
+    let mut command = std::process::Command::new("/bin/sh");
+    command.arg("-c").arg(r#"sleep 2; exec "$0" "$@""#);
+    command.args(relaunch_arguments(&executable));
+    let _ = command.spawn();
 }
 
 /// Refuses to start if another copy is already running.
@@ -957,6 +1156,60 @@ fn claim_sole_instance() -> bool {
     locked
 }
 
+/// When this Mac last started, in seconds since the epoch.
+///
+/// Used as the name of the current login session: it changes at every
+/// boot and at nothing else, so a marker carrying it says "already done
+/// this time round" without needing a timer or a file to clean up.
+fn boot_time() -> Option<i64> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_BOOTTIME];
+    let mut boot = libc::timeval { tv_sec: 0, tv_usec: 0 };
+    let mut size = std::mem::size_of::<libc::timeval>();
+    let read = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as u32,
+            std::ptr::addr_of_mut!(boot).cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (read == 0).then_some(boot.tv_sec)
+}
+
+/// Where the "I already opened the Accessibility pane" marker lives.
+fn accessibility_marker() -> Option<std::path::PathBuf> {
+    let mut path = config::path()?;
+    path.set_file_name("accessibility-prompted");
+    Some(path)
+}
+
+/// Whether the marker was written during this same boot.
+///
+/// Pure so the policy can be tested without a filesystem: an unreadable or
+/// missing marker, or one from a previous boot, means "not yet".
+fn prompted_this_boot(marker: Option<&str>, boot: Option<i64>) -> bool {
+    match (marker, boot) {
+        (Some(written), Some(now)) => written.trim().parse::<i64>() == Ok(now),
+        _ => false,
+    }
+}
+
+/// Records that the pane has been opened during this boot.
+fn remember_accessibility_prompt(boot: Option<i64>) {
+    if cfg!(test) {
+        return;
+    }
+    let (Some(path), Some(boot)) = (accessibility_marker(), boot) else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, boot.to_string());
+}
+
 /// Says plainly whether the key-pressing commands can work at all.
 ///
 /// Worth its own step because the failure is invisible: without the
@@ -981,15 +1234,80 @@ fn report_permissions() {
          Privacy & Security → Accessibility. Then restart Minion from the\n  \
          menu bar: the permission is only read at startup.\n"
     );
+    // Once per login, not once per start. The launch agent restarts Minion
+    // whenever it exits badly, and each restart used to throw System
+    // Settings in the user's face again.
+    let boot = boot_time();
+    let marker = accessibility_marker().and_then(|path| std::fs::read_to_string(path).ok());
+    if prompted_this_boot(marker.as_deref(), boot) {
+        note!("Accessibility pane already offered since this Mac started; not reopening it.");
+        return;
+    }
     actions::open_accessibility_settings();
+    remember_accessibility_prompt(boot);
+}
+
+/// Stops, having said why.
+///
+/// Everything that can go wrong before Minion is listening — no
+/// microphone, no model, a corrupt one — used to reach stderr alone, which
+/// under launchd goes to a file nobody opens: the user saw a menu bar with
+/// no icon, or an icon that never did anything. So it is written down, and
+/// shown.
+///
+/// Exits with 0 on purpose. The launch agent restarts on a non-zero exit,
+/// and a configuration problem does not fix itself between two tries: it
+/// would reopen this dialog every `ThrottleInterval` seconds until someone
+/// killed it.
+fn fatal(message: &str) -> ! {
+    note!("fatal    {message}");
+    actions::show_message(message);
+    std::process::exit(0)
 }
 
 fn main() -> Result<()> {
+    // A panic aborts (see [profile.release]), and an abort leaves nothing
+    // behind. Written down first, so the restart that follows can be
+    // explained afterwards rather than guessed at.
+    std::panic::set_hook(Box::new(|info| {
+        let payload = info.payload();
+        let message = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("panicked");
+        let place = info.location().map_or_else(
+            || "an unknown place".to_string(),
+            |at| format!("{}:{}", at.file(), at.line()),
+        );
+        journal::write(&format!("panic    {message} at {place}"));
+    }));
+
     // `minion learn` reads the log and turns its failures into vocabulary.
     // It touches neither the microphone nor the model, so it is handled
     // before any of that is set up.
     let first_argument = std::env::args().nth(1);
     if let Some(argument) = first_argument.as_deref() {
+        if matches!(argument, "--help" | "-h" | "help") {
+            // Spanish: everything the person running this reads is in
+            // Spanish, and this is read by nobody else. Without it,
+            // `minion --help` went looking for a model called «--help».
+            println!(
+                "Minion — control por voz en español.\n\n\
+                 Uso:\n  \
+                 minion                      escucha y obedece (el uso normal)\n  \
+                 minion <ruta-al-modelo>     igual, con el modelo de esa carpeta\n  \
+                 minion learn [--apply]      convierte en alias lo que no entendió\n  \
+                 minion enroll               aprende tu voz desde la terminal\n  \
+                 minion export-icon <dir>    guarda el icono como .iconset\n  \
+                 minion --help               esto\n\n\
+                 Variables de entorno:\n  \
+                 MINION_MODEL                carpeta del modelo de reconocimiento\n\n\
+                 Registro: ~/Library/Logs/minion.log\n\
+                 Ajustes:  ~/Library/Application Support/Minion/config.toml"
+            );
+            return Ok(());
+        }
         if argument == "export-icon" {
             let directory = std::env::args().nth(2).unwrap_or_else(|| "Minion.iconset".into());
             icon::export_iconset(&directory)?;
@@ -1014,7 +1332,22 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let model_path = locate_model(first_argument)?;
+    // Where the model is — or, on a first run, where it is about to be.
+    // The download itself happens on the worker thread, once the icon
+    // exists to report it.
+    let found = find_model(first_argument);
+    let downloading = Arc::new(AtomicBool::new(found.is_none()));
+    let status: Status = Arc::new(Mutex::new(
+        if found.is_some() { TOOLTIP_LISTENING } else { TOOLTIP_IDLE }.to_string(),
+    ));
+    let Some(model_path) = found.or_else(|| {
+        models::directory().map(|path| path.to_string_lossy().into_owned())
+    }) else {
+        fatal(
+            "Minion no encuentra el modelo de reconocimiento y no sabe dónde \
+             descargarlo: no hay carpeta personal.",
+        );
+    };
 
     let config = config::load();
     commands::configure(&config);
@@ -1068,7 +1401,33 @@ fn main() -> Result<()> {
         rate: config.speech_rate(),
         device: config.speaker(),
     });
+    let worker_downloading = Arc::clone(&downloading);
+    let worker_status = Arc::clone(&status);
+    let menu_bar = Bar {
+        model_path: model_path.clone(),
+        downloading: Arc::clone(&downloading),
+        status: Arc::clone(&status),
+    };
     std::thread::spawn(move || {
+        // First run: 670 MB before anything can be heard. Reported through
+        // the tooltip, which is where a menu bar app can say what it is
+        // doing without a window and without interrupting anyone.
+        if worker_downloading.load(Ordering::Relaxed) {
+            note!("Downloading the recognition model (about 670 MB, once).");
+            set_status(&worker_status, "Minion — descargando el modelo… 0 %");
+            let target = std::path::PathBuf::from(&model_path);
+            if let Err(e) = models::fetch(&target, |progress| {
+                set_status(&worker_status, &format!("Minion — {progress}"));
+            }) {
+                fatal(&format!(
+                    "Minion no ha podido descargar el modelo de reconocimiento.\n\n{e}\n\n\
+                     Comprueba la conexión y vuelve a abrir Minion."
+                ));
+            }
+            note!("Model downloaded.");
+            worker_downloading.store(false, Ordering::Relaxed);
+            set_status(&worker_status, TOOLTIP_LISTENING);
+        }
         if let Err(e) = listen_and_obey(Listening {
             model_path,
             audio: audio_settings,
@@ -1083,9 +1442,13 @@ fn main() -> Result<()> {
             microphone,
             show_catalogue: worker_catalogue,
             save_recordings,
+            status: Arc::clone(&worker_status),
         }) {
-            eprintln!("Error: {e:#}");
-            std::process::exit(1);
+            fatal(&format!(
+                "Minion no puede escuchar y va a cerrarse.\n\n{e:#}\n\nComprueba \
+                 el micrófono en Ajustes del Sistema → Privacidad y seguridad → \
+                 Micrófono."
+            ));
         }
     });
 
@@ -1098,5 +1461,80 @@ fn main() -> Result<()> {
         }
     }
 
-    run_menu_bar(active, play_sounds, log_ignored, training, acted, catalogue_asked)
+    run_menu_bar(
+        menu_bar,
+        active,
+        play_sounds,
+        log_ignored,
+        training,
+        acted,
+        catalogue_asked,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_tooltip_says_what_was_heard_and_what_came_of_it() {
+        assert_eq!(
+            last_utterance_tooltip("  minion, abre Chrome  ", "abrir Chrome"),
+            "Minion — última: “minion, abre Chrome” → abrir Chrome"
+        );
+    }
+
+    #[test]
+    fn a_long_sentence_is_shortened_rather_than_wrapped() {
+        let long = "minion, escribe que mañana por la mañana tengo que llamar al fontanero";
+        let tooltip = last_utterance_tooltip(long, "escribir");
+        assert!(tooltip.contains('…'), "should be cut: {tooltip}");
+        assert!(!tooltip.contains("fontanero"), "and cut at the right place: {tooltip}");
+    }
+
+    #[test]
+    fn a_bundled_minion_restarts_through_its_bundle() {
+        let inside = Path::new("/Applications/Minion.app/Contents/MacOS/minion");
+        assert_eq!(
+            relaunch_arguments(inside),
+            vec![
+                std::path::PathBuf::from("/usr/bin/open"),
+                std::path::PathBuf::from("-n"),
+                std::path::PathBuf::from("/Applications/Minion.app"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_bare_binary_restarts_itself() {
+        let built = Path::new("/Users/someone/minion/target/release/minion");
+        assert_eq!(relaunch_arguments(built), vec![built.to_path_buf()]);
+    }
+
+    #[test]
+    fn a_marker_from_this_boot_stops_the_pane_reopening() {
+        assert!(prompted_this_boot(Some("1725350400"), Some(1_725_350_400)));
+        assert!(prompted_this_boot(Some("1725350400\n"), Some(1_725_350_400)));
+    }
+
+    #[test]
+    fn a_marker_from_a_previous_boot_does_not_count() {
+        assert!(!prompted_this_boot(Some("1725350400"), Some(1_725_360_000)));
+    }
+
+    #[test]
+    fn no_marker_and_no_boot_time_mean_offer_it() {
+        assert!(!prompted_this_boot(None, Some(1_725_350_400)));
+        assert!(!prompted_this_boot(Some("1725350400"), None));
+        assert!(!prompted_this_boot(Some("not a number"), Some(1_725_350_400)));
+    }
+
+    #[test]
+    fn the_boot_time_is_a_plausible_moment_in_the_past() {
+        // It must be stable across calls, or it would be useless as the
+        // name of a login session.
+        let boot = boot_time().expect("macOS knows when it started");
+        assert!(boot > 1_000_000_000, "the epoch is not a boot time");
+        assert_eq!(Some(boot), boot_time(), "it must not move while running");
+    }
 }

@@ -63,6 +63,7 @@ pub fn say(
     rate: u32,
     device: Option<&str>,
     deaf: &AtomicBool,
+    tail: std::time::Duration,
 ) {
     if text.is_empty() {
         return;
@@ -80,8 +81,11 @@ pub fn say(
     let _ = command.status();
 
     // A moment more: the microphone hears the tail of the room, not just
-    // the file.
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    // the file. Long enough for the segmenter to have closed anything the
+    // reply opened — it needs `silence_end_ms` of quiet to do that — or
+    // the sentence carrying Minion's own answer arrives just after the
+    // flag comes down.
+    std::thread::sleep(tail);
     deaf.store(false, Ordering::Relaxed);
 }
 
@@ -110,7 +114,7 @@ mod tests {
     #[test]
     fn saying_nothing_does_nothing() {
         let deaf = AtomicBool::new(false);
-        say("", None, DEFAULT_RATE, None, &deaf);
+        say("", None, DEFAULT_RATE, None, &deaf, std::time::Duration::ZERO);
         assert!(!deaf.load(Ordering::Relaxed), "should not go deaf for silence");
     }
 }

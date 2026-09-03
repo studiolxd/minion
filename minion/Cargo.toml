@@ -27,3 +27,8 @@ tray-icon = "0.24.2"
 
 [profile.release]
 opt-level = 3
+# A panic on the listening thread used to leave the icon in the menu bar
+# with nothing behind it: the process survived, so launchd saw nothing to
+# restart and the user had a face that could not hear. Aborting turns that
+# silent deafness into a restart.
+panic = "abort"

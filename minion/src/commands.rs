@@ -107,7 +107,7 @@ fn named_command(name: &str) -> Option<&'static Command> {
 }
 
 /// Wake words in force: the user's if configured, otherwise the defaults.
-fn wake_words() -> &'static [&'static str] {
+pub fn wake_words() -> &'static [&'static str] {
     USER_WAKE_WORDS.get().map_or(DEFAULT_WAKE_WORDS, |w| w.as_slice())
 }
 

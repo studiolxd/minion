@@ -109,7 +109,7 @@ pub fn fetch<F: Fn(&str)>(directory: &Path, report: F) -> Result<(), String> {
             continue;
         }
         report(&format!(
-            "Descargando el modelo de voz… {}%",
+            "descargando el modelo… {} %",
             done * 100 / total.max(1)
         ));
         download(
@@ -125,7 +125,7 @@ pub fn fetch<F: Fn(&str)>(directory: &Path, report: F) -> Result<(), String> {
     // a second thing to wait for later.
     let speaker = directory.join("speaker.onnx");
     if !speaker.exists() {
-        report("Descargando el modelo de voz… 98%");
+        report("descargando el modelo… 98 %");
         download(
             &format!("{SPEAKER_URL_BASE}/{SPEAKER_REVISION}/voxceleb_ECAPA512_LM.onnx"),
             &speaker,
@@ -133,7 +133,7 @@ pub fn fetch<F: Fn(&str)>(directory: &Path, report: F) -> Result<(), String> {
         )?;
     }
 
-    report("Modelo descargado.");
+    report("modelo descargado");
     Ok(())
 }
 
