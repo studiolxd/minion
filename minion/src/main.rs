@@ -17,6 +17,7 @@ mod hotkey;
 mod icon;
 mod journal;
 mod learn;
+mod models;
 mod preferences;
 mod spanish;
 mod startup;
@@ -92,20 +93,26 @@ fn locate_model(argument: Option<String>) -> Result<String> {
     candidates.push(Path::new("model").to_path_buf());
     candidates.push(Path::new("../model").to_path_buf());
 
-    // Installed alongside user data.
-    if let Ok(home) = std::env::var("HOME") {
-        candidates.push(Path::new(&home).join("Library/Application Support/Minion/model"));
+    // Downloaded on first run, and kept outside the bundle so reinstalling
+    // does not fetch 670 MB again.
+    if let Some(downloaded) = models::directory() {
+        candidates.push(downloaded);
     }
 
     for candidate in candidates {
-        if candidate.join("vocab.txt").exists() {
+        if models::present(&candidate) {
             return Ok(candidate.to_string_lossy().into_owned());
         }
     }
-    Err(anyhow!(
-        "speech model not found. Run ./download-model.sh, or pass its path \
-         as an argument."
-    ))
+    // Nowhere yet: fetch it. First run, or someone deleted it.
+    let target = models::directory()
+        .ok_or_else(|| anyhow!("no home directory to download the model into"))?;
+    println!("Descargando el modelo de reconocimiento (una sola vez, ~670 MB)…");
+    models::fetch(&target, |progress| {
+        println!("  {progress}");
+    })
+    .map_err(|e| anyhow!("{e}"))?;
+    Ok(target.to_string_lossy().into_owned())
 }
 
 /// How ONNX Runtime should be set up.
@@ -175,6 +182,18 @@ struct Voice {
     threshold: f32,
 }
 
+/// Something Minion did that it knows how to take back.
+///
+/// Not every action can be undone — closing an application is gone — so
+/// only the ones with an honest reverse are recorded. Saying so beats a
+/// command that silently does nothing.
+enum Undoable {
+    /// Text that was typed: remove exactly that many characters.
+    Typed(usize),
+    /// An application that was brought forward: go back to the previous.
+    Launched { previous: Option<String> },
+}
+
 /// Voice training, shared between the window and the listening loop.
 ///
 /// `Some` while training is under way. The window sets it going and reads
@@ -215,6 +234,10 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
     let mut last_used = Instant::now();
     // What "otra vez" refers to.
     let mut last_command: Option<Decision> = None;
+    // While dictating, everything heard is typed rather than obeyed.
+    let mut dictating = false;
+    // What "deshaz lo que has hecho" would undo.
+    let mut undoable: Option<Undoable> = None;
     note!("Model loaded. {}", resident_memory());
 
     let listener =
@@ -350,6 +373,64 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
             let context = actions::frontmost_app();
             let (mut decision, confidence) = commands::decide_in(&part, context.as_deref());
 
+            // Dictation is a mode: while it is on, everything is text,
+            // except the phrase that turns it off.
+            if dictating {
+                match decision {
+                    commands::Decision::StopDictation => {
+                        dictating = false;
+                        note!("dictation ended");
+                        continue;
+                    }
+                    _ => {
+                        let typed = part.trim().to_string();
+                        if !typed.is_empty() {
+                            let length = typed.chars().count() + 1;
+                            actions::type_text(&format!("{typed} "));
+                            note!("typed    «{typed}»");
+                            undoable = Some(Undoable::Typed(length));
+                            acted.store(true, Ordering::Relaxed);
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            match decision {
+                commands::Decision::StartDictation => {
+                    dictating = true;
+                    note!("dictation started — say «deja de dictar» to stop");
+                    acted.store(true, Ordering::Relaxed);
+                    continue;
+                }
+                commands::Decision::StopDictation => {
+                    note!("not dictating");
+                    continue;
+                }
+                commands::Decision::UndoLast => {
+                    match undoable.take() {
+                        Some(Undoable::Typed(length)) => {
+                            for _ in 0..length {
+                                actions::press(actions::key::DELETE, actions::Mods::NONE);
+                            }
+                            note!("undid    typing ({length} characters)");
+                            acted.store(true, Ordering::Relaxed);
+                        }
+                        Some(Undoable::Launched { previous }) => match previous {
+                            Some(bundle) => {
+                                actions::open_app(&bundle);
+                                note!("undid    going back to {bundle}");
+                                acted.store(true, Ordering::Relaxed);
+                            }
+                            None => note!("nothing to go back to"),
+                        },
+                        None => note!("nothing of mine to undo"),
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+
             // "otra vez" means whatever was said before it.
             let mut repeats = 1;
             if let commands::Decision::Again(times) = decision {
@@ -381,6 +462,17 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                 active.store(false, Ordering::Relaxed);
                 note!("paused by voice — resume from the menu bar");
             }
+            // Remember what could be taken back.
+            match &decision {
+                commands::Decision::Type(text) => {
+                    undoable = Some(Undoable::Typed(text.chars().count()));
+                }
+                commands::Decision::Launch { .. } => {
+                    undoable = Some(Undoable::Launched { previous: context.clone() });
+                }
+                _ => {}
+            }
+
             // Only real actions are worth repeating later.
             if !matches!(
                 decision,

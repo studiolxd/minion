@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
-# Downloads the speech model. ~670 MB, int8 quantised.
+# Downloads the speech models ahead of time. Optional: Minion fetches them
+# itself on first run. ~670 MB, int8 quantised.
 #
 # Parakeet TDT 0.6b v3 covers 25 languages including Spanish. The int8 build
 # is used because inference runs on CPU: CoreML support in parakeet-rs is
 # still marked unstable.
 set -euo pipefail
 
-DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/model"
+# Same place the application downloads to on first run, so doing this by
+# hand and letting it do it are interchangeable.
+DIR="$HOME/Library/Application Support/Minion/model"
 BASE="https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main"
 
 mkdir -p "$DIR"

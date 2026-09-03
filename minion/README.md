@@ -53,17 +53,14 @@ Spanish recognition with hands-free listening.
 ## Quick start
 
 ```bash
-./download-model.sh    # ~640 MB, once
-./install.sh           # builds, installs to /Applications, starts at login
+./install.sh    # builds, installs to /Applications, starts at login
 ```
 
-Or to run it without installing:
-
-```bash
-./download-model.sh
-cargo build --release
-./target/release/minion
-```
+The speech models (~670 MB) are downloaded on first run into Application
+Support rather than carried inside the app, which is 29 MB. They never
+change, and keeping them outside means reinstalling does not fetch them
+again. `./download-model.sh` gets them ahead of time if you would rather
+not wait on the first launch.
 
 Grant microphone access when asked. For commands that press keys (copy,
 save, close tab) also grant Accessibility under System Settings → Privacy
@@ -373,6 +370,7 @@ rebuilding.
 
 ## Not done yet
 
+- **A tighter memory floor.** 405 MB idle is what ONNX Runtime gives back.
 - **Real VAD.** Energy cannot tell speech from a door slam, and background
   music keeps it triggering. Silero VAD is the next step.
 

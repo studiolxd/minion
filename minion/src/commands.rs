@@ -279,18 +279,6 @@ pub const COMMANDS: &[Command] = &[
               action: Action::Key(key::TAB, Mods::CTRL) },
     Command { phrases: &["vuelve a la pestana anterior", "pestana anterior"], name: "pestaña anterior",
               action: Action::Key(key::TAB, Mods::CTRL_SHIFT) },
-    // Ir a una pestaña concreta. El reconocedor devuelve el número como
-    // dígito ("pestaña 1"), así que esa es la forma principal.
-    Command { phrases: &["pestana 1", "pestana uno", "primera pestana"], name: "pestaña 1",
-              action: Action::Key(key::DIGIT_1, Mods::CMD) },
-    Command { phrases: &["pestana 2", "pestana dos"], name: "pestaña 2",
-              action: Action::Key(key::DIGIT_2, Mods::CMD) },
-    Command { phrases: &["pestana 3", "pestana tres"], name: "pestaña 3",
-              action: Action::Key(key::DIGIT_3, Mods::CMD) },
-    Command { phrases: &["pestana 4", "pestana cuatro"], name: "pestaña 4",
-              action: Action::Key(key::DIGIT_4, Mods::CMD) },
-    Command { phrases: &["pestana 5", "pestana cinco"], name: "pestaña 5",
-              action: Action::Key(key::DIGIT_5, Mods::CMD) },
     Command { phrases: &["ultima pestana", "pestana final"], name: "última pestaña",
               action: Action::Key(key::DIGIT_9, Mods::CMD) },
 
@@ -368,14 +356,79 @@ pub const COMMANDS: &[Command] = &[
 /// text — "pon la canción tú y yo" is one instruction, not two.
 const CHAIN_JOINERS: &[&str] = &[" y luego ", " y después ", " y despues ", " y ahora ", " y también ", " y tambien "];
 
-/// Spoken numbers, for "repite tres veces".
+/// Spoken numbers. The recogniser writes digits for some and words for
+/// others depending on the sentence, so both forms are here.
 const NUMBERS: &[(&str, usize)] = &[
-    ("una", 1), ("uno", 1), ("1", 1),
-    ("dos", 2), ("2", 2),
-    ("tres", 3), ("3", 3),
-    ("cuatro", 4), ("4", 4),
-    ("cinco", 5), ("5", 5),
+    ("una", 1), ("uno", 1), ("primera", 1), ("1", 1),
+    ("dos", 2), ("segunda", 2), ("2", 2),
+    ("tres", 3), ("tercera", 3), ("3", 3),
+    ("cuatro", 4), ("cuarta", 4), ("4", 4),
+    ("cinco", 5), ("quinta", 5), ("5", 5),
+    ("seis", 6), ("sexta", 6), ("6", 6),
+    ("siete", 7), ("septima", 7), ("7", 7),
+    ("ocho", 8), ("octava", 8), ("8", 8),
+    ("nueve", 9), ("novena", 9), ("9", 9),
 ];
+
+/// A number spoken anywhere in the sentence.
+fn number_in(words: &[String]) -> Option<usize> {
+    words
+        .iter()
+        .find_map(|word| NUMBERS.iter().find(|(name, _)| name == word))
+        .map(|(_, value)| *value)
+}
+
+/// Commands that take a number: one entry instead of one per value.
+///
+/// "pestaña 7" used to need its own table row, so the family stopped at
+/// five and every new one was another line to write.
+struct Numbered {
+    /// Words that must appear, besides the number itself.
+    subject: &'static [&'static str],
+    name: &'static str,
+    /// Turns the number into the key to press.
+    key_for: fn(usize) -> Option<(u16, Mods)>,
+}
+
+const NUMBERED: &[Numbered] = &[
+    Numbered {
+        subject: &["pestana"],
+        name: "ir a la pestaña",
+        key_for: |n| {
+            // ⌘1 to ⌘8 select tabs; ⌘9 is the last one, not the ninth.
+            let code = match n {
+                1 => key::DIGIT_1,
+                2 => key::DIGIT_2,
+                3 => key::DIGIT_3,
+                4 => key::DIGIT_4,
+                5 => key::DIGIT_5,
+                6 => 22,
+                7 => 26,
+                8 => 28,
+                _ => return None,
+            };
+            Some((code, Mods::CMD))
+        },
+    },
+];
+
+/// Matches "pestaña 7" and the like.
+fn numbered_command(words: &[String]) -> Option<(&'static str, usize, (u16, Mods))> {
+    let number = number_in(words)?;
+    for entry in NUMBERED {
+        let mentions_subject = entry
+            .subject
+            .iter()
+            .all(|needed| words.iter().any(|word| word == needed));
+        if !mentions_subject {
+            continue;
+        }
+        if let Some(key) = (entry.key_for)(number) {
+            return Some((entry.name, number, key));
+        }
+    }
+    None
+}
 
 /// Most times a command will be repeated in one go.
 const MAX_REPEATS: usize = 10;
@@ -397,6 +450,14 @@ pub enum Decision {
     SearchMusic(String),
     /// Do the last thing again, this many times.
     Again(usize),
+    /// A command that takes a number: which one, and what to press.
+    Numbered { name: &'static str, number: usize, key: (u16, Mods) },
+    /// Start typing everything said from now on.
+    StartDictation,
+    /// Stop doing that.
+    StopDictation,
+    /// Undo whatever Minion last did.
+    UndoLast,
     /// Run a command from the table, identified by name.
     Run(&'static str),
     /// Started with the wake word, but nothing was recognised.
@@ -608,6 +669,20 @@ pub fn decide_in(transcript: &str, context: Option<&str>) -> (Decision, f32) {
         return (Decision::Type(text), 1.0);
     }
 
+    // The dictation mode's own switches, and undo. Checked here because
+    // they are answered by the caller, which is what holds the state.
+    for (phrases, decision) in [
+        (["empieza a dictar", "modo dictado"], Decision::StartDictation),
+        (["deja de dictar", "fin del dictado"], Decision::StopDictation),
+        (["deshaz lo que has hecho", "anula eso"], Decision::UndoLast),
+    ] {
+        for phrase in phrases {
+            if similarity(rest, phrase) >= threshold() {
+                return (decision, 1.0);
+            }
+        }
+    }
+
     // Commands belonging to the application in front come first: they are
     // the most specific thing that can match.
     if let Some(bundle) = context {
@@ -670,6 +745,16 @@ pub fn decide_in(transcript: &str, context: Option<&str>) -> (Decision, f32) {
     // opening it, closing it, or nothing at all. Without this check, "cierra
     // Safari" would launch Safari, because the name alone used to be enough.
     let spoken_words = keywords(rest);
+
+    // A number in the sentence: "pestaña 7". After the plain table, so a
+    // command that matches outright still wins, and before applications,
+    // which would otherwise see only a stray digit.
+    if best.is_none() {
+        if let Some((name, number, key)) = numbered_command(&spoken_words) {
+            return (Decision::Numbered { name, number, key }, 1.0);
+        }
+    }
+
     let leading_verb = spoken_words.first().map(String::as_str);
     let asks_to_open = leading_verb.is_some_and(|v| APP_VERBS.contains(&v));
     let asks_to_quit = leading_verb.is_some_and(|v| QUIT_VERBS.contains(&v));
@@ -751,6 +836,12 @@ pub fn perform(decision: &Decision) -> Option<Done> {
                 None => format!("abrir {url}"),
             },
             succeeded: actions::open_url(url, *in_browser),
+        }),
+        // Answered by the caller, which holds the state they need.
+        Decision::StartDictation | Decision::StopDictation | Decision::UndoLast => None,
+        Decision::Numbered { name, number, key } => Some(Done {
+            description: format!("{name} {number}"),
+            succeeded: actions::press(key.0, key.1),
         }),
         Decision::SearchMusic(query) => Some(Done {
             description: format!("buscar «{query}» en Spotify"),
@@ -887,7 +978,10 @@ pub fn catalogue() -> String {
            páginas web           «{wake}, ve a google.com»\n\
            música por nombre     «{wake}, pon la canción Vértigo»\n\
            repetir               «{wake}, otra vez» · «repite tres veces»\n\
-           encadenar             «{wake}, cierra la pestaña y luego recarga»"
+           encadenar             «{wake}, cierra la pestaña y luego recarga»\n\
+           dictado seguido       «{wake}, empieza a dictar» … «{wake}, deja de dictar»\n\
+           deshacer lo suyo      «{wake}, deshaz lo que has hecho»\n\
+           una pestaña concreta  «{wake}, pestaña 7»"
     );
     out
 }
@@ -1032,7 +1126,7 @@ mod tests {
         // back "not understood".
         let cases: &[(&str, &str)] = &[
             ("minion pestaña anterior", "pestaña anterior"),
-            ("Minion pestaña 1.", "pestaña 1"),
+
             ("Minion página atrás.", "atrás"),
             ("Minion página anterior.", "atrás"),
             ("Minion página siguiente.", "adelante"),
@@ -1261,6 +1355,55 @@ mod tests {
                 "«{spoken}» should pause"
             );
         }
+    }
+
+    #[test]
+    fn numbers_fill_a_single_command() {
+        // One table entry rather than one per value: the family used to
+        // stop at five because each number was another line to write.
+        for (spoken, expected) in [
+            ("minion pestaña 1", 1),
+            ("minion pestaña 7", 7),
+            ("minion ve a la pestaña tres", 3),
+            ("minion pestaña octava", 8),
+        ] {
+            match decide(spoken).0 {
+                Decision::Numbered { name, number, .. } => {
+                    assert_eq!(name, "ir a la pestaña", "for «{spoken}»");
+                    assert_eq!(number, expected, "for «{spoken}»");
+                }
+                other => panic!("«{spoken}» should be tab {expected}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_number_out_of_range_is_not_invented() {
+        // ⌘9 is the last tab, not the ninth, so nine has no key of its own.
+        assert_eq!(decide("minion pestaña 9").0, Decision::Unrecognised);
+    }
+
+    #[test]
+    fn plain_tab_commands_still_win() {
+        // These mention tabs without a number and must not be swallowed.
+        assert_eq!(decide("minion cierra la pestaña").0, Decision::Run("cerrar pestaña"));
+        assert_eq!(decide("minion última pestaña").0, Decision::Run("última pestaña"));
+    }
+
+    #[test]
+    fn dictation_is_a_mode_of_its_own() {
+        assert_eq!(decide("minion empieza a dictar").0, Decision::StartDictation);
+        assert_eq!(decide("minion modo dictado").0, Decision::StartDictation);
+        assert_eq!(decide("minion deja de dictar").0, Decision::StopDictation);
+        assert_eq!(decide("minion fin del dictado").0, Decision::StopDictation);
+    }
+
+    #[test]
+    fn undo_is_about_what_minion_did() {
+        // Distinct from "deshaz el cambio", which is ⌘Z in the application.
+        assert_eq!(decide("minion deshaz lo que has hecho").0, Decision::UndoLast);
+        assert_eq!(decide("minion anula eso").0, Decision::UndoLast);
+        assert_eq!(decide("minion deshaz el cambio").0, Decision::Run("deshacer"));
     }
 
     #[test]

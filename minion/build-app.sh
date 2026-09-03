@@ -14,11 +14,6 @@ VERSION="1.0.0-beta.1"
 
 cd "$HERE"
 
-if [ ! -f model/vocab.txt ]; then
-  echo "Speech model missing. Run ./download-model.sh first." >&2
-  exit 1
-fi
-
 echo "Building…"
 cargo build --release
 
@@ -27,6 +22,9 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 cp target/release/minion "$APP/Contents/MacOS/minion"
+
+# The models are not bundled: 670 MB that never change, downloaded once on
+# first run into Application Support, where they also survive reinstalling.
 
 # The app icon comes from the same drawing as the menu bar face, so the two
 # cannot drift apart.
@@ -38,7 +36,6 @@ if ./target/release/minion export-icon "$ICONSET" >/dev/null 2>&1 \
 else
   echo "Warning: could not build the icon; the app will use the generic one." >&2
 fi
-cp -R model "$APP/Contents/Resources/model"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
