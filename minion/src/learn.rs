@@ -191,7 +191,7 @@ fn appended(existing: &str, addition: &str) -> Result<String, String> {
 /// Lower than [`SUGGEST_ABOVE`]: a question costs nothing but a moment and
 /// is answered by the person who knows, while an alias written into the
 /// configuration from a report nobody read has to be right on its own.
-pub const ASK_ABOVE: f32 = 0.5;
+pub const ASK_ABOVE: f32 = 0.6;
 
 /// What a phrase was probably meant to be: what to do about it, how to say
 /// so, and what to remember if the guess turns out to be right.

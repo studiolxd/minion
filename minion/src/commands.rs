@@ -1458,8 +1458,30 @@ pub fn decide_in(transcript: &str, context: Option<&str>) -> (Decision, f32) {
     match best {
         Some((TableHit::Command(command), score)) => (Decision::Run(command.name), score),
         Some((TableHit::Macro(macro_), score)) => (Decision::Macro(macro_), score),
+        // A question nothing in the vocabulary answers («qué es un
+        // SCORM») is for the AI, not a near-miss of «abrir Mail»: with the
+        // AI off, saying so beats guessing at a command.
+        None if looks_like_a_question(rest, transcript) => {
+            (Decision::AskAi(rest.to_string()), 0.9)
+        }
         None => (Decision::Unrecognised, 0.0),
     }
+}
+
+/// Whether a phrase is shaped like a question: it starts with an
+/// interrogative, or the recogniser closed it with a question mark.
+fn looks_like_a_question(rest: &str, transcript: &str) -> bool {
+    const INTERROGATIVES: &[&str] = &[
+        "que", "quien", "quienes", "cuanto", "cuanta", "cuantos", "cuantas", "como", "donde",
+        "cuando", "cual", "cuales", "por que", "para que",
+    ];
+    let trimmed = transcript.trim_end();
+    if trimmed.ends_with('?') {
+        return true;
+    }
+    INTERROGATIVES
+        .iter()
+        .any(|start| rest == *start || rest.starts_with(&format!("{start} ")))
 }
 
 /// One of the things a sentence could have been asking for, and how well
@@ -2626,6 +2648,22 @@ mod tests {
             decide("minion IA qué hora es en Tokio").0,
             Decision::AskAi("qué hora es en Tokio".to_string())
         );
+    }
+
+    #[test]
+    fn a_question_the_vocabulary_cannot_answer_goes_to_the_ai() {
+        assert_eq!(
+            decide("minion qué es un scorm").0,
+            Decision::AskAi("que es un scorm".to_string())
+        );
+        assert_eq!(
+            decide("Minion, ¿cuánta gente vive en Málaga?").0,
+            Decision::AskAi("cuanta gente vive en malaga".to_string())
+        );
+        // Not a question: still a near miss of nothing, still unrecognised.
+        assert_eq!(decide("minion haz un pino").0, Decision::Unrecognised);
+        // A real command that happens to start like a question stays one.
+        assert_ne!(decide("minion qué hora es").0, Decision::AskAi("que hora es".to_string()));
     }
 
     #[test]
