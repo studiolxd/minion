@@ -748,6 +748,7 @@ impl Preferences {
     /// whatever you were using — which looks exactly like nothing happened.
     pub fn show(&self) {
         if let Some(mtm) = MainThreadMarker::new() {
+            install_main_menu(mtm);
             let app = NSApplication::sharedApplication(mtm);
             #[allow(deprecated)]
             app.activateIgnoringOtherApps(true);
@@ -1001,6 +1002,60 @@ impl Preferences {
     }
 }
 
+/// Gives the application the menu its windows need, once.
+///
+/// An accessory application shows no menu bar, so Minion had none at all —
+/// and with no menu there is nothing for ⌘C, ⌘V or ⌘W to go through:
+/// AppKit routes a key equivalent by looking for it in `mainMenu` first.
+/// The result was a text field that could not be pasted into. The items
+/// are the standard responder actions, so whatever has focus answers them.
+fn install_main_menu(mtm: MainThreadMarker) {
+    use objc2::sel;
+    use objc2_app_kit::{NSMenu, NSMenuItem};
+
+    let app = NSApplication::sharedApplication(mtm);
+    if app.mainMenu().is_some() {
+        return;
+    }
+
+    let sections: [(&str, &[(&str, objc2::runtime::Sel, &str)]); 2] = [
+        (
+            "Edición",
+            &[
+                ("Deshacer", sel!(undo:), "z"),
+                ("Cortar", sel!(cut:), "x"),
+                ("Copiar", sel!(copy:), "c"),
+                ("Pegar", sel!(paste:), "v"),
+                ("Seleccionar todo", sel!(selectAll:), "a"),
+            ],
+        ),
+        ("Ventana", &[("Cerrar", sel!(performClose:), "w")]),
+    ];
+
+    let bar = NSMenu::new(mtm);
+    for (title, items) in sections {
+        let menu = NSMenu::initWithTitle(mtm.alloc(), &NSString::from_str(title));
+        for (name, action, key) in items {
+            // Safety: the selectors are the standard responder ones; with
+            // no target set they travel up the responder chain, so an item
+            // nothing answers is simply greyed out.
+            let item = unsafe {
+                NSMenuItem::initWithTitle_action_keyEquivalent(
+                    mtm.alloc(),
+                    &NSString::from_str(name),
+                    Some(*action),
+                    &NSString::from_str(key),
+                )
+            };
+            menu.addItem(&item);
+        }
+        let holder = NSMenuItem::new(mtm);
+        holder.setSubmenu(Some(&menu));
+        bar.addItem(&holder);
+    }
+    app.setMainMenu(Some(&bar));
+}
+
 fn save(key: &str, value: &str) {
     if let Err(e) = config::set_option(key, value) {
         crate::journal::write(&format!("could not save {key}: {e}"));
@@ -1115,6 +1170,7 @@ impl Report {
         // Grow to fit, so the scroll view knows how far it can go.
         self.text.sizeToFit();
         if let Some(mtm) = MainThreadMarker::new() {
+            install_main_menu(mtm);
             let app = NSApplication::sharedApplication(mtm);
             #[allow(deprecated)]
             app.activateIgnoringOtherApps(true);
