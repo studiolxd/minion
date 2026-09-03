@@ -20,6 +20,7 @@ mod hotkey;
 mod icon;
 mod journal;
 mod learn;
+mod metrics;
 mod microphone;
 mod models;
 mod notify;
@@ -1352,6 +1353,7 @@ fn run_menu_bar(
     // opening something for you to fill in.
     let learn = MenuItem::new("Aprender", true, None);
     let show_log = MenuItem::new("Ver el registro", true, None);
+    let stats_item = MenuItem::new("Estadísticas…", true, None);
 
     // The wake word, a learned alias and a voice profile are all read once
     // at startup, so three different places tell the user to restart
@@ -1365,6 +1367,7 @@ fn run_menu_bar(
     let log_menu = Submenu::new("Registro", true);
     log_menu.append(&learn)?;
     log_menu.append(&show_log)?;
+    log_menu.append(&stats_item)?;
 
     // «Últimas órdenes»: fixed slots, updated in place, rather than menu
     // items created and destroyed on every utterance — a slot with nothing
@@ -1412,6 +1415,7 @@ fn run_menu_bar(
     let preferences_id = preferences.id().clone();
     let commands_id = commands_item.id().clone();
     let show_log_id = show_log.id().clone();
+    let stats_id = stats_item.id().clone();
     let restart_id = restart.id().clone();
     let quit_id = quit.id().clone();
 
@@ -1443,6 +1447,11 @@ fn run_menu_bar(
         "Qué puedo decirle",
         objc2_foundation::NSSize::new(560.0, 620.0),
     ));
+    let stats_window = Rc::new(preferences::Report::new(
+        mtm,
+        "Estadísticas",
+        objc2_foundation::NSSize::new(620.0, 640.0),
+    ));
 
     // Watches this application's keys, so the shortcut button can be set by
     // pressing a combination rather than typing its name.
@@ -1454,6 +1463,7 @@ fn run_menu_bar(
     let open_requested = Arc::new(AtomicBool::new(false));
     let learn_requested = Arc::new(AtomicBool::new(false));
     let catalogue_requested = Arc::new(AtomicBool::new(false));
+    let stats_requested = Arc::new(AtomicBool::new(false));
 
     // What each "Últimas órdenes" slot currently holds, so the menu-event
     // thread — which owns no state of its own — can look one up by number
@@ -1516,6 +1526,8 @@ fn run_menu_bar(
     let catalogue_for_timer = Arc::clone(&catalogue_requested);
     let catalogue_window = Rc::clone(&catalogue);
     let catalogue_asked_aloud = Arc::clone(&catalogue_asked);
+    let stats_for_timer = Arc::clone(&stats_requested);
+    let stats_window_for_timer = Rc::clone(&stats_window);
     // The submenu is only ever touched from here — set_text/set_enabled are
     // cheap, so it is simplest to just rebuild the visible slots whenever
     // the parsed history changes, rather than diffing against what is
@@ -1657,6 +1669,11 @@ fn run_menu_bar(
             || catalogue_for_timer.swap(false, Ordering::Relaxed)
         {
             catalogue_window.show(&commands::catalogue());
+        }
+        if stats_for_timer.swap(false, Ordering::Relaxed) {
+            // The last 30 days: recent enough to act on, short enough that
+            // the window does not turn into the whole rotated log.
+            stats_window_for_timer.show(&metrics::report_text(Some(30)));
         }
         if learn_for_timer.swap(false, Ordering::Relaxed) {
             let config = config::load();
@@ -1842,6 +1859,7 @@ fn run_menu_bar(
     let restart_from_menu = Arc::clone(&restart_requested);
     let quit_from_menu = Arc::clone(&quit_requested);
     let catalogue_from_menu = Arc::clone(&catalogue_requested);
+    let stats_from_menu = Arc::clone(&stats_requested);
     let history_slots_from_menu = Arc::clone(&history_slots);
     let forget_alias_from_menu = Arc::clone(&forget_alias_requested);
     std::thread::spawn(move || {
@@ -1861,6 +1879,8 @@ fn run_menu_bar(
             } else if event.id == preferences_id {
                 // Windows belong to the main thread; the timer opens it.
                 open_from_menu.store(true, Ordering::Relaxed);
+            } else if event.id == stats_id {
+                stats_from_menu.store(true, Ordering::Relaxed);
             } else if event.id == show_log_id {
                 if let Some(path) = journal::path() {
                     if let Err(reason) = actions::reveal(&path.to_string_lossy()) {
@@ -2201,6 +2221,8 @@ fn main() -> Result<()> {
                  minion say \"texto\"          lo dice en voz alta\n  \
                  minion status               si Minion está escuchando o en pausa\n  \
                  minion mic                  qué apps usan ahora el micrófono\n  \
+                 minion stats [--days N]     informe de reconocimiento (todo el \
+                 registro, o los últimos N días)\n  \
                  minion --help               esto\n\n\
                  «run» y «say» dejan un aviso para la copia que ya está en\n\
                  marcha y no hacen nada si no hay ninguna — útil para atajos\n\
@@ -2259,6 +2281,15 @@ fn main() -> Result<()> {
         // this, and see the same thing Minion sees.
         if argument == "mic" {
             microphone::report();
+            return Ok(());
+        }
+        if argument == "stats" {
+            let args: Vec<String> = std::env::args().collect();
+            let days = args
+                .windows(2)
+                .find(|pair| pair[0] == "--days")
+                .and_then(|pair| pair[1].parse::<u32>().ok());
+            println!("{}", metrics::report_text(days));
             return Ok(());
         }
     }
