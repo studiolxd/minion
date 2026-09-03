@@ -14,6 +14,9 @@
 //! wake word and the verb lists — and the deciding itself.
 
 use std::sync::OnceLock;
+use std::time::Duration;
+
+use chrono::NaiveTime;
 
 use crate::actions::{self, key, Mods};
 use crate::config::Config;
@@ -470,6 +473,21 @@ fn numbered_command(words: &[String]) -> Option<(&'static str, usize, (u16, Mods
 /// Most times a command will be repeated in one go.
 const MAX_REPEATS: usize = 10;
 
+/// When a spoken pause resumes — named the same two ways
+/// `timers::parse_duration`/`parse_alarm` name a timer or an alarm, since
+/// it is the same grammar. Resolved to an absolute moment by the caller
+/// (`timers::at_duration_from_now`/`next_occurrence`), not here: working
+/// that out needs the wall clock, and `decide_in` stays pure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PauseSpec {
+    /// "espera diez minutos", "espera media hora": the duration, and the
+    /// words that named it.
+    For(Duration, String),
+    /// "no me escuches hasta las cinco": the clock time, and the words
+    /// that named it.
+    At(NaiveTime, String),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Decision {
     /// Launch or focus an application.
@@ -507,6 +525,9 @@ pub enum Decision {
     /// with an object in it ("cancela esto"), which still mean what they
     /// meant before — see [`cancel_word`].
     Cancel,
+    /// «espera diez minutos», «no me escuches hasta las cinco»: pause
+    /// listening, resuming on its own at the named moment.
+    Pause(PauseSpec),
     /// A question, to be answered aloud.
     Answer(crate::answers::Question),
     /// «pregunta a la IA …», «pregúntale a la IA …», «IA, …»: what to ask
@@ -577,6 +598,27 @@ fn cancel_word(rest: &str) -> bool {
         return false;
     }
     WORDS.iter().any(|word| *word == only || crate::text::edits_between(only, word) <= 1)
+}
+
+/// «espera diez minutos», «espera media hora», «no me escuches hasta las
+/// cinco», «espera hasta las cinco»: a spoken pause, either a duration
+/// from now or a clock time to resume at — reusing
+/// `timers::parse_duration`/`parse_alarm` rather than parsing the same
+/// grammar a second time.
+fn pause_request(rest: &str) -> Option<PauseSpec> {
+    for prefix in ["espera hasta ", "no me escuches hasta ", "no escuches hasta "] {
+        if let Some(after) = rest.strip_prefix(prefix) {
+            if let Some((time, label)) = crate::timers::parse_alarm(after) {
+                return Some(PauseSpec::At(time, label));
+            }
+        }
+    }
+    if let Some(after) = rest.strip_prefix("espera ") {
+        if let Some((duration, label)) = crate::timers::parse_duration(after) {
+            return Some(PauseSpec::For(duration, label));
+        }
+    }
+    None
 }
 
 /// Strips the wake word. Returns `None` if the sentence is not a command.
@@ -1403,6 +1445,13 @@ pub fn decide_in(transcript: &str, context: Option<&str>) -> (Decision, f32) {
     // swallow the escape/Ctrl-C meaning that phrase still has.
     if cancel_word(rest) {
         return (Decision::Cancel, 1.0);
+    }
+
+    // A spoken pause, checked before anything contextual for the same
+    // reason: it names a duration or a clock time nobody's table phrase
+    // does, so there is nothing else this could plausibly mean.
+    if let Some(spec) = pause_request(rest) {
+        return (Decision::Pause(spec), 1.0);
     }
 
     // Commands belonging to the application in front come first: they are
@@ -2306,6 +2355,37 @@ mod tests {
         assert_eq!(decision("minion fin"), Decision::Run("tecla fin"));
         assert_eq!(decision("minion pagina arriba"), Decision::Run("pagina arriba"));
         assert_eq!(decision("minion pagina abajo"), Decision::Run("pagina abajo"));
+    }
+
+    #[test]
+    fn a_pause_is_decided_from_a_duration_or_a_clock_time() {
+        match decision("minion espera diez minutos") {
+            Decision::Pause(PauseSpec::For(duration, label)) => {
+                assert_eq!(duration, std::time::Duration::from_secs(600));
+                assert_eq!(label, "diez minutos");
+            }
+            other => panic!("expected a pause, got {other:?}"),
+        }
+        match decision("minion espera media hora") {
+            Decision::Pause(PauseSpec::For(duration, _)) => {
+                assert_eq!(duration, std::time::Duration::from_secs(1_800));
+            }
+            other => panic!("expected a pause, got {other:?}"),
+        }
+        match decision("minion no me escuches hasta las cinco") {
+            Decision::Pause(PauseSpec::At(_, label)) => assert_eq!(label, "las cinco"),
+            other => panic!("expected a pause, got {other:?}"),
+        }
+        match decision("minion espera hasta las cinco") {
+            Decision::Pause(PauseSpec::At(_, label)) => assert_eq!(label, "las cinco"),
+            other => panic!("expected a pause, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_pause_with_nothing_it_can_parse_is_not_a_pause() {
+        assert_eq!(decision("minion espera"), Decision::Unrecognised);
+        assert_eq!(decision("minion espera un momento"), Decision::Unrecognised);
     }
 
     #[test]

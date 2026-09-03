@@ -71,6 +71,11 @@ pub enum Outcome {
     /// running — this only carries what `Session` itself knows was
     /// cancelled, for the log line.
     Cancel { cancelled_question: bool, closed_window: bool },
+    /// «espera diez minutos», «no me escuches hasta las cinco»: pause
+    /// listening. `main.rs` resolves the spec to an absolute moment (the
+    /// wall clock is not this module's to read) and does the actual
+    /// pausing and scheduling.
+    Pause(commands::PauseSpec),
     /// «otra vez» with nothing said before it.
     NothingToRepeat,
     /// Carry this out, this many times.
@@ -392,6 +397,7 @@ impl Session {
                 self.close_window();
                 return Outcome::Cancel { cancelled_question, closed_window };
             }
+            Decision::Pause(spec) => return Outcome::Pause(spec),
             _ => {}
         }
 
@@ -1601,6 +1607,16 @@ mod tests {
             )
             .expect("worth confirming");
         assert_eq!(question.text, "¿Salir de Chrome?");
+    }
+
+    #[test]
+    fn a_pause_decision_becomes_a_pause_outcome() {
+        let mut session = Session::new();
+        let spec = commands::PauseSpec::For(Duration::from_secs(600), "diez minutos".to_string());
+        assert_eq!(
+            session.interpret("minion espera diez minutos", Decision::Pause(spec.clone()), None),
+            Outcome::Pause(spec)
+        );
     }
 
     #[test]

@@ -53,6 +53,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
+use chrono::{DateTime, Local};
 use block2::RcBlock;
 use objc2::MainThreadMarker;
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
@@ -683,6 +684,12 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
     // knows the pause is its own to lift — a manual pause never sets this,
     // and so never gets silently overridden once the reason clears.
     let mut auto_paused = false;
+    // «espera diez minutos», «no me escuches hasta las cinco»: when this
+    // is due, listening resumes on its own — checked on the idle tick
+    // below. Cleared, rather than acted on, the moment `active` is found
+    // already true: that means something else (the menu, the shortcut)
+    // resumed it early, and the pause is no longer this feature's to end.
+    let mut paused_until: Option<DateTime<Local>> = None;
     // Energy: "auto" follows the battery, "battery" always behaves as if
     // on one, "performance" never unloads. Checking `pmset` on every 250 ms
     // tick would be wasteful for a value that changes on the order of
@@ -817,6 +824,18 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                 // open once `Instant::now()` passes its deadline — so this
                 // is where that becomes visible to the menu bar.
                 window_open.store(session.window_open(Instant::now()), Ordering::Relaxed);
+                // «espera diez minutos», «no me escuches hasta las cinco»:
+                // due, or already lifted some other way.
+                if let Some(until) = paused_until {
+                    if active.load(Ordering::Relaxed) {
+                        paused_until = None;
+                    } else if Local::now() >= until {
+                        active.store(true, Ordering::Relaxed);
+                        paused_until = None;
+                        note!("resumed  the pause ended — listening again");
+                        set_status(&status, TOOLTIP_LISTENING);
+                    }
+                }
                 // Smart auto-pause. Only in "always" mode: push-to-talk
                 // already gates listening on the key, and layering this on
                 // top of it would fight that — resuming on its own the
@@ -1561,6 +1580,26 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                         heard: Some(part.clone()),
                         outcome: Some("cancelado".to_string()),
                     });
+                }
+                Outcome::Pause(spec) => {
+                    let (resume_at, label) = match &spec {
+                        commands::PauseSpec::For(duration, label) => {
+                            (timers::at_duration_from_now(*duration), label.clone())
+                        }
+                        commands::PauseSpec::At(time, label) => {
+                            (timers::next_occurrence(*time), label.clone())
+                        }
+                    };
+                    active.store(false, Ordering::Relaxed);
+                    paused_until = Some(resume_at);
+                    let until = resume_at.format("%H:%M");
+                    note!("paused   «{part}»  ->  {label}, until {until}");
+                    set_status(&status, &format!("Minion — en pausa hasta las {until}"));
+                    hud::push_update(hud::Update {
+                        heard: Some(part.clone()),
+                        outcome: Some(format!("en pausa hasta las {until}")),
+                    });
+                    acted.store(true, Ordering::Relaxed);
                 }
                 Outcome::AskAi(text) => {
                     // The [ai] table is re-read here: switching the AI on

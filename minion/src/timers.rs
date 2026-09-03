@@ -84,6 +84,11 @@ pub fn number_at(words: &[&str], start: usize) -> Option<(u32, usize)> {
 pub fn parse_duration(rest: &str) -> Option<(Duration, String)> {
     let words: Vec<&str> = rest.split_whitespace().collect();
     for i in 0..words.len() {
+        // "media hora": the number is implicit in the word itself, unlike
+        // every other duration here.
+        if words[i] == "media" && matches!(words.get(i + 1), Some(&"hora") | Some(&"horas")) {
+            return Some((Duration::from_secs(1_800), words[i..=i + 1].join(" ")));
+        }
         let Some((n, next)) = number_at(&words, i) else { continue };
         if n == 0 {
             continue;
@@ -197,21 +202,32 @@ fn push(kind: Kind, label: String, fires_at: DateTime<Local>) {
     }
 }
 
-/// Adds a timer that fires `duration` from now.
-pub fn schedule_timer(duration: Duration, label: String) {
-    let fires_at = Local::now() + chrono::Duration::from_std(duration).unwrap_or_default();
-    push(Kind::Timer, label, fires_at);
+/// `duration` from now, as an absolute point in time — what a timer fires
+/// at, and what pausing until a spoken duration resumes at.
+pub fn at_duration_from_now(duration: Duration) -> DateTime<Local> {
+    Local::now() + chrono::Duration::from_std(duration).unwrap_or_default()
 }
 
-/// Adds an alarm for the next time the clock reads `time`.
-pub fn schedule_alarm(time: NaiveTime, label: String) {
+/// The next time the clock reads `time` — today if that has not passed
+/// yet, tomorrow if it has. What an alarm fires at, and what pausing
+/// until a spoken clock time resumes at.
+pub fn next_occurrence(time: NaiveTime) -> DateTime<Local> {
     let now = Local::now();
     let mut naive = now.date_naive().and_time(time);
     if naive <= now.naive_local() {
         naive += chrono::Duration::days(1);
     }
-    let fires_at = Local.from_local_datetime(&naive).single().unwrap_or(now);
-    push(Kind::Alarm, label, fires_at);
+    Local.from_local_datetime(&naive).single().unwrap_or(now)
+}
+
+/// Adds a timer that fires `duration` from now.
+pub fn schedule_timer(duration: Duration, label: String) {
+    push(Kind::Timer, label, at_duration_from_now(duration));
+}
+
+/// Adds an alarm for the next time the clock reads `time`.
+pub fn schedule_alarm(time: NaiveTime, label: String) {
+    push(Kind::Alarm, label, next_occurrence(time));
 }
 
 /// Cancels everything pending. Returns how many there were.
@@ -264,6 +280,31 @@ mod tests {
 
         let (_, label) = parse_alarm("pon una alarma a las ocho y media").unwrap();
         assert_eq!(label, "a las ocho y media");
+    }
+
+    #[test]
+    fn media_hora_is_thirty_minutes() {
+        let (duration, label) = parse_duration("espera media hora").unwrap();
+        assert_eq!(duration, Duration::from_secs(30 * 60));
+        assert_eq!(label, "media hora");
+    }
+
+    #[test]
+    fn at_duration_from_now_lands_that_far_in_the_future() {
+        let now = Local::now();
+        let fires_at = at_duration_from_now(Duration::from_secs(600));
+        let diff = fires_at.signed_duration_since(now).num_seconds();
+        assert!((595..=605).contains(&diff), "{diff}");
+    }
+
+    #[test]
+    fn next_occurrence_lands_today_or_tomorrow_but_never_in_the_past() {
+        let now = Local::now();
+        let past = (now - chrono::Duration::minutes(1)).time();
+        assert!(next_occurrence(past) > now);
+        let future = (now + chrono::Duration::minutes(1)).time();
+        let fires_at = next_occurrence(future);
+        assert!(fires_at > now && fires_at.date_naive() == now.date_naive());
     }
 
     #[test]
