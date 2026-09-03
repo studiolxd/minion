@@ -46,6 +46,17 @@ pub fn configure(config: &Config) {
     }
     let aliases = config.extra_aliases();
     if !aliases.is_empty() {
+        // An alias whose command does not exist can never fire. Said now,
+        // once, rather than leaving the user to wonder in front of a
+        // microphone that answers nothing.
+        let own: &[Command] = USER_COMMANDS.get().map_or(&[], Vec::as_slice);
+        for (name, phrase) in &aliases {
+            if resolve_target(name, own) == Target::Unknown {
+                crate::journal::write(&format!(
+                    "Ignoring alias «{phrase}»: no command is called «{name}»"
+                ));
+            }
+        }
         let _ = USER_ALIASES.set(aliases);
     }
     if let Some(words) = config.wake_words() {
@@ -54,6 +65,45 @@ pub fn configure(config: &Config) {
     if let Some(threshold) = config.threshold {
         let _ = USER_THRESHOLD.set(threshold.clamp(0.3, 1.0));
     }
+}
+
+/// Where the command an alias points at lives, if it exists at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target {
+    /// One of the built-in commands.
+    Global,
+    /// One that only exists inside particular applications.
+    Contextual,
+    /// One the user declared in `[[commands]]`.
+    User,
+    /// Nothing of that name: the alias can never fire.
+    Unknown,
+}
+
+/// Resolves the name an alias points at.
+///
+/// Commands are identified by their name, spelled out in the log and
+/// copied into the configuration by hand, so a misspelling ("atras" for
+/// "atrás") produces an alias that silently never fires. Checked at
+/// startup instead, where it can be said out loud.
+pub fn resolve_target(name: &str, user_commands: &[Command]) -> Target {
+    if COMMANDS.iter().any(|c| c.name == name) {
+        Target::Global
+    } else if user_commands.iter().any(|c| c.name == name) {
+        Target::User
+    } else if CONTEXTUAL_COMMANDS.iter().any(|c| c.name == name) {
+        Target::Contextual
+    } else {
+        Target::Unknown
+    }
+}
+
+/// The command with this name, built in or the user's own.
+fn named_command(name: &str) -> Option<&'static Command> {
+    COMMANDS
+        .iter()
+        .chain(USER_COMMANDS.get().into_iter().flatten())
+        .find(|c| c.name == name)
 }
 
 /// Wake words in force: the user's if configured, otherwise the defaults.
@@ -875,14 +925,24 @@ pub fn decide_in(transcript: &str, context: Option<&str>) -> (Decision, f32) {
         }
     }
 
-    // Phrasings the user added, or that were learned from the log.
+    // Phrasings the user added, or that were learned from the log. The
+    // target may be any command with that name, the user's own included.
     for (name, phrase) in USER_ALIASES.get().into_iter().flatten() {
         let score = similarity(rest, phrase);
         if score < threshold() || !best.is_none_or(|(_, b)| score > b) {
             continue;
         }
-        if let Some(command) = COMMANDS.iter().find(|c| c.name == *name) {
+        if let Some(command) = named_command(name) {
             best = Some((command, score));
+        } else if let Some(bundle) = context {
+            // A contextual command only exists where it applies, so this
+            // is the one place it can be reached by name.
+            if CONTEXTUAL_COMMANDS
+                .iter()
+                .any(|c| c.name == *name && c.bundles.contains(&bundle))
+            {
+                return (Decision::RunHere(name), score);
+            }
         }
     }
 
@@ -1750,6 +1810,23 @@ mod tests {
         let parts = split_chain("Minion cierra la pestaña y luego recarga", false);
         assert_eq!(decide(&parts[0]).0, Decision::Run("cerrar pestaña"));
         assert_eq!(decide(&parts[1]).0, Decision::Run("recargar"));
+    }
+
+    #[test]
+    fn an_alias_target_is_resolved_before_it_is_trusted() {
+        let own = [Command {
+            phrases: &["haz lo mio"],
+            name: "lo mío",
+            action: Action::Key(key::A, Mods::CMD),
+        }];
+        assert_eq!(resolve_target("guardar", &own), Target::Global);
+        assert_eq!(resolve_target("lo mío", &own), Target::User);
+        assert_eq!(resolve_target("interrumpir", &own), Target::Contextual);
+        // The whole point: a name that resolves to nothing is found now,
+        // not in silence at the microphone.
+        assert_eq!(resolve_target("atras", &own), Target::Unknown);
+        assert_eq!(resolve_target("atrás", &own), Target::Global);
+        assert_eq!(resolve_target("lo mio", &own), Target::Unknown);
     }
 
     #[test]
