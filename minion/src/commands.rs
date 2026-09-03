@@ -1569,6 +1569,15 @@ mod tests {
     }
 
     #[test]
+    fn naming_the_music_opens_spotify() {
+        // "para" used to be dropped as a filler, which left "para la
+        // música" and "música" looking like the same thing.
+        launches("Minion música.", "Spotify");
+        launches("Minion la música.", "Spotify");
+        assert_eq!(decision("Minion para la música."), Decision::Run("pausar"));
+    }
+
+    #[test]
     fn short_phrases_stay_commands() {
         // "pon la música" must not become a request to type "la música".
         assert_eq!(decision("Minion pon la música."), Decision::Run("reproducir"));

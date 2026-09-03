@@ -35,11 +35,17 @@ pub fn normalise(input: &str) -> String {
 /// "cierra la ventana", "cerrar ventana" and "cierra ventana" all reduce to
 /// `[cerrar, ventana]`, which is what makes the table forgiving without
 /// listing every phrasing.
+///
+/// Verbs are canonicalised before fillers are dropped, because one word is
+/// both: "para" is a preposition and the imperative of "parar". Dropping
+/// first left "para la música" as just `[musica]`, so saying "minion,
+/// música" paused Spotify instead of opening it.
 pub fn keywords(phrase: &str) -> Vec<String> {
     phrase
         .split_whitespace()
+        .map(spanish::canonical_verb)
         .filter(|w| !spanish::is_filler(w))
-        .map(|w| spanish::canonical_verb(w).to_string())
+        .map(str::to_string)
         .collect()
 }
 
@@ -275,6 +281,8 @@ mod tests {
         assert_eq!(keywords("cierra la ventana"), vec!["cerrar", "ventana"]);
         assert_eq!(keywords("cerrar ventana"), vec!["cerrar", "ventana"]);
         assert_eq!(keywords("guarda esto"), vec!["guardar"]);
+        // "para" is a preposition and a verb; as a verb it must survive.
+        assert_eq!(keywords("para la musica"), vec!["parar", "musica"]);
     }
 
     #[test]
