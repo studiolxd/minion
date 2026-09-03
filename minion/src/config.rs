@@ -206,19 +206,31 @@ pub fn path() -> Option<PathBuf> {
     Some(PathBuf::from(home).join("Library/Application Support/Minion/config.toml"))
 }
 
-/// Sets an option inside a table, such as `[audio]`.
+/// Renders a Rust string as a valid, escaped TOML string literal, quotes
+/// included.
 ///
-/// Same care as [`set_option`]: the file is edited, not regenerated, so the
-/// comments survive. Creates the table if it is not there yet.
-pub fn set_table_option(table: &str, key: &str, value: &str) -> Result<(), String> {
-    let path = path().ok_or("no home directory")?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    let header = format!("[{table}]");
+/// Every string value written into the config file must go through this —
+/// a bare `"{value}"` breaks the moment the value contains a `"` or a `\`,
+/// which for `microphone`/`speaker` names and for aliases learned from the
+/// log is not a hypothetical. `toml::Value` already knows how to escape a
+/// string; this just borrows that.
+///
+/// Public so other writers of `config.toml` (`learn.rs`, `preferences.rs`)
+/// can adopt it too, instead of hand-quoting. Not yet called outside this
+/// module's own tests, hence the `allow`.
+#[allow(dead_code)]
+pub fn toml_string(value: &str) -> String {
+    toml::Value::String(value.to_string()).to_string()
+}
 
-    let mut lines: Vec<String> = existing.lines().map(str::to_string).collect();
+/// Sets an option inside a table, such as `[audio]`, in already-read file
+/// contents. Pure: takes and returns text, touches no file.
+///
+/// The table runs until the next `[` header, or the end of the file.
+/// Creates the table, appended at the end, if it is not there yet.
+fn with_table_option(contents: &str, table: &str, key: &str, value: &str) -> String {
+    let header = format!("[{table}]");
+    let mut lines: Vec<String> = contents.lines().map(str::to_string).collect();
     let table_at = lines.iter().position(|l| l.trim() == header);
 
     let Some(start) = table_at else {
@@ -228,7 +240,7 @@ pub fn set_table_option(table: &str, key: &str, value: &str) -> Result<(), Strin
         }
         lines.push(header);
         lines.push(format!("{key} = {value}"));
-        return std::fs::write(&path, lines.join("\n") + "\n").map_err(|e| e.to_string());
+        return lines.join("\n") + "\n";
     };
 
     // The table runs until the next header.
@@ -249,29 +261,33 @@ pub fn set_table_option(table: &str, key: &str, value: &str) -> Result<(), Strin
         Some(i) => lines[i] = format!("{key} = {value}"),
         None => lines.insert(end, format!("{key} = {value}")),
     }
-    std::fs::write(&path, lines.join("\n") + "\n").map_err(|e| e.to_string())
+    lines.join("\n") + "\n"
 }
 
-/// Sets one top-level option, preserving everything else.
+/// Sets one top-level option in already-read file contents, preserving
+/// everything else. Pure: takes and returns text, touches no file.
 ///
-/// Rewrites the line if it is there and appends it otherwise, rather than
+/// Rewrites the line if it is there and inserts it otherwise, rather than
 /// serialising the whole file back out — that would discard the comments,
-/// which are most of what makes the file worth editing by hand.
-pub fn set_option(key: &str, value: &str) -> Result<(), String> {
-    let path = path().ok_or("no home directory")?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
-
+/// which are most of what makes the file worth editing by hand. A key not
+/// already present is inserted right before the first `[table]` header, so
+/// it lands at the top level rather than inside that table; with no table
+/// in the file it goes at the end.
+fn with_option(contents: &str, key: &str, value: &str) -> String {
     let mut replaced = false;
+    let mut in_table = false;
     let mut lines: Vec<String> = Vec::new();
-    for line in existing.lines() {
-        let is_this_key = line
-            .split('=')
-            .next()
-            .is_some_and(|name| name.trim() == key);
-        // Only at the top level: a key inside a [table] means something else.
+    for line in contents.lines() {
+        if line.trim_start().starts_with('[') {
+            in_table = true;
+        }
+        // Only at the top level: a key inside a [table] means something
+        // else, and a table header ends the search for this key.
+        let is_this_key = !in_table
+            && line
+                .split('=')
+                .next()
+                .is_some_and(|name| name.trim() == key);
         if is_this_key && !replaced {
             lines.push(format!("{key} = {value}"));
             replaced = true;
@@ -288,7 +304,48 @@ pub fn set_option(key: &str, value: &str) -> Result<(), String> {
         lines.insert(insert_at, format!("{key} = {value}"));
     }
 
-    std::fs::write(&path, lines.join("\n") + "\n").map_err(|e| e.to_string())
+    lines.join("\n") + "\n"
+}
+
+/// Checks that edited contents still parse as a [`Config`], so a bug in
+/// [`with_option`] or [`with_table_option`] — or an unescaped value passed
+/// to them — cannot silently invalidate the whole file the next time it is
+/// read.
+fn parse_checked(contents: String) -> Result<String, String> {
+    toml::from_str::<Config>(&contents)
+        .map(|_| contents)
+        .map_err(|e| format!("edit would leave an unparsable config: {e}"))
+}
+
+/// Sets an option inside a table, such as `[audio]`.
+///
+/// Same care as [`set_option`]: the file is edited, not regenerated, so the
+/// comments survive. Creates the table if it is not there yet. Refuses to
+/// write if the result would not parse.
+pub fn set_table_option(table: &str, key: &str, value: &str) -> Result<(), String> {
+    let path = path().ok_or("no home directory")?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let updated = parse_checked(with_table_option(&existing, table, key, value))?;
+    std::fs::write(&path, updated).map_err(|e| e.to_string())
+}
+
+/// Sets one top-level option, preserving everything else.
+///
+/// Rewrites the line if it is there and appends it otherwise, rather than
+/// serialising the whole file back out — that would discard the comments,
+/// which are most of what makes the file worth editing by hand. Refuses to
+/// write if the result would not parse.
+pub fn set_option(key: &str, value: &str) -> Result<(), String> {
+    let path = path().ok_or("no home directory")?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let updated = parse_checked(with_option(&existing, key, value))?;
+    std::fs::write(&path, updated).map_err(|e| e.to_string())
 }
 
 /// Reads the configuration, or returns the defaults if there is no file.
@@ -466,21 +523,78 @@ mod tests {
     fn setting_an_option_keeps_the_rest_of_the_file() {
         // The comments are most of the value of a hand-edited file.
         let before = "# a note\nsounds = true\n\n[audio]\nsilence_end_ms = 900\n";
-        // Simulated here rather than touching the real file.
-        let mut lines: Vec<String> = Vec::new();
-        let mut replaced = false;
-        for line in before.lines() {
-            if line.split('=').next().is_some_and(|n| n.trim() == "sounds") && !replaced {
-                lines.push("sounds = false".into());
-                replaced = true;
-            } else {
-                lines.push(line.into());
-            }
-        }
-        let after = lines.join("\n");
+        let after = with_option(before, "sounds", "false");
         assert!(after.contains("# a note"), "comments survive");
         assert!(after.contains("sounds = false"), "the value changed");
         assert!(after.contains("silence_end_ms = 900"), "other settings survive");
+    }
+
+    #[test]
+    fn a_missing_top_level_key_is_appended_before_the_first_table() {
+        let before = "sounds = true\n\n[audio]\nsilence_end_ms = 900\n";
+        let after = with_option(before, "speak", "false");
+        let sounds_at = after.find("sounds").unwrap();
+        let speak_at = after.find("speak").unwrap();
+        let table_at = after.find("[audio]").unwrap();
+        assert!(sounds_at < speak_at, "new key comes after what was there");
+        assert!(speak_at < table_at, "new key lands before the first table");
+    }
+
+    #[test]
+    fn a_missing_top_level_key_is_appended_with_no_table_at_all() {
+        let before = "sounds = true\n";
+        let after = with_option(before, "speak", "false");
+        assert!(after.contains("sounds = true"));
+        assert!(after.contains("speak = false"));
+    }
+
+    #[test]
+    fn a_key_only_replaces_the_top_level_one_not_a_same_named_key_in_a_table() {
+        // A key inside [audio] must not be mistaken for the top-level one,
+        // and setting the top-level one must not touch the one in the table.
+        let before = "threshold = 0.7\n\n[audio]\nspeech_threshold = 0.02\n";
+        let after = with_option(before, "threshold", "0.8");
+        assert!(after.contains("threshold = 0.8"));
+        assert!(after.contains("speech_threshold = 0.02"), "table key untouched");
+        assert_eq!(after.matches("threshold").count(), 2, "no key duplicated");
+    }
+
+    #[test]
+    fn a_table_option_replaces_an_existing_key_and_creates_a_missing_table() {
+        let before = "sounds = true\n\n[audio]\nsilence_end_ms = 900\nmin_speech_ms = 300\n";
+        let after = with_table_option(before, "audio", "silence_end_ms", "700");
+        assert!(after.contains("silence_end_ms = 700"));
+        assert!(after.contains("min_speech_ms = 300"), "sibling key survives");
+        assert!(after.contains("sounds = true"), "top-level key survives");
+
+        let no_table = "sounds = true\n";
+        let created = with_table_option(no_table, "audio", "silence_end_ms", "700");
+        assert!(created.contains("[audio]"));
+        assert!(created.contains("silence_end_ms = 700"));
+    }
+
+    #[test]
+    fn a_table_key_does_not_clobber_a_same_named_key_in_another_table() {
+        let before = "[audio]\nsilence_end_ms = 900\n\n[speaker]\nsilence_end_ms = 1\n";
+        let after = with_table_option(before, "audio", "silence_end_ms", "700");
+        assert!(after.contains("[audio]"));
+        let audio_at = after.find("[audio]").unwrap();
+        let speaker_at = after.find("[speaker]").unwrap();
+        let audio_section = &after[audio_at..speaker_at];
+        assert!(audio_section.contains("silence_end_ms = 700"));
+        let speaker_section = &after[speaker_at..];
+        assert!(speaker_section.contains("silence_end_ms = 1"), "other table untouched");
+    }
+
+    #[test]
+    fn values_with_quotes_and_backslashes_are_escaped_before_writing() {
+        // A bare `"{value}"` would break on either character; toml_string
+        // must produce something that parses back to the original text.
+        let raw = "say \"hi\" \\ bye";
+        let escaped = toml_string(raw);
+        let contents = with_option("", "microphone", &escaped);
+        let parsed: toml::Value = toml::from_str(&contents).expect("escaped value must parse");
+        assert_eq!(parsed.get("microphone").and_then(|v| v.as_str()), Some(raw));
     }
 
     #[test]
