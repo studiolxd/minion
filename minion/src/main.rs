@@ -12,6 +12,7 @@ mod ai;
 mod answers;
 mod api;
 mod audio;
+mod ax;
 mod commands;
 mod config;
 mod corpus;
@@ -38,6 +39,7 @@ mod speech;
 mod startup;
 mod speaker;
 mod system;
+mod targets;
 mod text;
 mod vocabulary;
 mod vocabulary_editor;
@@ -1670,11 +1672,22 @@ enum Ran {
 /// entering dictation itself is `Outcome::DictateInto`'s caller's job, once
 /// this returns `Ok`.
 fn prepare_destination(destination: &commands::Destination, recipient: Option<&str>) -> Result<(), String> {
-    if let Some(bundle_id) = destination.bundle_id {
-        actions::open_app(bundle_id)?;
-        if !wait_for_frontmost(bundle_id, Duration::from_secs(3)) {
-            return Err(format!("{bundle_id} never came to the front"));
+    match destination.bundle_id {
+        Some(bundle_id) => {
+            actions::open_app(bundle_id)?;
+            if !wait_for_frontmost(bundle_id, Duration::from_secs(3)) {
+                return Err(format!("{bundle_id} never came to the front"));
+            }
         }
+        // «dicta aquí», «dicta en el documento»: nothing is brought
+        // forward, so the only question is where in what is already
+        // there the words will land. Best effort — an application that
+        // does not answer the Accessibility API leaves the focus exactly
+        // where dictation would have found it anyway.
+        None => match targets::focus_text_field_here() {
+            Ok(what) => note!("focus    {what}"),
+            Err(reason) => note!("focus    left where it was: {reason}"),
+        },
     }
     for (code, mods) in destination.keys_before_typing {
         actions::press(*code, *mods)?;

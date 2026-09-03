@@ -508,12 +508,20 @@ Only «dictar» — never «escribe» — also opens a destination first:
 «minion, dicta un correo a Ana»         → Mail, a new message addressed to Ana
 «minion, dicta un mensaje a Ana»        → Messages, a new message to Ana
 «minion, dicta en el documento»         → dictates into whatever is already in front
+«minion, dicta en el campo de texto»    → puts the focus in a text field first
 ```
 
 *correo* and *mensaje* take a recipient — everything after "a" — and move
 the cursor into the body once the app is ready (Mail: subject, then body;
 Messages: the suggestion is accepted, then the body). *documento* opens
 nothing; it is for an app already in front with a cursor waiting.
+
+*campo* (also *aquí*) opens nothing either, and goes one step further: if
+what has the focus is not somewhere text can go, Minion looks through the
+front window for the first text field and puts the focus there before
+dictation starts. The log says what got it — `focus    AXTextField in
+Notas`. Best effort: an application that will not answer the
+Accessibility API leaves the focus exactly where it was.
 
 ### Dictado
 

@@ -500,6 +500,23 @@ trigger = ["documento"]
 # No bundle_id: dictates into whatever is already in front.
 
 [[destinations]]
+name = "aquí"
+trigger = ["aqui"]
+# No bundle_id either — "dicta aquí" means this window, this field. With
+# nothing to bring forward, `main.rs` looks for somewhere to type first:
+# if what has the focus is not a text field, the first one in the front
+# window gets it. See `targets::focus_text_field_here`.
+#
+# A trigger is compared against the words as the recogniser wrote them,
+# accents and all, so this one only fires when it writes "aqui" plain.
+# "campo" below is the same destination by a name that has no accent to
+# lose: "dicta en el campo de texto".
+
+[[destinations]]
+name = "campo"
+trigger = ["campo"]
+
+[[destinations]]
 name = "teams"
 trigger = ["teams"]
 bundle_id = "com.microsoft.teams2"
