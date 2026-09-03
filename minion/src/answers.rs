@@ -16,8 +16,15 @@
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use chrono::{Datelike, Local, NaiveDate, NaiveTime, Timelike};
+use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use objc2_app_kit::{NSApplicationActivationPolicy, NSWorkspace};
+
+// `minion/src/reminders.rs` on disk, nested here rather than declared in
+// `main.rs` — this task does not touch that file. See the module doc
+// there for why reminders and calendar events live apart from this file's
+// otherwise-fixed `ASKED` table.
+#[path = "reminders.rs"]
+mod reminders;
 
 /// The questions Minion can answer.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,6 +54,18 @@ pub enum Question {
     ReadSelection,
     ReadClipboard,
     StopReading,
+    /// "recuérdame comprar pan" — the text, when it is due (`None` for a
+    /// plain reminder), and the phrase to name it back with.
+    Reminder(String, Option<NaiveDateTime>, Option<String>),
+    /// "añade evento X mañana a las diez" — the title, when it starts, and
+    /// the phrase to name it back with.
+    AddEvent(String, NaiveDateTime, String),
+    /// "¿qué tengo hoy?"
+    CalendarToday,
+    /// "¿qué tengo mañana?"
+    CalendarTomorrow,
+    /// "¿cuál es mi próxima reunión?"
+    NextMeeting,
 }
 
 /// Ways of asking each one.
@@ -66,6 +85,9 @@ const ASKED: &[(Question, &[&str])] = &[
     (Question::ReadSelection, &["lee esto", "lee la seleccion"]),
     (Question::ReadClipboard, &["lee el portapapeles"]),
     (Question::StopReading, &["para de leer", "deja de leer"]),
+    (Question::CalendarToday, &["que tengo hoy"]),
+    (Question::CalendarTomorrow, &["que tengo manana"]),
+    (Question::NextMeeting, &["cual es mi proxima reunion", "cual es mi siguiente reunion"]),
     (Question::Help, &["que puedes hacer", "que te puedo decir", "ayuda",
                        "que ordenes hay", "que se decir"]),
 ];
@@ -91,6 +113,16 @@ fn parse_variable(rest: &str) -> Option<Question> {
     if rest.contains("dia") && rest.contains("semana") {
         if let Some(day) = weekday_target(rest) {
             return Some(Question::Weekday(day));
+        }
+    }
+    if rest.contains("recuerda") {
+        if let Some((text, due, when)) = reminders::parse_reminder(rest, Local::now()) {
+            return Some(Question::Reminder(text, due, when));
+        }
+    }
+    if rest.contains("evento") {
+        if let Some((title, start, when)) = reminders::parse_event(rest, Local::now()) {
+            return Some(Question::AddEvent(title, start, when));
         }
     }
     None
@@ -172,6 +204,54 @@ pub fn answer(question: Question, listening: bool) -> String {
             crate::speech::stop();
             "Vale.".into()
         }
+        Question::Reminder(text, due, when) => match reminders::create_reminder(&text, due) {
+            Ok(()) => match when {
+                Some(when) => format!("Te lo recordaré {when}."),
+                None => "Vale, recordado.".into(),
+            },
+            Err(reason) => {
+                crate::journal::write(&format!("reminder BLOCKED  {reason}"));
+                "No puedo crear recordatorios; da permiso a Minion en Ajustes → Privacidad → Recordatorios.".into()
+            }
+        },
+        Question::AddEvent(title, start, when) => match reminders::create_event(&title, start) {
+            Ok(()) => format!("Evento «{title}» añadido {when}."),
+            Err(reason) => {
+                crate::journal::write(&format!("event    BLOCKED  {reason}"));
+                "No puedo crear el evento; da permiso a Minion en Ajustes → Privacidad → Calendarios.".into()
+            }
+        },
+        Question::CalendarToday => calendar_answer(reminders::events_today(Local::now()), "No tienes nada hoy."),
+        Question::CalendarTomorrow => {
+            calendar_answer(reminders::events_tomorrow(Local::now()), "No tienes nada mañana.")
+        }
+        Question::NextMeeting => match reminders::next_meeting(Local::now()) {
+            Ok(Some((when, title))) => format!("Tu próxima reunión es a {}, {title}.", spoken_clock(when.time())),
+            Ok(None) => "No tienes ninguna reunión próxima.".into(),
+            Err(reason) => {
+                crate::journal::write(&format!("calendar BLOCKED  {reason}"));
+                "No puedo leer el calendario; da permiso a Minion en Ajustes → Privacidad → Calendarios.".into()
+            }
+        },
+    }
+}
+
+/// The spoken list a day's events read as: "A las diez, reunión con Ana.
+/// A las cuatro, dentista." Or, if `osascript` could not read Calendario
+/// at all — most likely because Minion has not been granted access — the
+/// permission message, with the raw error logged for whoever reads it.
+fn calendar_answer(events: Result<Vec<(NaiveDateTime, String)>, String>, none: &str) -> String {
+    match events {
+        Ok(events) if events.is_empty() => none.into(),
+        Ok(events) => events
+            .iter()
+            .map(|(when, title)| format!("A {}, {title}.", spoken_clock(when.time())))
+            .collect::<Vec<_>>()
+            .join(" "),
+        Err(reason) => {
+            crate::journal::write(&format!("calendar BLOCKED  {reason}"));
+            "No puedo leer el calendario; da permiso a Minion en Ajustes → Privacidad → Calendarios.".into()
+        }
     }
 }
 
@@ -232,9 +312,14 @@ fn spoken_time_left(label: &str, seconds: i64) -> String {
 
 /// The time as someone would say it, not as a clock shows it.
 fn spoken_time() -> String {
-    let now = Local::now();
-    let hour = now.hour();
-    let minute = now.minute();
+    spoken_clock(Local::now().time())
+}
+
+/// [`spoken_time`], for a clock time other than right now — a calendar
+/// event's start, say, rather than the current moment.
+fn spoken_clock(time: NaiveTime) -> String {
+    let hour = time.hour();
+    let minute = time.minute();
 
     // "La una" but "las dos": the article agrees with the number.
     let hour_12 = match hour % 12 {

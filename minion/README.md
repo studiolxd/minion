@@ -53,6 +53,33 @@ portapapeles» reads whatever is already on it, «para de leer» stops
 mid-sentence. Long text is read one sentence at a time so it can actually
 be interrupted rather than only after the whole thing finishes.
 
+**Recordatorios y calendario** — «recuérdame comprar pan», «recuérdame
+llamar a Ana a las cinco», «recuérdame regar las plantas mañana a las diez»,
+«recuérdame pagar el alquiler el viernes». Understands «mañana», «pasado
+mañana», «esta tarde» (17:00) and «esta noche» (21:00) besides the usual
+clock times; a reminder with no date and no time at all is created without
+a due date. Confirms with «Te lo recordaré a las cinco» — or, for a plain
+reminder, «Vale, recordado».
+
+«¿qué tengo hoy?», «¿qué tengo mañana?» and «¿cuál es mi próxima reunión?»
+read the first five events of the day (sorted, across every calendar) as a
+spoken list: «A las diez, reunión con Ana. A las cuatro, dentista.» «añade
+evento cena con Ana mañana a las diez», «crea un evento revisión el lunes a
+las nueve y media» add a one-hour event the same way — to the first
+calendar in the list, since Calendar.app has no scriptable "default
+calendar" the way Reminders has a default list.
+
+Both talk to Recordatorios and Calendario through `osascript`, which macOS
+gates behind its own permission prompt the first time each is used —
+**Recordatorios** the first time something is remembered, **Calendarios**
+the first time an event is read or added. Grant both from *Ajustes del
+Sistema → Privacidad y seguridad*; until then, a reminder fails silently
+into the log and a calendar question answers «No puedo leer el calendario;
+da permiso a Minion en Ajustes → Privacidad → Calendarios» (or the
+Recordatorios equivalent for a reminder). Every call to `osascript` here is
+bounded to 5 seconds, so a stuck permission dialog cannot hang Minion's
+answer.
+
 It stays quiet for commands. Opening Chrome is something you can see, and
 announcing it would be noise arriving after the fact — the icon's blink
 already says it was heard. Answers are short and plain: a reply heard forty
