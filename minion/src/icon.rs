@@ -9,6 +9,8 @@
 //! whatever scale the display uses, and because the two states then differ
 //! by three lines of SVG instead of two image files.
 
+use std::sync::OnceLock;
+
 use anyhow::{anyhow, Result};
 use resvg::tiny_skia::{Pixmap, Transform};
 use resvg::usvg::{Options, Tree};
@@ -46,12 +48,27 @@ fn render(svg: &str) -> Result<Icon> {
         .map_err(|e| anyhow!("the icon will not load: {e}"))
 }
 
+/// Renders a face once and hands out copies of it afterwards.
+///
+/// The menu bar asks for a face on every state change — and the blink that
+/// acknowledges a command is three changes in half a second. Parsing the
+/// SVG and rasterising it each time is real work for a drawing that never
+/// changes; the copy is a few kilobytes of pixels. On macOS an `Icon` is
+/// just those pixels, so this is safe to keep in a static.
+fn cached(slot: &'static OnceLock<Option<Icon>>, svg: &'static str) -> Result<Icon> {
+    slot.get_or_init(|| render(svg).ok())
+        .clone()
+        .ok_or_else(|| anyhow!("the icon will not draw"))
+}
+
 pub fn awake() -> Result<Icon> {
-    render(AWAKE)
+    static AWAKE_ICON: OnceLock<Option<Icon>> = OnceLock::new();
+    cached(&AWAKE_ICON, AWAKE)
 }
 
 pub fn asleep() -> Result<Icon> {
-    render(ASLEEP)
+    static ASLEEP_ICON: OnceLock<Option<Icon>> = OnceLock::new();
+    cached(&ASLEEP_ICON, ASLEEP)
 }
 
 /// Shown briefly when a command runs.
@@ -60,7 +77,8 @@ pub fn asleep() -> Result<Icon> {
 /// acknowledgement there is no telling whether you were heard. The sounds
 /// did that job and can be turned off; this does it silently.
 pub fn acting() -> Result<Icon> {
-    render(ACTING)
+    static ACTING_ICON: OnceLock<Option<Icon>> = OnceLock::new();
+    cached(&ACTING_ICON, ACTING)
 }
 
 /// Writes the app icon at every size macOS asks for.
@@ -103,6 +121,18 @@ mod tests {
         assert!(awake().is_ok(), "the awake face should draw");
         assert!(asleep().is_ok(), "the sleeping face should draw");
         assert!(acting().is_ok(), "the acting face should draw");
+    }
+
+    #[test]
+    fn asking_for_a_face_again_still_gives_one() {
+        // The faces are rendered once and copied afterwards; a cache that
+        // hands out nothing the second time would leave the menu bar stuck
+        // on whichever face it happened to have.
+        for _ in 0..5 {
+            assert!(awake().is_ok());
+            assert!(asleep().is_ok());
+            assert!(acting().is_ok());
+        }
     }
 
     fn draw(svg: &str) -> Vec<u8> {
