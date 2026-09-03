@@ -1,14 +1,150 @@
 //! Targets named out loud.
 //!
-//! Everything else in the vocabulary is a fixed phrase: «dicta una nota»
-//! is one entry in a table, and the table is the whole of what can be
-//! said. What this module is for is different in kind — «dicta aquí»
-//! names no application and no command, it names *the thing in front of
-//! you*, which only exists on this machine, at this moment.
+//! Everything else in the vocabulary is a fixed phrase: «abre Chrome» is
+//! one entry in a table, and the table is the whole of what can be said.
+//! The commands here are different in kind — «abre la carpeta Dev»,
+//! «dicta aquí» — because the target is a name that only exists on this
+//! machine, at this moment, and no table can hold it.
 //!
-//! So the target is resolved against the machine rather than looked up:
-//! the Accessibility API (see [`crate::ax`]) for the window and the text
-//! field somebody meant.
+//! So the phrase is parsed into a *kind* and a *name*, and the name is
+//! resolved against the machine: Spotlight for files and folders (see
+//! [`crate::files`]), the Accessibility API for the text field in front
+//! of you (see [`crate::ax`]).
+//!
+//! Two things follow from that, and both are deliberate:
+//!
+//!   * the parsing is pure and tested, the resolving is not. Everything
+//!     below `parse_target` can be read as a function of its input;
+//!     everything above it asks the machine;
+//!   * resolving happens where the answer is needed, not where the phrase
+//!     is understood. [`decide`] is the exception it has to be — it looks
+//!     a name up so it can return a path to open — and the lookup is
+//!     read-only, idempotent and time-bounded, so being asked the same
+//!     question twice costs a second search and changes nothing.
+
+use crate::answers::Question;
+use crate::commands::Decision;
+use crate::files::{self, Kind};
+use crate::text::normalise;
+
+/// The words that say a folder is meant, and the ones that say a file is.
+const FOLDER_WORDS: &[&str] = &["carpeta", "directorio"];
+const FILE_WORDS: &[&str] = &["archivo", "fichero", "documento"];
+
+/// Verbs that mean "open this".
+const OPEN_VERBS: &[&str] = &["abrir", "ir", "mostrar", "ver", "traer", "buscar"];
+
+/// Words that turn a target into an existing command rather than a name:
+/// «carpeta nueva», «ventana nueva», «la otra ventana».
+const NOT_A_NAME: &[&str] = &[
+    "nueva", "nuevo", "otra", "otro", "superior", "anterior", "siguiente", "actual", "privada",
+    "incognito", "izquierda", "derecha", "arriba", "abajo", "pantalla", "esta", "ese", "esa",
+];
+
+/// What follows the marker word, as a name: the words after it, with
+/// nothing but fillers and modifiers dropped.
+///
+/// `None` when nothing usable is left — «crea una carpeta» names no
+/// folder, and «cierra la ventana» names no window.
+fn name_after(words: &[&str], marker: usize) -> Option<String> {
+    let name: Vec<&str> = words[marker + 1..]
+        .iter()
+        .copied()
+        .skip_while(|word| matches!(*word, "de" | "del" | "la" | "el" | "los" | "las" | "un" | "una"))
+        .collect();
+    if name.is_empty() || name.iter().any(|word| NOT_A_NAME.contains(word)) {
+        return None;
+    }
+    Some(name.join(" "))
+}
+
+/// Whether the sentence asks for something to be brought forward.
+fn has_verb(words: &[&str], verbs: &[&str]) -> bool {
+    words.iter().any(|word| verbs.contains(&crate::spanish::canonical_verb(word)))
+}
+
+/// «abre la carpeta Dev», «abre el archivo informe septiembre»: what kind
+/// of thing was named, and what it is called.
+///
+/// Pure. `rest` is what [`crate::commands::decide_in`] has already
+/// normalised and stripped the wake word from.
+pub fn parse_target(rest: &str) -> Option<(Kind, String)> {
+    let normalised = normalise(rest);
+    let words: Vec<&str> = normalised.split_whitespace().collect();
+    let marker = words.iter().position(|word| {
+        FOLDER_WORDS.contains(word) || FILE_WORDS.contains(word)
+    })?;
+    if !has_verb(&words, OPEN_VERBS) {
+        return None;
+    }
+    let kind = if FOLDER_WORDS.contains(&words[marker]) { Kind::Folder } else { Kind::File };
+    Some((kind, name_after(&words, marker)?))
+}
+
+/// What «abre la carpeta X» means, if the sentence says that.
+///
+/// The one thing `commands::decide_in` calls in this module: everything
+/// else here is reached through `answers.rs`.
+pub fn decide(rest: &str, _transcript: &str, _context: Option<&str>) -> Option<(Decision, f32)> {
+    let (kind, name) = parse_target(rest)?;
+    let found = files::find(&name, kind);
+    let Some(best) = found.first() else {
+        crate::journal::write(&format!("targets  «{name}»  ->  nothing on this machine"));
+        return Some((Decision::Answer(Question::NotFound(name)), 1.0));
+    };
+    crate::journal::write(&format!(
+        "targets  «{name}»  ->  {} ({} more)",
+        best.path,
+        found.len() - 1
+    ));
+    // Two things with the same name in different folders cannot be told
+    // apart from the phrase alone. There is no way to put the choice to
+    // the user from here — the machinery for that is `session.rs`'s, and
+    // it can only offer readings `commands::candidates` produced — so the
+    // best one is opened and named out loud instead of opened silently:
+    // a wrong guess is then obvious immediately rather than later.
+    if found.len() > 1 && tied(&found) {
+        return Some((Decision::Answer(Question::OpenTarget(best.path.clone())), 1.0));
+    }
+    Some((
+        Decision::Browse { url: files::file_url(&best.path), in_browser: None },
+        1.0,
+    ))
+}
+
+/// Whether the second-best answer is as good as the best one.
+///
+/// The same name, the same kind of thing, and the same distance from
+/// home: two folders both called Dev, one in Desarrollo and one in
+/// Documentos. A copy buried deeper than the other is not a tie — the
+/// nearer one is what anybody means.
+fn tied(found: &[files::Found]) -> bool {
+    match found {
+        [best, next, ..] => {
+            best.is_folder == next.is_folder
+                && normalise(&best.name) == normalise(&next.name)
+                && files::depth(&best.path) == files::depth(&next.path)
+        }
+        _ => false,
+    }
+}
+
+/// Opens a path and says which one it opened, for when there was more
+/// than one to choose from. Called by `answers.rs`.
+pub fn open_target(path: &str) -> String {
+    let name = std::path::Path::new(path)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string());
+    let home = std::env::var("HOME").unwrap_or_default();
+    match crate::actions::open_url(&files::file_url(path), None) {
+        Ok(()) => format!("Abro {name} en {}.", files::spoken_location(path, &home)),
+        Err(reason) => {
+            crate::journal::write(&format!("targets  {path} refused: {reason}"));
+            format!("No he podido abrir {name}.")
+        }
+    }
+}
 
 // ── The text field in front of you ──────────────────────────────────────
 
@@ -78,6 +214,58 @@ fn first_text_input(window: crate::ax::Element) -> Option<crate::ax::Element> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn a_folder_is_named_after_the_word_carpeta() {
+        assert_eq!(parse_target("abre la carpeta dev"), Some((Kind::Folder, "dev".to_string())));
+        assert_eq!(
+            parse_target("ve a la carpeta descargas"),
+            Some((Kind::Folder, "descargas".to_string()))
+        );
+        assert_eq!(
+            parse_target("muestrame el directorio proyectos"),
+            Some((Kind::Folder, "proyectos".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_file_is_named_after_the_word_archivo() {
+        assert_eq!(
+            parse_target("abre el archivo informe septiembre"),
+            Some((Kind::File, "informe septiembre".to_string()))
+        );
+        assert_eq!(
+            parse_target("abre el documento presupuesto"),
+            Some((Kind::File, "presupuesto".to_string()))
+        );
+    }
+
+    #[test]
+    fn what_the_table_already_answers_is_left_alone() {
+        // Every one of these is an existing command, and reading it as a
+        // name would take it away from the command that answers it.
+        assert_eq!(parse_target("crea una carpeta"), None);
+        assert_eq!(parse_target("nueva carpeta"), None);
+        assert_eq!(parse_target("sube a la carpeta superior"), None);
+    }
+
+    #[test]
+    fn nothing_the_vocabulary_already_says_is_read_as_a_target() {
+        // `commands::decide_in` asks this module last, but it asks before
+        // the table's own answer is returned, so a phrase read as a name
+        // here would be taken away from the command that owns it.
+        let vocabulary = crate::commands::vocabulary();
+        let phrases = vocabulary
+            .commands
+            .iter()
+            .flat_map(|command| command.phrases.iter())
+            .chain(vocabulary.contextual.iter().flat_map(|command| command.phrases.iter()));
+        for phrase in phrases {
+            assert_eq!(parse_target(phrase), None, "«{phrase}» is a command, not a target");
+        }
+    }
+
     #[test]
     fn dictating_here_is_a_destination_with_nothing_to_bring_forward() {
         // «dicta aquí» goes through the destination table, not through
@@ -102,5 +290,45 @@ mod tests {
             crate::commands::decide("minion dicta en el campo de texto").0,
             crate::commands::Decision::DictateInto { destination: "campo", recipient: None }
         );
+    }
+
+    #[test]
+    fn a_target_needs_a_verb_that_asks_for_it() {
+        // "la carpeta Dev" on its own is somebody talking about a folder.
+        assert_eq!(parse_target("la carpeta dev"), None);
+    }
+
+
+
+
+
+
+
+    #[test]
+    fn two_things_with_the_same_name_are_a_tie() {
+        let dev_here = files::Found {
+            path: "/Users/ana/Desarrollo/Dev".to_string(),
+            name: "Dev".to_string(),
+            is_folder: true,
+        };
+        let dev_there = files::Found {
+            path: "/Users/ana/Documentos/Dev".to_string(),
+            name: "Dev".to_string(),
+            is_folder: true,
+        };
+        let only_one = files::Found {
+            path: "/Users/ana/Desarrollo/Deveras".to_string(),
+            name: "Deveras".to_string(),
+            is_folder: true,
+        };
+        let deeper = files::Found {
+            path: "/Users/ana/Documentos/proyectos/viejos/Dev".to_string(),
+            name: "Dev".to_string(),
+            is_folder: true,
+        };
+        assert!(tied(&[dev_here.clone(), dev_there]));
+        assert!(!tied(&[dev_here.clone(), only_one]));
+        assert!(!tied(std::slice::from_ref(&dev_here)));
+        assert!(!tied(&[dev_here, deeper]), "the nearer copy wins outright");
     }
 }

@@ -1504,6 +1504,8 @@ pub fn decide_in(transcript: &str, context: Option<&str>) -> (Decision, f32) {
         }
     }
 
+    if let Some(decision) = crate::targets::decide(rest, transcript, context) { return decision; }
+
     match best {
         Some((TableHit::Command(command), score)) => (Decision::Run(command.name), score),
         Some((TableHit::Macro(macro_), score)) => (Decision::Macro(macro_), score),

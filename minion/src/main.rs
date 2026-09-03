@@ -19,6 +19,7 @@ mod corpus;
 mod dictation;
 mod enroll;
 mod fbank;
+mod files;
 mod hotkey;
 mod hud;
 mod icon;

@@ -621,6 +621,28 @@ the Web API and an OAuth token, which is a different project.
 A known command always wins over a title, so "pon la canción anterior"
 goes back one rather than searching for a song called "anterior".
 
+### Carpetas y archivos por su nombre
+
+The commands above are fixed phrases. These take a name that only exists
+on this machine, so they are looked up rather than listed:
+
+```
+«minion, abre la carpeta Dev»           → Finder, on the best match
+«minion, ve a la carpeta Descargas»     → the standard folders answer outright
+«minion, abre el archivo informe septiembre»
+«minion, abre el documento presupuesto»
+```
+
+They are found with Spotlight, scoped to your home folder, one search
+term per word — so «informe septiembre» reaches "Informe de septiembre
+2026.pdf". An exact name beats one that starts with what you said, which
+beats one that merely contains it; a folder wins when you said *carpeta*;
+and the copy nearer home wins a tie. Caches, `Library`, `node_modules`
+and the insides of application bundles are never answers. When two things
+of the same name sit equally deep, the nearer-to-hand one is opened *and
+named out loud* — «Abro Dev en Desarrollo» — so a wrong guess is obvious
+straight away. Nothing found: «No encuentro Dev».
+
 ## The log
 
 `~/Library/Logs/minion.log` records every utterance it heard and what it

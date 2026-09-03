@@ -68,6 +68,13 @@ pub enum Question {
     CalendarTomorrow,
     /// "¿cuál es mi próxima reunión?"
     NextMeeting,
+    /// "abre la carpeta Dev" when more than one thing on the machine
+    /// answers to that name: the path of the best of them. Opened and
+    /// named out loud, since the choice cannot be put to the user from
+    /// here — see `targets::decide`.
+    OpenTarget(String),
+    /// Nothing on this machine answers to the name that was said.
+    NotFound(String),
 }
 
 /// Ways of asking each one.
@@ -236,6 +243,8 @@ pub fn answer(question: Question, listening: bool) -> String {
         Question::CalendarTomorrow => {
             calendar_answer(reminders::events_tomorrow(Local::now()), "No tienes nada mañana.")
         }
+        Question::OpenTarget(path) => crate::targets::open_target(&path),
+        Question::NotFound(name) => format!("No encuentro {name}."),
         Question::NextMeeting => match reminders::next_meeting(Local::now()) {
             Ok(Some((when, title))) => format!("Tu próxima reunión es a {}, {title}.", spoken_clock(when.time())),
             Ok(None) => "No tienes ninguna reunión próxima.".into(),
