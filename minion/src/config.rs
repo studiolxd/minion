@@ -508,10 +508,9 @@ pub fn problem() -> Option<String> {
     let contents = std::fs::read_to_string(&file).ok()?;
     toml::from_str::<Config>(&contents).err().map(|e| {
         let reason = e.message().to_string();
-        let line = e.span().and_then(|span| {
-            let at = contents[..span.start.min(contents.len())].matches('\n').count() + 1;
-            Some(at)
-        });
+        let line = e
+            .span()
+            .map(|span| contents[..span.start.min(contents.len())].matches('\n').count() + 1);
         match line {
             Some(line) => format!("línea {line}: {reason}"),
             None => reason,

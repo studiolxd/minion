@@ -254,7 +254,7 @@ mod tests {
         // The alias is stored without «minion»; the log line has it. The
         // two must still be recognised as the same phrase, or the lesson
         // is offered again on every run.
-        let known = vec![without_wake_word("Minion. Deshacer.")];
+        let known = [without_wake_word("Minion. Deshacer.")];
         assert!(known.contains(&without_wake_word("Minion deshacer")));
         assert!(!known.contains(&without_wake_word("Minion rehacer")));
     }
