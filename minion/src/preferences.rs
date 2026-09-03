@@ -1023,7 +1023,10 @@ impl Preferences {
         if self.cancel_train.clicked() {
             self.cancel_requested.set(true);
             self.cancel_train.control.setHidden(true);
-            self.show_training("Entrenamiento cancelado.", true);
+            // Not through `show_training`: a cancelled session leaves the
+            // button saying «Entrenar mi voz», since nothing was learned.
+            self.train_status
+                .setStringValue(&NSString::from_str("Entrenamiento cancelado."));
         }
         if self.forget.clicked() {
             self.forget_voice();
@@ -1236,6 +1239,13 @@ fn install_main_menu(mtm: MainThreadMarker) {
     ];
 
     let bar = NSMenu::new(mtm);
+    // AppKit treats the first submenu as the application menu whatever is
+    // in it, so an empty one goes first and the real menus keep their
+    // names — an accessory application never draws them, but the key
+    // equivalents are searched in every menu, including this one.
+    let application = NSMenuItem::new(mtm);
+    application.setSubmenu(Some(&NSMenu::new(mtm)));
+    bar.addItem(&application);
     for (title, items) in sections {
         let menu = NSMenu::initWithTitle(mtm.alloc(), &NSString::from_str(title));
         for (name, action, key, tag) in items {
