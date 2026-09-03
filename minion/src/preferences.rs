@@ -887,6 +887,14 @@ impl Preferences {
         self.window.orderFrontRegardless();
     }
 
+    /// Whether the window is on screen right now.
+    ///
+    /// Lets the run loop timer tell "nobody is looking" from "a slider
+    /// might be moving", without keeping its own copy of that state.
+    pub fn is_visible(&self) -> bool {
+        self.window.isVisible()
+    }
+
     /// Whether a text field is being typed into right now.
     ///
     /// A field under the cursor owns the window's field editor; when the

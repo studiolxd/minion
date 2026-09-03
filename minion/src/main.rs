@@ -103,6 +103,14 @@ const BLINK_SECONDS: f64 = 0.45;
 /// what makes the preferences window feel like a window rather than a form.
 const UI_REFRESH_SECONDS: f64 = 0.05;
 
+/// How many ticks of the UI timer make up one check, while nobody is
+/// looking at the settings window and no blink is pending.
+///
+/// Five ticks of 50 ms is 250 ms — quick enough that a menu toggle still
+/// repaints promptly, slow enough that an idle Minion is not doing the
+/// full repaint eighteen times a second for no one.
+const UI_THROTTLE_TICKS: u32 = 5;
+
 /// How often the recognition loop wakes up between utterances.
 ///
 /// Short, because this is also how quickly it notices that someone has
@@ -958,6 +966,9 @@ fn run_menu_bar(
     // independently of each other.
     let request_check_ticks: Cell<u32> = Cell::new(0);
     let request_check_period = ticks_per_second(UI_REFRESH_SECONDS);
+    // Its own counter, independent of the one above: the two gates run on
+    // different periods and neither should have to know the other exists.
+    let throttle_ticks: Cell<u32> = Cell::new(0);
     let repaint = RcBlock::new(move |_timer: NonNull<NSTimer>| {
         // A second copy that lost the single-instance lock left this
         // instead of opening a window of its own — see
@@ -973,6 +984,19 @@ fn run_menu_bar(
                     open_for_timer.store(true, Ordering::Relaxed);
                 }
             }
+        }
+
+        // The rest of this closure is the expensive part: reading every
+        // control, deciding the menu bar's face, repainting it. Worth doing
+        // at full speed while a slider might be moving or the blink that
+        // acknowledges a command is still showing; otherwise it is work
+        // nobody can see, so it only runs often enough that a menu toggle
+        // still repaints promptly.
+        let throttle_tick = throttle_ticks.get().wrapping_add(1);
+        throttle_ticks.set(throttle_tick);
+        let watched = panel_for_timer.is_visible() || blink_until.get().is_some();
+        if !watched && !on_schedule(throttle_tick, UI_THROTTLE_TICKS) {
+            return;
         }
 
         if open_for_timer.swap(false, Ordering::Relaxed) {
@@ -1122,6 +1146,10 @@ fn run_menu_bar(
     let timer = unsafe {
         NSTimer::timerWithTimeInterval_repeats_block(UI_REFRESH_SECONDS, true, &repaint)
     };
+    // Lets AppKit coalesce this timer's firing with others rather than
+    // waking the process for it alone — the tick counters above already
+    // mean most firings do nothing, so exactness buys nothing here.
+    timer.setTolerance(0.02);
     unsafe {
         NSRunLoop::currentRunLoop().addTimer_forMode(&timer, NSRunLoopCommonModes);
     }
