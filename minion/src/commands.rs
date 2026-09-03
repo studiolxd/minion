@@ -148,7 +148,10 @@ pub struct App {
 pub const APPS: &[App] = &[
     App { name: "Chrome", bundle_id: "com.google.Chrome",
           aliases: &["chrome", "crome", "cromo", "el navegador", "navegador"] },
-    App { name: "Safari", bundle_id: "com.apple.Safari", aliases: &["safari"] },
+    // "shafari", "safaris", "safaria": what the recogniser writes when the
+    // word is said quickly. Cheaper and safer than loosening the matcher.
+    App { name: "Safari", bundle_id: "com.apple.Safari",
+          aliases: &["safari", "shafari", "safaris", "safaria", "el safari"] },
     App { name: "Terminal", bundle_id: "com.apple.Terminal",
           aliases: &["terminal", "la terminal", "consola"] },
     App { name: "Orca", bundle_id: "com.stablyai.orca",
@@ -502,9 +505,34 @@ fn sounds_like_wake_word(word: &str) -> bool {
 }
 
 /// Strips the wake word. Returns `None` if the sentence is not a command.
+///
+/// Handles the wake word arriving as two words. The recogniser splits
+/// "Minion" into "Mini on" often enough to matter, and the stray half then
+/// sits at the front of the command and stops it matching anything.
 fn strip_wake_word(phrase: &str) -> Option<&str> {
-    let first = phrase.split_whitespace().next()?;
-    sounds_like_wake_word(first).then(|| phrase[first.len()..].trim())
+    let mut words = phrase.split_whitespace();
+    let first = words.next()?;
+    if !sounds_like_wake_word(first) {
+        return None;
+    }
+    let rest = phrase[first.len()..].trim();
+
+    // If the first word was only part of the wake word, the next one may
+    // be the remainder rather than the start of the command.
+    let Some(second) = words.next() else {
+        return Some(rest);
+    };
+    let joined = format!("{first}{second}");
+    let split_wake = wake_words()
+        .iter()
+        .any(|wake| joined == *wake || crate::text::edits_between(&joined, wake) <= 1);
+
+    // Only when joining actually produces the wake word: "mini on" does,
+    // "minion abre" does not.
+    if split_wake {
+        return Some(rest[second.len()..].trim());
+    }
+    Some(rest)
 }
 
 /// Reads "otra vez", "repite", "hazlo tres veces" and the like.
@@ -1126,6 +1154,22 @@ mod tests {
                 "«{spoken}» should be taken as a command"
             );
         }
+    }
+
+    #[test]
+    fn the_wake_word_survives_being_split_in_two() {
+        // From the log: "Minion Safari" came back as "Mini on so fuddy",
+        // and the stray "on" sat at the front of the command.
+        assert_eq!(decide("Mini on abre Chrome").0, decide("Minion abre Chrome").0);
+        assert_eq!(decide("mini on guarda esto").0, Decision::Run("guardar"));
+    }
+
+    #[test]
+    fn a_real_second_word_is_not_eaten() {
+        // Joining only happens when it produces the wake word. "minion
+        // abre" must keep its verb.
+        assert_eq!(decide("minion abre chrome").0, decide("minion chrome").0);
+        assert_eq!(decide("minion guarda esto").0, Decision::Run("guardar"));
     }
 
     #[test]
