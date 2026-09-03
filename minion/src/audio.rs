@@ -46,6 +46,11 @@ pub struct Settings {
     /// Below this it is a noise, not an utterance.
     pub min_speech_ms: usize,
     /// Safety cut so a continuous noise cannot accumulate forever.
+    ///
+    /// It also sets the largest tensor the encoder ever sees, and ONNX
+    /// Runtime's arena grows to the longest utterance of a session and
+    /// stays there. Eight seconds is longer than any command anyone
+    /// speaks and keeps that ceiling well below where twelve put it.
     pub max_utterance_ms: usize,
 }
 
@@ -55,7 +60,7 @@ impl Default for Settings {
             speech_threshold: 0.015,
             silence_end_ms: 700,
             min_speech_ms: 300,
-            max_utterance_ms: 12_000,
+            max_utterance_ms: 8_000,
         }
     }
 }
