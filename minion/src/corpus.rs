@@ -282,6 +282,10 @@ fn describe(decision: &Decision) -> String {
         Decision::Again(times) => format!("otra vez ×{times}"),
         Decision::Numbered { name, number, .. } => format!("{name} {number}"),
         Decision::StartDictation => "empezar a dictar".to_string(),
+        Decision::DictateInto { destination, recipient } => match recipient {
+            Some(recipient) => format!("dictar en {destination} a {recipient}"),
+            None => format!("dictar en {destination}"),
+        },
         Decision::StopDictation => "dejar de dictar".to_string(),
         Decision::UndoLast => "deshacer".to_string(),
         Decision::Answer(question) => format!("responder {question:?}"),

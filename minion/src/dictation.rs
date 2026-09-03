@@ -48,6 +48,50 @@ fn word_atom(text: String) -> Atom {
     Atom { text, glue_before: false, no_space_after: false }
 }
 
+/// Replaces runs of `words` matching a `[[dictation_words]]` entry with
+/// what it says to type instead, greedily and longest-match-first. Shared
+/// by [`Transformer::apply_vocabulary`] and [`spell_recipient`], since a
+/// spoken recipient's name goes through the same personal vocabulary as
+/// anything else that is dictated.
+fn substitute_words(words: &[&str], vocabulary: &[(Vec<String>, String)]) -> Vec<Tok> {
+    let normalised: Vec<String> = words.iter().map(|w| text::normalise(w)).collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < words.len() {
+        let matched = vocabulary.iter().find(|(heard, _)| {
+            let len = heard.len();
+            i + len <= normalised.len() && normalised[i..i + len] == heard[..]
+        });
+        match matched {
+            Some((heard, written)) => {
+                out.push(Tok::Literal(written.clone()));
+                i += heard.len();
+            }
+            None => {
+                out.push(Tok::Word(words[i].to_string()));
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Rewrites a spoken recipient's name through `[[dictation_words]]`, the
+/// same substitution ordinary dictation applies, so «Ana Pérez» arrives in
+/// the To field spelled as configured rather than however the recogniser
+/// wrote it.
+pub fn spell_recipient(name: &str, config: &Config) -> String {
+    let vocabulary = config.dictation_words();
+    let words: Vec<&str> = name.split_whitespace().collect();
+    substitute_words(&words, &vocabulary)
+        .into_iter()
+        .map(|tok| match tok {
+            Tok::Word(w) | Tok::Literal(w) => w,
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Turns spoken Spanish into typed text: punctuation words become signs,
 /// sentences get their capitals, and a personal vocabulary fixes names the
 /// recogniser cannot spell.
@@ -185,26 +229,7 @@ impl Transformer {
     /// the whole point being that "mir angel sufire" must not stop at
     /// matching just "mir" if a longer entry also fits.
     fn apply_vocabulary(&self, words: &[&str]) -> Vec<Tok> {
-        let normalised: Vec<String> = words.iter().map(|w| text::normalise(w)).collect();
-        let mut out = Vec::new();
-        let mut i = 0;
-        while i < words.len() {
-            let matched = self.vocabulary.iter().find(|(heard, _)| {
-                let len = heard.len();
-                i + len <= normalised.len() && normalised[i..i + len] == heard[..]
-            });
-            match matched {
-                Some((heard, written)) => {
-                    out.push(Tok::Literal(written.clone()));
-                    i += heard.len();
-                }
-                None => {
-                    out.push(Tok::Word(words[i].to_string()));
-                    i += 1;
-                }
-            }
-        }
-        out
+        substitute_words(words, &self.vocabulary)
     }
 
     /// Interprets a token stream: spoken punctuation, the «literal» escape,

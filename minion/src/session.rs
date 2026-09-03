@@ -38,6 +38,13 @@ pub enum Undoable {
 pub enum Outcome {
     /// Dictation has just begun.
     EnterDictation,
+    /// «dicta …»: the named destination should be brought forward, its
+    /// recipient (if any) typed, and dictation started once that succeeds.
+    /// Naming IO — launching an app, waiting for it, typing into it — that
+    /// `Session` itself does not do, unlike `EnterDictation`: dictation
+    /// only actually begins once `main.rs` calls back
+    /// [`Session::confirm_dictation`] to say the destination is ready.
+    DictateInto { destination: &'static str, recipient: Option<String> },
     /// Dictation has just ended.
     LeaveDictation,
     /// «deja de dictar» said while not dictating.
@@ -338,6 +345,9 @@ impl Session {
             Decision::StopDictation => return Outcome::NotDictating,
             Decision::Answer(question) => return Outcome::Answer(question),
             Decision::UndoLast => return Outcome::Undo(self.undoable.take()),
+            Decision::DictateInto { destination, recipient } => {
+                return Outcome::DictateInto { destination, recipient };
+            }
             _ => {}
         }
 
@@ -575,6 +585,16 @@ impl Session {
 
     pub fn forget_undo(&mut self) {
         self.undoable = None;
+    }
+
+    /// Confirms that an `Outcome::DictateInto` destination is ready — its
+    /// application is frontmost and the recipient, if any, has been typed —
+    /// so dictation itself may begin. `main.rs` calls this after doing that
+    /// IO; `interpret` never sets `dictating` for `DictateInto` itself,
+    /// since a destination that never came to the front must not silently
+    /// start typing into whatever else is in front instead.
+    pub fn confirm_dictation(&mut self) {
+        self.dictating = true;
     }
 
     /// Splits an utterance into the instructions it holds.
@@ -911,6 +931,35 @@ mod tests {
             say(&mut session, "minion abre Chrome").as_slice(),
             [Outcome::Perform { .. }]
         ));
+    }
+
+    #[test]
+    fn dictate_into_does_not_enter_dictation_before_confirmed() {
+        let mut session = Session::new();
+        assert_eq!(
+            say(&mut session, "minion dicta una nota"),
+            vec![Outcome::DictateInto { destination: "nota", recipient: None }]
+        );
+        // The destination has not been confirmed ready yet: an ordinary
+        // command right after is still an order, not dictated text.
+        assert!(matches!(
+            say(&mut session, "minion abre Chrome").as_slice(),
+            [Outcome::Perform { .. }]
+        ));
+    }
+
+    #[test]
+    fn dictate_into_enters_dictation_once_confirmed() {
+        let mut session = Session::new();
+        say(&mut session, "minion dicta una nota");
+        session.confirm_dictation();
+        // Only now does a plain sentence become dictated text rather than
+        // an order — the same behaviour `StartDictation` gives, just
+        // delayed until the caller says the destination is ready.
+        assert_eq!(
+            say(&mut session, "minion abre Chrome"),
+            vec![Outcome::Type("minion abre Chrome".to_string())]
+        );
     }
 
     #[test]

@@ -68,6 +68,17 @@
 #   name = "gmail"                   # said on its own, after an opening verb
 #   url = "https://mail.google.com"
 #
+#   [[destinations]]
+#   name = "nota"                             # stable identifier, shown in the log
+#   trigger = ["nota"]                        # words «dicta …» must contain to pick this one
+#   bundle_id = "com.apple.Notes"             # brought forward first; absent means whatever is already there
+#   keys_before_typing = ["cmd-n"]            # pressed once frontmost, before anything is typed
+#   takes_recipient = false                   # true reads a name after «a» and types it first
+#   keys_after_recipient = []                 # pressed after the recipient, to reach the body
+#
+#     What "minion dicta …" opens before dictation begins. Only the verb
+#     "dictar" is read this way — "escribe …" still types literally.
+#
 # A phrase claimed by two different commands is reported in the log at
 # startup, and the later one keeps it.
 
@@ -452,3 +463,38 @@ name = "obtener información"
 phrases = ["muestra la información", "información"]
 keys = "cmd-i"
 bundles = ["com.apple.finder"]
+
+# ── Dictating into a destination ────────────────────────────────────────
+#
+# "minion, dicta …" — opens the destination, gets it ready, then dictation
+# begins. See `commands::dictate_into`.
+
+[[destinations]]
+name = "nota"
+trigger = ["nota"]
+bundle_id = "com.apple.Notes"
+keys_before_typing = ["cmd-n"]
+
+[[destinations]]
+name = "correo"
+trigger = ["correo"]
+bundle_id = "com.apple.mail"
+keys_before_typing = ["cmd-n"]
+takes_recipient = true
+# Send field, then Subject, then the body — verified against Mail's own
+# tab order in a new message window.
+keys_after_recipient = ["tab", "tab"]
+
+[[destinations]]
+name = "mensaje"
+trigger = ["mensaje"]
+bundle_id = "com.apple.MobileSMS"
+keys_before_typing = ["cmd-n"]
+takes_recipient = true
+# Accepts the recipient from the suggestion list and moves to the body.
+keys_after_recipient = ["enter"]
+
+[[destinations]]
+name = "documento"
+trigger = ["documento"]
+# No bundle_id: dictates into whatever is already in front.

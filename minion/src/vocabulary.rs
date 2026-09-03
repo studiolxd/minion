@@ -28,8 +28,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::actions;
-use crate::commands::{Action, App, Command, ContextualCommand, Site};
+use crate::actions::{self, Mods};
+use crate::commands::{Action, App, Command, ContextualCommand, Destination, Site};
 use crate::config::Config;
 use crate::system;
 use crate::text::normalise;
@@ -103,6 +103,8 @@ struct VocabularyFile {
     commands: Vec<CommandEntry>,
     #[serde(default)]
     sites: Vec<SiteEntry>,
+    #[serde(default)]
+    destinations: Vec<DestinationEntry>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -147,6 +149,29 @@ struct SiteEntry {
     url: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DestinationEntry {
+    /// Stable identifier, shown in the log.
+    name: String,
+    /// Words that must all appear in what follows «dicta» to pick this
+    /// destination.
+    trigger: Vec<String>,
+    /// The application to bring forward first. Absent means whatever is
+    /// already in front — "dicta en el documento".
+    bundle_id: Option<String>,
+    #[serde(default)]
+    takes_recipient: bool,
+    /// Shortcuts pressed once the application is frontmost, before
+    /// anything is typed, written the same way `keys` is.
+    #[serde(default)]
+    keys_before_typing: Vec<String>,
+    /// Shortcuts pressed after the recipient has been typed, to reach the
+    /// body.
+    #[serde(default)]
+    keys_after_recipient: Vec<String>,
+}
+
 /// Everything that can be said, merged and ready to match against.
 #[derive(Default)]
 pub struct Vocabulary {
@@ -156,6 +181,8 @@ pub struct Vocabulary {
     /// Commands that only exist inside particular applications.
     pub contextual: Vec<ContextualCommand>,
     pub sites: Vec<Site>,
+    /// Where «dicta …» can send what follows.
+    pub destinations: Vec<Destination>,
 }
 
 /// Where downloaded or hand-written packs live.
@@ -271,6 +298,9 @@ impl Vocabulary {
         for site in file.sites {
             self.add_site(site, category);
         }
+        for destination in file.destinations {
+            self.add_destination(destination, source);
+        }
     }
 
     /// Merges every `*.toml` under a directory, including subdirectories —
@@ -346,6 +376,11 @@ impl Vocabulary {
             category,
         };
         replace_or_push(&mut self.sites, site, |s| s.name);
+    }
+
+    fn add_destination(&mut self, entry: DestinationEntry, source: &str) {
+        let Some(destination) = read_destination(entry, source) else { return };
+        replace_or_push(&mut self.destinations, destination, |d| d.name);
     }
 
     /// Reports every phrase claimed by more than one command, and lets the
@@ -489,6 +524,41 @@ fn read_action(entry: &CommandEntry, source: &str) -> Option<Action> {
             None
         }
     }
+}
+
+/// Reads a `[[destinations]]` entry into a [`Destination`], or reports why
+/// it could not and drops it — one bad entry must not cost the rest of the
+/// file.
+fn read_destination(entry: DestinationEntry, source: &str) -> Option<Destination> {
+    let name = &entry.name;
+    if entry.trigger.is_empty() {
+        crate::note!("Ignoring destination «{name}» in {source}: it has no trigger words");
+        return None;
+    }
+    let parse_keys = |field: &str, keys: &[String]| -> Option<Vec<(u16, Mods)>> {
+        keys.iter()
+            .map(|k| {
+                actions::parse_shortcut(k).or_else(|| {
+                    crate::note!(
+                        "Ignoring destination «{name}» in {source}: cannot read the shortcut \
+                         «{k}» in {field}"
+                    );
+                    None
+                })
+            })
+            .collect()
+    };
+    let before = parse_keys("keys_before_typing", &entry.keys_before_typing)?;
+    let after = parse_keys("keys_after_recipient", &entry.keys_after_recipient)?;
+
+    Some(Destination {
+        name: leak(entry.name.clone()),
+        trigger: leak_all(entry.trigger.iter().map(|t| normalise(t)).collect()),
+        bundle_id: entry.bundle_id.map(leak),
+        takes_recipient: entry.takes_recipient,
+        keys_before_typing: Box::leak(before.into_boxed_slice()),
+        keys_after_recipient: Box::leak(after.into_boxed_slice()),
+    })
 }
 
 #[cfg(test)]
