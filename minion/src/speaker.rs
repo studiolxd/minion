@@ -9,10 +9,19 @@
 //! The model is ECAPA-TDNN from wespeaker: 24 MB, 192 numbers per voice.
 //! Two recordings of the same person score high against each other and low
 //! against anyone else; the threshold decides where the line falls.
+//!
+//! There can be more than one voice. Each enrolled person is a file in
+//! `voices/`, named after them, and every utterance is compared against all
+//! of them: the best score above the threshold decides who is speaking, and
+//! the log says the name. Nobody above it is a stranger, as before. There
+//! are no permissions attached to a name — whoever Minion recognises may do
+//! everything — so the name is for the log, for «¿quién soy?» and for
+//! forgetting one voice without forgetting the rest.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use anyhow::{anyhow, Context, Result};
 use ort::session::Session;
@@ -142,10 +151,59 @@ pub fn similarity(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
-/// Where the enrolled voice is kept.
-pub fn profile_path() -> Option<PathBuf> {
+/// An enrolled person: a name and the voice behind it.
+#[derive(Clone, Debug)]
+pub struct Profile {
+    pub name: String,
+    pub voice: Embedding,
+}
+
+/// The name a nameless profile gets — the one migrated from `voice.txt` on
+/// a machine whose config never said who its owner was.
+pub const DEFAULT_NAME: &str = "yo";
+
+/// Where Minion keeps everything of its own.
+fn support_dir() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join("Library/Application Support/Minion/voice.txt"))
+    Some(PathBuf::from(home).join("Library/Application Support/Minion"))
+}
+
+/// Where the enrolled voices are kept, one file per person.
+pub fn voices_dir() -> Option<PathBuf> {
+    Some(support_dir()?.join("voices"))
+}
+
+/// The single profile of the versions before names existed.
+///
+/// Still read once, to be copied into `voices/`; never written again.
+pub fn legacy_profile_path() -> Option<PathBuf> {
+    Some(support_dir()?.join("voice.txt"))
+}
+
+/// A name reduced to something safe to use as a file name.
+///
+/// Typed by hand into the settings window, so it cannot be trusted to stay
+/// inside the directory: a slash or a `..` would write the profile
+/// somewhere else entirely. Accents stay — «Begoña» is a name, and the file
+/// stem is what is shown back and said aloud.
+pub fn tidy_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| if c.is_control() || "/\\:".contains(c) { ' ' } else { c })
+        .collect();
+    // A word of nothing but dots is «.» or «..», which name a directory
+    // rather than a person; the separators are already gone, but a name
+    // that is only dots would still be a file nobody meant to write.
+    let cleaned = cleaned
+        .split_whitespace()
+        .filter(|word| !word.chars().all(|c| c == '.'))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if cleaned.is_empty() {
+        DEFAULT_NAME.to_string()
+    } else {
+        cleaned.chars().take(40).collect()
+    }
 }
 
 /// Identifies the model a profile was made with.
@@ -159,13 +217,13 @@ fn model_fingerprint(model_dir: &str) -> Option<u64> {
     fs::metadata(path).ok().map(|m| m.len())
 }
 
-/// Reads the enrolled voice, if there is one made with this model.
+/// Reads one profile file, checking it was made with this model.
 ///
 /// A profile from another model is ignored rather than used, and says so:
-/// silently failing to recognise someone is the worse outcome.
-pub fn load_profile_for(model_dir: &str) -> Option<Embedding> {
-    let contents = fs::read_to_string(profile_path()?).ok()?;
-
+/// silently failing to recognise someone is the worse outcome. `current`
+/// is the fingerprint of the model in use, or `None` when it cannot be
+/// read — in which case whatever is stored is trusted.
+fn parse_profile(contents: &str, current: Option<u64>, name: &str) -> Option<Embedding> {
     let mut lines = contents.lines();
     let first = lines.next()?;
     let (stored_model, numbers) = match first.strip_prefix("# model ") {
@@ -174,12 +232,12 @@ pub fn load_profile_for(model_dir: &str) -> Option<Embedding> {
         None => (None, first),
     };
 
-    if let (Some(stored), Some(current)) = (stored_model, model_fingerprint(model_dir)) {
+    if let (Some(stored), Some(current)) = (stored_model, current) {
         if stored != current {
-            crate::journal::write(
-                "The stored voice was made with a different speech model and no \
-                 longer applies. Train it again from Preferences.",
-            );
+            crate::journal::write(&format!(
+                "The stored voice «{name}» was made with a different speech model \
+                 and no longer applies. Train it again from Preferences."
+            ));
             return None;
         }
     }
@@ -191,41 +249,171 @@ pub fn load_profile_for(model_dir: &str) -> Option<Embedding> {
     (!values.is_empty()).then_some(values)
 }
 
-/// Whether a voice has been enrolled at all, whatever model made it.
-pub fn has_profile() -> bool {
-    profile_path().is_some_and(|path| path.exists())
+/// Reads every profile in a directory, in a settled order.
+///
+/// Sorted by name so two voices that score exactly alike are always
+/// resolved the same way, and so the settings window lists them the same
+/// way twice running.
+fn read_profiles_in(dir: &Path, current: Option<u64>) -> Vec<Profile> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut profiles: Vec<Profile> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|e| e == "txt"))
+        .filter_map(|path| {
+            let name = path.file_stem()?.to_string_lossy().into_owned();
+            let contents = fs::read_to_string(&path).ok()?;
+            let voice = parse_profile(&contents, current, &name)?;
+            Some(Profile { name, voice })
+        })
+        .collect();
+    profiles.sort_by(|a, b| a.name.cmp(&b.name));
+    profiles
 }
 
-/// Stores an enrolled voice, noting which model made it.
+/// Copies a lone `voice.txt` into `voices/` the first time this runs.
 ///
-/// Does nothing under test. The profile belongs to whoever is running
-/// Minion, and a test run wrote one made of arithmetic — which would have
-/// left the machine refusing to listen to its owner.
-///
-/// Kept outside the application bundle on purpose, so reinstalling does
-/// not lose it.
-pub fn save_profile_for(model_dir: &str, embedding: &[f32]) -> Result<()> {
-    if cfg!(test) {
-        return Ok(());
+/// A copy rather than a move: a version of Minion that has not learned
+/// about names yet may still be on the machine, and losing the voice
+/// profile costs five spoken sentences to get back. Does nothing once
+/// there is anything in `voices/`, so a forgotten profile stays forgotten.
+fn migrate_legacy_in(root: &Path, name: &str) -> Option<PathBuf> {
+    let voices = root.join("voices");
+    if !read_profiles_in(&voices, None).is_empty() {
+        return None;
     }
-    let path = profile_path().ok_or_else(|| anyhow!("no home directory"))?;
+    let legacy = root.join("voice.txt");
+    let contents = fs::read_to_string(&legacy).ok()?;
+    let destination = voices.join(format!("{}.txt", tidy_name(name)));
+    write_profile(&destination, &contents).ok()?;
+    crate::journal::write(&format!(
+        "voice profile migrated to {} (the original is kept)",
+        destination.display()
+    ));
+    Some(destination)
+}
+
+/// Every enrolled voice, migrating the old single profile if need be.
+pub fn load_profiles_for(model_dir: &str) -> Vec<Profile> {
+    let Some(root) = support_dir() else {
+        return Vec::new();
+    };
+    // Migration writes, and a test run must not touch the real profile.
+    if !cfg!(test) {
+        migrate_legacy_in(&root, &crate::config::load().voice_name());
+    }
+    read_profiles_in(&root.join("voices"), model_fingerprint(model_dir))
+}
+
+/// The names enrolled, whatever model made them. For the settings window.
+pub fn profile_names() -> Vec<String> {
+    voices_dir()
+        .map(|dir| {
+            read_profiles_in(&dir, None)
+                .into_iter()
+                .map(|profile| profile.name)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Writes a profile file, private to its owner, creating the directory.
+fn write_profile(path: &Path, contents: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
-        // The voice profile identifies the owner; the directory holding it
-        // should not be readable by other accounts on the machine.
+        // The voice profiles identify the people who use this machine; the
+        // directory holding them should not be readable by other accounts.
         let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
     }
+    fs::write(path, contents).with_context(|| format!("writing {}", path.display()))?;
+    // A biometric embedding, even a lossy one, is worth keeping private.
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("setting permissions on {}", path.display()))?;
+    Ok(())
+}
+
+/// The file a profile is written as: the model that made it, then the
+/// numbers.
+fn profile_contents(model_dir: &str, embedding: &[f32]) -> String {
     let numbers: Vec<String> = embedding.iter().map(|v| format!("{v:.6}")).collect();
     let mut contents = String::new();
     if let Some(fingerprint) = model_fingerprint(model_dir) {
         contents.push_str(&format!("# model {fingerprint}\n"));
     }
     contents.push_str(&numbers.join(" "));
-    fs::write(&path, contents).with_context(|| format!("writing {}", path.display()))?;
-    // A biometric embedding, even a lossy one, is worth keeping private.
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("setting permissions on {}", path.display()))?;
+    contents
+}
+
+/// Stores an enrolled voice under a name, noting which model made it.
+///
+/// Does nothing under test. The profiles belong to whoever is running
+/// Minion, and a test run wrote one made of arithmetic — which would have
+/// left the machine refusing to listen to its owner.
+///
+/// Kept outside the application bundle on purpose, so reinstalling does
+/// not lose it.
+pub fn save_profile_for(model_dir: &str, name: &str, embedding: &[f32]) -> Result<()> {
+    if cfg!(test) {
+        return Ok(());
+    }
+    let dir = voices_dir().ok_or_else(|| anyhow!("no home directory"))?;
+    let path = dir.join(format!("{}.txt", tidy_name(name)));
+    write_profile(&path, &profile_contents(model_dir, embedding))
+}
+
+/// Deletes one enrolled voice, leaving the others alone.
+///
+/// The old single `voice.txt` goes with it when it is the copy this
+/// profile was migrated from, or forgetting a voice would leave Minion
+/// still obeying it after a downgrade.
+pub fn forget_profile(name: &str) -> std::io::Result<()> {
+    let Some(dir) = voices_dir() else {
+        return Err(std::io::Error::other("no home directory"));
+    };
+    let path = dir.join(format!("{}.txt", tidy_name(name)));
+    fs::remove_file(&path)?;
+    if read_profiles_in(&dir, None).is_empty() {
+        if let Some(legacy) = legacy_profile_path() {
+            let _ = fs::remove_file(legacy);
+        }
+    }
     Ok(())
+}
+
+/// Whose voice this sounds most like, and how much.
+///
+/// Every profile is compared and the best wins; the caller decides whether
+/// it is close enough. Ties keep the first, and profiles arrive sorted by
+/// name, so the same two voices always resolve the same way.
+pub fn best_match<'a>(profiles: &'a [Profile], heard: &[f32]) -> Option<(&'a str, f32)> {
+    profiles.iter().fold(None, |best, profile| {
+        let score = similarity(heard, &profile.voice);
+        match best {
+            Some((_, previous)) if previous >= score => best,
+            _ => Some((profile.name.as_str(), score)),
+        }
+    })
+}
+
+/// Who spoke last, for «¿quién soy?».
+///
+/// A static rather than something threaded through: the answer is worked
+/// out in `answers.rs`, which is reached from the listening loop and from
+/// `minion run` alike, and neither carries the speaker check with it.
+static LAST_MATCHED: Mutex<Option<String>> = Mutex::new(None);
+
+/// Remembers who the speaker check just recognised.
+pub fn remember_match(name: &str) {
+    if let Ok(mut last) = LAST_MATCHED.lock() {
+        *last = Some(name.to_string());
+    }
+}
+
+/// Who the speaker check last recognised, if anyone.
+pub fn last_matched() -> Option<String> {
+    LAST_MATCHED.lock().ok().and_then(|last| last.clone())
 }
 
 /// Averages several recordings into one voice.
@@ -712,6 +900,149 @@ mod tests {
         let mean = average(&samples).expect("two samples average");
         let norm: f32 = mean.iter().map(|v| v * v).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-5);
+    }
+
+    /// A directory of this test's own, under the scratch space the
+    /// operating system gives us. Never `~/Library`: the profiles there
+    /// belong to whoever is running Minion.
+    fn temp_dir(what: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!("minion-{what}-{unique}"));
+        fs::create_dir_all(&dir).expect("a temporary directory");
+        dir
+    }
+
+    fn profile(name: &str, voice: Vec<f32>) -> Profile {
+        Profile { name: name.to_string(), voice: unit_length(voice) }
+    }
+
+    #[test]
+    fn the_closest_profile_wins() {
+        let profiles = vec![
+            profile("Ana", vec![1.0, 0.0, 0.0]),
+            profile("Beto", vec![0.0, 1.0, 0.0]),
+            profile("Carla", vec![0.0, 0.0, 1.0]),
+        ];
+        let heard = unit_length(vec![0.1, 0.9, 0.2]);
+        let (name, score) = best_match(&profiles, &heard).expect("three profiles to choose from");
+        assert_eq!(name, "Beto");
+        assert!(score > 0.9, "and by a wide margin, got {score:.2}");
+    }
+
+    #[test]
+    fn nobody_to_match_against_is_nobody() {
+        assert!(best_match(&[], &[1.0, 0.0]).is_none());
+    }
+
+    #[test]
+    fn a_tie_always_falls_the_same_way() {
+        // Two voices exactly as far from what was heard. Profiles come off
+        // disk sorted by name, so the first alphabetically wins — arbitrary,
+        // but the same arbitrary answer every time, which a log that names
+        // who spoke needs.
+        let profiles = vec![
+            profile("Ana", vec![1.0, 0.0]),
+            profile("Beto", vec![0.0, 1.0]),
+        ];
+        let heard = unit_length(vec![1.0, 1.0]);
+        let (name, _) = best_match(&profiles, &heard).expect("a match");
+        assert_eq!(name, "Ana");
+        let reversed: Vec<Profile> = profiles.into_iter().rev().collect();
+        let (other, _) = best_match(&reversed, &heard).expect("a match");
+        assert_eq!(other, "Beto", "and it is the order that decides, not the name");
+    }
+
+    #[test]
+    fn profiles_are_read_by_name_and_sorted() {
+        let dir = temp_dir("voices");
+        fs::write(dir.join("Beto.txt"), "# model 7\n0.0 1.0 0.0").unwrap();
+        fs::write(dir.join("Ana.txt"), "0.0 0.0 1.0").unwrap();
+        fs::write(dir.join("notas.md"), "not a profile").unwrap();
+
+        let profiles = read_profiles_in(&dir, Some(7));
+        let names: Vec<&str> = profiles.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["Ana", "Beto"], "sorted, and only the .txt files");
+        assert_eq!(profiles[1].voice, vec![0.0, 1.0, 0.0]);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_profile_from_another_model_is_left_out() {
+        let dir = temp_dir("stale");
+        fs::write(dir.join("Ana.txt"), "# model 7\n1.0 0.0").unwrap();
+        fs::write(dir.join("Beto.txt"), "# model 9\n0.0 1.0").unwrap();
+
+        let profiles = read_profiles_in(&dir, Some(9));
+        let names: Vec<&str> = profiles.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["Beto"], "Ana's was made with a different model");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_old_single_profile_becomes_a_named_one() {
+        let root = temp_dir("migration");
+        fs::write(root.join("voice.txt"), "# model 7\n1.0 0.0 0.0").unwrap();
+
+        let written = migrate_legacy_in(&root, "Ana").expect("something to migrate");
+        assert_eq!(written, root.join("voices/Ana.txt"));
+        assert!(root.join("voice.txt").exists(), "the original is kept");
+
+        let profiles = read_profiles_in(&root.join("voices"), Some(7));
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].name, "Ana");
+        assert_eq!(profiles[0].voice, vec![1.0, 0.0, 0.0]);
+
+        // And it only happens once: a voice forgotten later must not come
+        // back the next time Minion starts.
+        assert!(
+            migrate_legacy_in(&root, "Ana").is_none(),
+            "there is already a profile; nothing to migrate"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn nothing_to_migrate_is_not_an_error() {
+        let root = temp_dir("empty");
+        assert!(migrate_legacy_in(&root, "yo").is_none());
+        assert!(!root.join("voices").exists(), "and no directory is made for nothing");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_name_cannot_escape_the_voices_directory() {
+        assert_eq!(tidy_name("../../etc/passwd"), "etc passwd");
+        assert_eq!(tidy_name("  Ana  María "), "Ana María");
+        assert_eq!(tidy_name(""), DEFAULT_NAME);
+        assert_eq!(tidy_name("   "), DEFAULT_NAME);
+        assert_eq!(tidy_name("Begoña"), "Begoña", "accents are part of a name");
+    }
+
+    /// Two synthesised voices, enrolled separately, must be told apart.
+    ///
+    /// The property multiple profiles rest on: with one profile a wrong
+    /// answer is "not you", which is visible; with several it is "you are
+    /// Ana", which is not. Different pitches are not different people, but
+    /// if even these land on the same profile nothing else will work.
+    #[test]
+    fn two_voices_land_on_their_own_profiles() {
+        let Some(mut model) = model_if_present() else {
+            return;
+        };
+        let profiles = vec![
+            Profile { name: "grave".into(), voice: model.embed(&voiced(95.0, 2.0)).unwrap() },
+            Profile { name: "aguda".into(), voice: model.embed(&voiced(255.0, 2.0)).unwrap() },
+        ];
+        // Not the same recordings: near neighbours of each, so this is a
+        // match and not a lookup of something already stored.
+        for (pitch, expected) in [(100.0, "grave"), (250.0, "aguda")] {
+            let heard = model.embed(&voiced(pitch, 1.5)).unwrap();
+            let (name, score) = best_match(&profiles, &heard).expect("two profiles");
+            println!("  {pitch:.0} Hz -> {name} at {score:.3}");
+            assert_eq!(name, expected, "{pitch:.0} Hz should be «{expected}»");
+        }
     }
 
     #[test]

@@ -102,6 +102,14 @@ pub struct Config {
     /// one, default 0.32.
     pub voice_threshold: Option<f32>,
 
+    /// What to call the voice enrolled before profiles had names.
+    ///
+    /// Only ever read once, when the single `voice.txt` of earlier versions
+    /// is copied into `voices/`. After that the directory is the list and
+    /// this key does nothing; there is no `[[profiles]]` table to keep in
+    /// step with it. Empty means «yo».
+    pub voice_name: Option<String>,
+
     /// Which microphone to listen through.
     ///
     /// Empty follows the system's default, changing along with it when you
@@ -489,6 +497,7 @@ impl Default for Config {
             aliases: Vec::new(),
             commands: Vec::new(),
             voice_threshold: None,
+            voice_name: None,
             resume_shortcut: None,
             microphone: None,
             speaker: None,
@@ -953,6 +962,16 @@ impl Config {
     /// How alike a voice must sound before it is obeyed.
     pub fn voice_threshold(&self) -> f32 {
         self.voice_threshold.unwrap_or(DEFAULT_VOICE_THRESHOLD).clamp(0.0, 1.0)
+    }
+
+    /// What to call the voice migrated from the old single profile.
+    pub fn voice_name(&self) -> String {
+        self.voice_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or(crate::speaker::DEFAULT_NAME)
+            .to_string()
     }
 
     /// How long to keep the model in memory with nothing to do.

@@ -101,8 +101,10 @@ pub fn run(dir: &Path, save: bool) -> Result<()> {
     let config = crate::config::load();
     commands::configure(&config);
     let threshold = config.voice_threshold();
-    let mut voice = speaker::load_profile_for(&model_path)
-        .and_then(|profile| speaker::Speaker::load(&model_path).ok().map(|model| (model, profile)));
+    let profiles = speaker::load_profiles_for(&model_path);
+    let mut voice = (!profiles.is_empty())
+        .then(|| speaker::Speaker::load(&model_path).ok().map(|model| (model, profiles)))
+        .flatten();
     if voice.is_none() {
         println!("No voice profile — every file is judged as if it were the owner's.");
     }
@@ -126,9 +128,11 @@ pub fn run(dir: &Path, save: bool) -> Result<()> {
 
         // The speaker check first, over the raw samples, same as the app —
         // it never sees a transcript.
-        let voice_score = voice
-            .as_mut()
-            .and_then(|(model, profile)| model.embed(&samples).map(|heard| speaker::similarity(&heard, profile)));
+        // Whoever it sounds most like, as the listening loop decides it.
+        let voice_score = voice.as_mut().and_then(|(model, profiles)| {
+            let heard = model.embed(&samples)?;
+            speaker::best_match(profiles, &heard).map(|(_, score)| score)
+        });
 
         let transcript = match model.transcribe_samples(samples, crate::audio::TARGET_HZ, 1, None) {
             Ok(result) => result.text.trim().to_string(),
@@ -456,7 +460,12 @@ fn outcome_after(lines: &[&str], from: usize) -> Option<(String, String, bool)> 
             let transcript = quoted(rest).unwrap_or_else(|| "unknown".to_string());
             return Some((transcript, "Ignored".to_string(), owner_voice));
         }
-        if body.starts_with("voice    matched") {
+        // "voice    Ana matched at 0.61", or without a name on a log
+        // written before profiles had them.
+        if body
+            .strip_prefix("voice    ")
+            .is_some_and(|rest| rest.contains("matched"))
+        {
             continue; // informational; the decision line follows
         }
         if body.starts_with("blank    ") {
