@@ -14,6 +14,9 @@
 //! wake word and the verb lists — and the deciding itself.
 
 use std::sync::OnceLock;
+use std::time::Duration;
+
+use chrono::NaiveTime;
 
 use crate::actions::{self, key, Mods};
 use crate::config::Config;
@@ -148,6 +151,31 @@ pub fn wake_words() -> &'static [&'static str] {
 /// Confidence required to act.
 pub fn threshold() -> f32 {
     *USER_THRESHOLD.get().unwrap_or(&DEFAULT_THRESHOLD)
+}
+
+/// Scores this close count as a tie, broken by which phrase said more.
+const SCORE_TIE: f32 = 1e-4;
+
+/// Whether a candidate match beats the current best, in the table and
+/// macro races of [`decide_in`].
+///
+/// A phrase that names more of the sentence is more specific, and wins a
+/// tie: "borra la palabra" reaches "borrar palabra" as well as it reaches
+/// the single-word "borrar", but "borrar palabra" is the one that was
+/// actually asked for. Only a near-exact tie in score is broken this way —
+/// a real difference in how well something was said still decides it, the
+/// same way it always has.
+fn beats(score: f32, words: usize, current: Option<f32>, current_words: usize) -> bool {
+    match current {
+        None => true,
+        Some(best) => {
+            if (score - best).abs() > SCORE_TIE {
+                score > best
+            } else {
+                words > current_words
+            }
+        }
+    }
 }
 
 /// Every application, from every layer of the vocabulary.
@@ -445,6 +473,21 @@ fn numbered_command(words: &[String]) -> Option<(&'static str, usize, (u16, Mods
 /// Most times a command will be repeated in one go.
 const MAX_REPEATS: usize = 10;
 
+/// When a spoken pause resumes — named the same two ways
+/// `timers::parse_duration`/`parse_alarm` name a timer or an alarm, since
+/// it is the same grammar. Resolved to an absolute moment by the caller
+/// (`timers::at_duration_from_now`/`next_occurrence`), not here: working
+/// that out needs the wall clock, and `decide_in` stays pure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PauseSpec {
+    /// "espera diez minutos", "espera media hora": the duration, and the
+    /// words that named it.
+    For(Duration, String),
+    /// "no me escuches hasta las cinco": the clock time, and the words
+    /// that named it.
+    At(NaiveTime, String),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Decision {
     /// Launch or focus an application.
@@ -475,6 +518,16 @@ pub enum Decision {
     StopDictation,
     /// Undo whatever Minion last did.
     UndoLast,
+    /// «cancela», «para», «basta», bare: stop whatever Minion itself is
+    /// doing right now — reading a reply aloud, a macro between two of its
+    /// steps, a pending question, the conversation window. Distinct from
+    /// [`Decision::Run`]'s "cancelar" (escape) and any contextual command
+    /// with an object in it ("cancela esto"), which still mean what they
+    /// meant before — see [`cancel_word`].
+    Cancel,
+    /// «espera diez minutos», «no me escuches hasta las cinco»: pause
+    /// listening, resuming on its own at the named moment.
+    Pause(PauseSpec),
     /// A question, to be answered aloud.
     Answer(crate::answers::Question),
     /// «pregunta a la IA …», «pregúntale a la IA …», «IA, …»: what to ask
@@ -525,6 +578,47 @@ fn sounds_like_wake_word(word: &str) -> bool {
         let same_start = word.chars().take(PREFIX).eq(wake.chars().take(PREFIX));
         same_start && crate::text::edits_between(word, wake) <= 1
     })
+}
+
+/// Whether the whole (wake-word-stripped) phrase is nothing but Minion's
+/// own cancel word — "cancela", "para" or "basta" — with nothing else said.
+///
+/// Deliberately not routed through [`similarity`]: that drops fillers like
+/// "esto" from both sides, which would make "cancela esto" score the same
+/// as bare "cancela" and lose its own, different meaning (see
+/// [`Decision::Cancel`]). One word of tolerance, the same one edit
+/// [`sounds_like_wake_word`] allows, covers the recogniser dropping a
+/// syllable without opening this up to ordinary sentences that merely
+/// contain one of these words.
+fn cancel_word(rest: &str) -> bool {
+    const WORDS: &[&str] = &["cancela", "para", "basta"];
+    let mut words = rest.split_whitespace();
+    let Some(only) = words.next() else { return false };
+    if words.next().is_some() {
+        return false;
+    }
+    WORDS.iter().any(|word| *word == only || crate::text::edits_between(only, word) <= 1)
+}
+
+/// «espera diez minutos», «espera media hora», «no me escuches hasta las
+/// cinco», «espera hasta las cinco»: a spoken pause, either a duration
+/// from now or a clock time to resume at — reusing
+/// `timers::parse_duration`/`parse_alarm` rather than parsing the same
+/// grammar a second time.
+fn pause_request(rest: &str) -> Option<PauseSpec> {
+    for prefix in ["espera hasta ", "no me escuches hasta ", "no escuches hasta "] {
+        if let Some(after) = rest.strip_prefix(prefix) {
+            if let Some((time, label)) = crate::timers::parse_alarm(after) {
+                return Some(PauseSpec::At(time, label));
+            }
+        }
+    }
+    if let Some(after) = rest.strip_prefix("espera ") {
+        if let Some((duration, label)) = crate::timers::parse_duration(after) {
+            return Some(PauseSpec::For(duration, label));
+        }
+    }
+    None
 }
 
 /// Strips the wake word. Returns `None` if the sentence is not a command.
@@ -799,6 +893,26 @@ fn ask_ai_text(transcript: &str) -> Option<String> {
         return (!text.trim().is_empty()).then_some(text);
     }
     None
+}
+
+/// The names of every command that only exists in `bundle_id`, in the
+/// order the vocabulary declares them — «qué puedo decir aquí» reads this
+/// out. Global commands are not included: this is specifically what the
+/// application in front adds, not everything that happens to work there.
+pub fn contextual_command_names(bundle_id: &str) -> Vec<&'static str> {
+    vocabulary()
+        .contextual
+        .iter()
+        .filter(|command| command.bundles.contains(&bundle_id))
+        .map(|command| command.name)
+        .collect()
+}
+
+/// The application's own display name for a bundle id, if the vocabulary
+/// knows it — «qué puedo decir aquí» names the application it is talking
+/// about.
+pub fn app_name_for(bundle_id: &str) -> Option<&'static str> {
+    vocabulary().apps.iter().find(|app| app.bundle_id == bundle_id).map(|app| app.name)
 }
 
 /// The catalogue [`crate::ai::ask_for_command`] is shown when a phrase
@@ -1343,6 +1457,23 @@ pub fn decide_in(transcript: &str, context: Option<&str>) -> (Decision, f32) {
         }
     }
 
+    // Minion's own cancel word, bare — before anything contextual, since
+    // stopping Minion outweighs whatever the application in front would
+    // otherwise have done with the same word. Checked on the raw phrase
+    // rather than through `similarity`: that drops "esto" as a filler,
+    // which would make "cancela esto" indistinguishable from "cancela" and
+    // swallow the escape/Ctrl-C meaning that phrase still has.
+    if cancel_word(rest) {
+        return (Decision::Cancel, 1.0);
+    }
+
+    // A spoken pause, checked before anything contextual for the same
+    // reason: it names a duration or a clock time nobody's table phrase
+    // does, so there is nothing else this could plausibly mean.
+    if let Some(spec) = pause_request(rest) {
+        return (Decision::Pause(spec), 1.0);
+    }
+
     // Commands belonging to the application in front come first: they are
     // the most specific thing that can match.
     if let Some(bundle) = context {
@@ -1368,19 +1499,30 @@ pub fn decide_in(transcript: &str, context: Option<&str>) -> (Decision, f32) {
     // macros — a macro is just as much the user's own as a `[[commands]]`
     // entry, so it races the same way for the same phrase.
     let mut best: Option<(TableHit, f32)> = None;
+    let mut best_words = 0usize;
     for command in &vocabulary().commands {
         for phrase in command.phrases {
             let score = similarity(rest, phrase);
-            if score >= threshold() && best.is_none_or(|(_, b)| score > b) {
+            if score < threshold() {
+                continue;
+            }
+            let words = keywords(phrase).len();
+            if beats(score, words, best.as_ref().map(|(_, b)| *b), best_words) {
                 best = Some((TableHit::Command(command), score));
+                best_words = words;
             }
         }
     }
     for macro_ in macros() {
         for phrase in macro_.phrases {
             let score = similarity(rest, phrase);
-            if score >= threshold() && best.is_none_or(|(_, b)| score > b) {
+            if score < threshold() {
+                continue;
+            }
+            let words = keywords(phrase).len();
+            if beats(score, words, best.as_ref().map(|(_, b)| *b), best_words) {
                 best = Some((TableHit::Macro(macro_), score));
+                best_words = words;
             }
         }
     }
@@ -1834,6 +1976,23 @@ fn try_macro_step(step: &str) -> StepResult {
     }
 }
 
+/// Set by [`request_cancel`] when "cancela"/"para"/"basta" is heard, and
+/// checked between a running macro's steps — never at the first, so a
+/// cancel word left over from before this macro started (nothing was
+/// running to hear it) cannot stop one that only starts afterwards.
+/// Global rather than threaded through `perform`/`run_macro`: nothing else
+/// needs to know about it, and only one macro ever runs at a time in this
+/// single-threaded loop.
+static CANCEL_MACRO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// «cancela», «para», «basta»: stop the macro that may be running, at its
+/// next step boundary. Safe to call with none running — the flag is
+/// cleared the moment the next one starts, so it cannot leak forward onto
+/// an unrelated later macro.
+pub fn request_cancel() {
+    CANCEL_MACRO.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Runs a macro's steps in order, stopping at the first one that fails.
 ///
 /// `try_step` decides what a step means and, unless it names another
@@ -1841,8 +2000,17 @@ fn try_macro_step(step: &str) -> StepResult {
 /// [`try_macro_step`] directly so a test can supply one that only records
 /// what it was asked to do.
 fn run_macro_steps(macro_: &Macro, mut try_step: impl FnMut(&str) -> StepResult) {
+    CANCEL_MACRO.store(false, std::sync::atomic::Ordering::Relaxed);
     let total = macro_.steps.len();
     for (i, step) in macro_.steps.iter().enumerate() {
+        if i > 0 && CANCEL_MACRO.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            crate::journal::write(&format!(
+                "cancel   {}: stopped at {}/{total} — cancelled",
+                macro_.name,
+                i + 1
+            ));
+            return;
+        }
         crate::journal::write(&format!("macro    {}: {}/{total} {step}", macro_.name, i + 1));
         match try_step(step) {
             StepResult::Ok => {}
@@ -1903,6 +2071,30 @@ fn run_action(action: Action) -> Result<(), String> {
 /// Whether this decision asks Minion to stop listening.
 pub fn is_sleep(decision: &Decision) -> bool {
     matches!(decision, Decision::Run(name) if *name == "dormir")
+}
+
+/// The question worth asking before carrying out `decision`, if it names
+/// one of the built-in commands costly enough that a low-confidence guess
+/// should be confirmed rather than simply run — closing a window or a
+/// tab, quitting an application, emptying the Trash, hanging up, deleting,
+/// turning off the screen. `None` for everything else, which just runs
+/// regardless of how it scored.
+///
+/// Named by decision rather than scored: a command earns a place here by
+/// being hard to undo, not by how it happened to be matched. See
+/// `Session::ask_confirm`, which only asks when the score is also below
+/// `[confirm_below]`.
+pub fn confirm_question(decision: &Decision) -> Option<String> {
+    match decision {
+        Decision::Run("cerrar ventana") => Some("¿Cerrar la ventana?".to_string()),
+        Decision::Run("cerrar pestaña") => Some("¿Cerrar la pestaña?".to_string()),
+        Decision::Run("vaciar papelera") => Some("¿Vaciar la papelera?".to_string()),
+        Decision::Run("borrar") => Some("¿Borrar esto?".to_string()),
+        Decision::Run("apagar pantalla") => Some("¿Apagar la pantalla?".to_string()),
+        Decision::RunHere("colgar") => Some("¿Colgar la llamada?".to_string()),
+        Decision::Quit { name, .. } => Some(format!("¿Salir de {name}?")),
+        _ => None,
+    }
 }
 
 /// The command a phrase most resembles, ignoring the confidence threshold.
@@ -2158,6 +2350,109 @@ mod tests {
 
     fn decision(phrase: &str) -> Decision {
         decide(phrase).0
+    }
+
+    #[test]
+    fn a_command_that_matches_more_of_the_phrase_beats_a_subset() {
+        // "borra la palabra" names "borrar palabra" outright; "borrar" on
+        // its own only reaches it with a word left over, so it must not
+        // win even if the two were ever tied on raw score.
+        assert_eq!(decision("minion borra la palabra"), Decision::Run("borrar palabra"));
+    }
+
+    #[test]
+    fn named_keys_press_the_right_key() {
+        assert_eq!(decision("minion intro"), Decision::Run("tecla enter"));
+        assert_eq!(decision("minion pulsa tabulador"), Decision::Run("tecla tabulador"));
+        assert_eq!(decision("minion escape"), Decision::Run("tecla escape"));
+        assert_eq!(decision("minion retroceso"), Decision::Run("tecla retroceso"));
+        assert_eq!(decision("minion borra un caracter"), Decision::Run("tecla retroceso"));
+        assert_eq!(decision("minion suprime"), Decision::Run("tecla suprimir"));
+        assert_eq!(decision("minion pulsa espacio"), Decision::Run("tecla espacio"));
+        assert_eq!(decision("minion flecha arriba"), Decision::Run("flecha arriba"));
+        assert_eq!(decision("minion flecha abajo"), Decision::Run("flecha abajo"));
+        assert_eq!(decision("minion flecha izquierda"), Decision::Run("flecha izquierda"));
+        assert_eq!(decision("minion flecha derecha"), Decision::Run("flecha derecha"));
+        assert_eq!(decision("minion inicio"), Decision::Run("tecla inicio"));
+        assert_eq!(decision("minion fin"), Decision::Run("tecla fin"));
+        assert_eq!(decision("minion pagina arriba"), Decision::Run("pagina arriba"));
+        assert_eq!(decision("minion pagina abajo"), Decision::Run("pagina abajo"));
+    }
+
+    #[test]
+    fn a_pause_is_decided_from_a_duration_or_a_clock_time() {
+        match decision("minion espera diez minutos") {
+            Decision::Pause(PauseSpec::For(duration, label)) => {
+                assert_eq!(duration, std::time::Duration::from_secs(600));
+                assert_eq!(label, "diez minutos");
+            }
+            other => panic!("expected a pause, got {other:?}"),
+        }
+        match decision("minion espera media hora") {
+            Decision::Pause(PauseSpec::For(duration, _)) => {
+                assert_eq!(duration, std::time::Duration::from_secs(1_800));
+            }
+            other => panic!("expected a pause, got {other:?}"),
+        }
+        match decision("minion no me escuches hasta las cinco") {
+            Decision::Pause(PauseSpec::At(_, label)) => assert_eq!(label, "las cinco"),
+            other => panic!("expected a pause, got {other:?}"),
+        }
+        match decision("minion espera hasta las cinco") {
+            Decision::Pause(PauseSpec::At(_, label)) => assert_eq!(label, "las cinco"),
+            other => panic!("expected a pause, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_pause_with_nothing_it_can_parse_is_not_a_pause() {
+        assert_eq!(decision("minion espera"), Decision::Unrecognised);
+        assert_eq!(decision("minion espera un momento"), Decision::Unrecognised);
+    }
+
+    #[test]
+    fn contextual_command_names_lists_only_that_bundles_own() {
+        let names = contextual_command_names("com.apple.Terminal");
+        assert!(names.contains(&"interrumpir"), "{names:?}");
+        // Chrome's own commands are not Terminal's.
+        assert!(!names.contains(&"favoritos"), "{names:?}");
+    }
+
+    #[test]
+    fn contextual_command_names_is_empty_for_an_app_with_none_of_its_own() {
+        assert!(contextual_command_names("com.nobody.nothing").is_empty());
+    }
+
+    #[test]
+    fn app_name_for_finds_the_display_name() {
+        assert_eq!(app_name_for("com.apple.Terminal"), Some("Terminal"));
+        assert_eq!(app_name_for("com.nobody.nothing"), None);
+    }
+
+    #[test]
+    fn confirm_question_names_every_costly_command() {
+        assert_eq!(confirm_question(&Decision::Run("cerrar ventana")).as_deref(), Some("¿Cerrar la ventana?"));
+        assert_eq!(confirm_question(&Decision::Run("cerrar pestaña")).as_deref(), Some("¿Cerrar la pestaña?"));
+        assert_eq!(confirm_question(&Decision::Run("vaciar papelera")).as_deref(), Some("¿Vaciar la papelera?"));
+        assert_eq!(confirm_question(&Decision::Run("borrar")).as_deref(), Some("¿Borrar esto?"));
+        assert_eq!(confirm_question(&Decision::Run("apagar pantalla")).as_deref(), Some("¿Apagar la pantalla?"));
+        assert_eq!(confirm_question(&Decision::RunHere("colgar")).as_deref(), Some("¿Colgar la llamada?"));
+        assert_eq!(
+            confirm_question(&Decision::Quit { name: "Safari", bundle_id: "com.apple.Safari" }).as_deref(),
+            Some("¿Salir de Safari?")
+        );
+        // Nothing else is costly.
+        assert!(confirm_question(&Decision::Run("borrar palabra")).is_none());
+        assert!(confirm_question(&Decision::Launch { name: "Chrome", bundle_id: "com.google.Chrome" })
+            .is_none());
+    }
+
+    #[test]
+    fn observed_recogniser_forms_open_the_right_app() {
+        launches("minion abre so fuddi", "Safari");
+        launches("minion abre cron", "Chrome");
+        launches("minion abre u s code", "VS Code");
+        launches("minion abre uve ese code", "VS Code");
     }
 
     fn launches(phrase: &str, expected: &str) {
@@ -2453,13 +2748,20 @@ mod tests {
 
     #[test]
     fn guessing_splits_a_run_together_word_to_find_the_app() {
-        // The real case: "Minion abrecron" glued "abre" and "cron", and
-        // "cron" is one phonetic edit from Chrome's "crom". The strict path
-        // must not act on it — only the guess used for questions and
-        // Aprender does.
-        assert_eq!(decision("minion abrecron"), Decision::Unrecognised);
-        let guess = closest_app("minion abrecron").expect("should guess Chrome");
+        // The real case: "Minion abrechron" glues "abre" and "chron", and
+        // "chron" is one phonetic edit from Chrome's "crom" ("cron" itself
+        // is now a listed alias — see browsers.toml — since the log showed
+        // it often enough to stop being a guess). The strict path must not
+        // act on "chron" — only the guess used for questions and Aprender
+        // does.
+        assert_eq!(decision("minion abrechron"), Decision::Unrecognised);
+        let guess = closest_app("minion abrechron").expect("should guess Chrome");
         assert_eq!(guess.app, "Chrome");
+        // "cron" itself, being a listed alias, is acted on outright.
+        assert_eq!(
+            decision("minion abrecron"),
+            Decision::Launch { name: "Chrome", bundle_id: "com.google.Chrome" }
+        );
 
         // "cromo" spelled right phonetically, and "avrechrome" where the
         // verb itself is misheard ("avre" for "abre", a b/v slip) but the
@@ -3212,6 +3514,37 @@ mod tests {
             StepResult::Ok
         });
         assert!(seen.borrow().is_empty());
+    }
+
+    #[test]
+    fn cancel_stops_a_macro_between_steps() {
+        let seen = std::cell::RefCell::new(Vec::new());
+        let steps: &[&str] = &["uno", "dos", "tres"];
+        let macro_ = Macro { name: "prueba", phrases: &["prueba"], steps };
+        run_macro_steps(&macro_, |step| {
+            seen.borrow_mut().push(step.to_string());
+            // The cancel word arrives right after the first step.
+            if step == "uno" {
+                request_cancel();
+            }
+            StepResult::Ok
+        });
+        assert_eq!(*seen.borrow(), vec!["uno".to_string()]);
+    }
+
+    #[test]
+    fn a_cancel_word_left_over_does_not_stop_the_next_macro() {
+        // Nothing was running to hear it, so a stale flag must not cancel
+        // the first step of whatever runs next.
+        request_cancel();
+        let seen = std::cell::RefCell::new(Vec::new());
+        let steps: &[&str] = &["uno", "dos"];
+        let macro_ = Macro { name: "prueba", phrases: &["prueba"], steps };
+        run_macro_steps(&macro_, |step| {
+            seen.borrow_mut().push(step.to_string());
+            StepResult::Ok
+        });
+        assert_eq!(*seen.borrow(), vec!["uno".to_string(), "dos".to_string()]);
     }
 
     #[test]

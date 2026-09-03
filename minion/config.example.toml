@@ -93,6 +93,25 @@
 # Keep the HUD panel on screen permanently instead of only around an
 # utterance. Off by default, and only meaningful with show_hud on.
 # hud_pinned = false
+
+# Confidence the winning command needs before it just runs. Below this, a
+# built-in costly command (closing a window or a tab, quitting an app,
+# emptying the Trash, hanging up, deleting, turning off the screen) is
+# asked about instead — "¿Cerrar la ventana?" — rather than simply run.
+# Default 0.85.
+# confirm_below = 0.85
+
+# How Minion signals what it is doing without a full spoken answer: a
+# short system sound for heard/done/not understood/blocked/a question
+# asked. "voice" speaks instead of a sound, "sounds" plays a sound and
+# never speaks, "both" (the default) does both, "quiet" does neither.
+# feedback = "both"
+
+# When true, a confirmation (see confirm_below) is a sound only, never a
+# spoken question, and a spoken answer is cut to its first sentence. Off
+# by default.
+# brief_answers = false
+
 # Look once a day for a newer version of Minion and offer to install it.
 # On by default, and silent unless there is one. «Buscar
 # actualizaciones…» in the menu asks straight away either way.

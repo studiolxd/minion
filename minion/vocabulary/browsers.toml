@@ -9,7 +9,7 @@ bundle_id = "com.google.Chrome"
 # "grum", "crum", "crumb": what the recogniser makes of a Spanish mouth
 # saying an English name. Listed as heard, since no tolerance short of
 # reckless would reach them from the real word.
-aliases = ["chrome", "crome", "cromo", "grum", "crum", "crumb",
+aliases = ["chrome", "crome", "cromo", "grum", "crum", "crumb", "cron",
            "el navegador", "navegador"]
 
 [[apps]]
@@ -18,7 +18,7 @@ bundle_id = "com.apple.Safari"
 # "shafari", "safaris", "safaria", "so fuddy": what the recogniser writes
 # when the word is said quickly. Cheaper and safer than loosening the
 # matcher.
-aliases = ["safari", "shafari", "safaris", "safaria", "so fuddy", "el safari"]
+aliases = ["safari", "shafari", "safaris", "safaria", "so fuddy", "so fuddi", "el safari"]
 
 # No misheard spellings here yet: nothing has been said to Minion in
 # Spanish for it to write down. Add what the log shows rather than

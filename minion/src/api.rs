@@ -196,7 +196,7 @@ pub fn handle(request: &Request, reply: &ReplySettings, context: Option<&str>) {
             let (decision, _confidence) = crate::commands::decide_in(&heard, context);
             match &decision {
                 crate::commands::Decision::Answer(question) => {
-                    let answer = crate::answers::answer(question.clone(), true);
+                    let answer = crate::answers::answer(question.clone(), true, context);
                     crate::note!("api      «{text}»  ->  {answer}");
                     reply.deliver(&answer);
                 }

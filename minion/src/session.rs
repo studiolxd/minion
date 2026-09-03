@@ -66,6 +66,16 @@ pub enum Outcome {
     ForgetAiConversation,
     /// Take back what was last done, if there was anything.
     Undo(Option<Undoable>),
+    /// «cancela», «para», «basta»: stop whatever Minion itself is doing.
+    /// `main.rs` still has to stop the speech and the macro that may be
+    /// running — this only carries what `Session` itself knows was
+    /// cancelled, for the log line.
+    Cancel { cancelled_question: bool, closed_window: bool },
+    /// «espera diez minutos», «no me escuches hasta las cinco»: pause
+    /// listening. `main.rs` resolves the spec to an absolute moment (the
+    /// wall clock is not this module's to read) and does the actual
+    /// pausing and scheduling.
+    Pause(commands::PauseSpec),
     /// «otra vez» with nothing said before it.
     NothingToRepeat,
     /// Carry this out, this many times.
@@ -94,6 +104,11 @@ pub struct Session {
     /// user rather than acted on. Zero never asks, which is what a
     /// `Session` nobody has configured does.
     margin: f32,
+    /// Confidence one of the built-in costly commands needs before it just
+    /// runs — below it, [`Session::ask_confirm`] asks instead. Zero never
+    /// asks, the same way `margin` does, which is what a `Session` nobody
+    /// has configured does.
+    confirm_below: f32,
 }
 
 /// How long a guess waits for its yes or no.
@@ -125,6 +140,10 @@ enum Asked {
     /// recognise. Yes runs it; unlike [`Asked::Guess`], nothing is learned
     /// from it — a model's guess is not the same as a nearby alias.
     AiSuggestion(AiSuggestion),
+    /// A costly command matched below `confirm_below`, not yet run. Yes
+    /// carries it out; unlike [`Asked::Guess`], nothing is learned — this
+    /// is about how sure Minion was, not about a phrase it did not know.
+    Confirm { decision: Decision, repeats: usize },
 }
 
 /// A command the AI layer suggested for a phrase the vocabulary missed —
@@ -165,6 +184,8 @@ pub enum Reply {
     Chose { phrase: String, candidate: Candidate },
     /// Yes to an AI-suggested command: run it, but do not learn it.
     AiYes { phrase: String, suggestion: AiSuggestion },
+    /// Yes to a confirmation: carry out the costly command it was about.
+    ConfirmYes { phrase: String, decision: Decision, repeats: usize },
     /// No, or something that was not an answer at all. `answered` tells
     /// the two apart, because only the first has used up the utterance —
     /// anything else still has to be listened to on its own terms.
@@ -370,6 +391,13 @@ impl Session {
             }
             Decision::AskAi(text) => return Outcome::AskAi(text),
             Decision::ForgetAiConversation => return Outcome::ForgetAiConversation,
+            Decision::Cancel => {
+                let cancelled_question = self.pending.take().is_some();
+                let closed_window = self.window_opened_at.is_some();
+                self.close_window();
+                return Outcome::Cancel { cancelled_question, closed_window };
+            }
+            Decision::Pause(spec) => return Outcome::Pause(spec),
             _ => {}
         }
 
@@ -446,6 +474,41 @@ impl Session {
     /// `Session` that has not been told never asks.
     pub fn disambiguates(&mut self, margin: f32) {
         self.margin = margin;
+    }
+
+    /// Confidence a costly command needs before it just runs. Read from
+    /// `[confirm_below]`, and set by the caller for the same reason
+    /// `disambiguates` is: a `Session` that has not been told never asks.
+    pub fn confirms_below(&mut self, threshold: f32) {
+        self.confirm_below = threshold;
+    }
+
+    /// The question worth asking before carrying out a costly command
+    /// matched below `confirm_below`, if there is one — `None` when the
+    /// decision is not one of the built-in costly commands
+    /// (`commands::confirm_question` says which), or when it scored well
+    /// enough to just run. Never while dictating, and never for a
+    /// question or an AI request, since neither ever reaches here: both
+    /// are already resolved before `interpret` would produce
+    /// `Outcome::Perform`.
+    ///
+    /// Pure: asking it out loud, and opening the window for the answer,
+    /// are the caller's to do.
+    pub fn ask_confirm(
+        &self,
+        decision: &Decision,
+        confidence: f32,
+        repeats: usize,
+    ) -> Option<Question> {
+        if self.dictating || self.confirm_below <= 0.0 || confidence >= self.confirm_below {
+            return None;
+        }
+        let text = commands::confirm_question(decision)?;
+        Some(Question {
+            text: text.clone(),
+            description: text,
+            asked: Asked::Confirm { decision: decision.clone(), repeats },
+        })
     }
 
     /// The question worth asking about a phrase that was not understood,
@@ -610,6 +673,11 @@ impl Session {
             },
             Asked::AiSuggestion(suggestion) => match answer_in(part) {
                 Some(true) => Reply::AiYes { phrase, suggestion },
+                Some(false) => Reply::No { phrase, answered: true },
+                None => Reply::No { phrase, answered: false },
+            },
+            Asked::Confirm { decision, repeats } => match answer_in(part) {
+                Some(true) => Reply::ConfirmYes { phrase, decision, repeats },
                 Some(false) => Reply::No { phrase, answered: true },
                 None => Reply::No { phrase, answered: false },
             },
@@ -1421,5 +1489,142 @@ mod tests {
             say(&mut session, "minion otra vez"),
             vec![Outcome::Perform { decision: last, repeats: 1 }]
         );
+    }
+
+    #[test]
+    fn cancel_clears_a_pending_question_and_the_conversation_window() {
+        let mut session = asking();
+        let now = Instant::now();
+        let question = session.ask_about(NEARLY, now).expect("worth asking about");
+        session.open_question(NEARLY, question, now);
+        assert!(session.question_open(now));
+
+        // A question already closes the window when it opens, so this
+        // exercises the pending-question half of cancel; the window half
+        // is checked below, on its own.
+        assert_eq!(
+            session.interpret("minion cancela", Decision::Cancel, None),
+            Outcome::Cancel { cancelled_question: true, closed_window: false }
+        );
+        assert!(!session.question_open(now));
+        // Answering "sí" now is just an ordinary phrase: there is nothing
+        // left to answer.
+        assert!(session.answer_question("si", now).is_none());
+
+        session.open_window(now, Duration::from_secs(5));
+        assert_eq!(
+            session.interpret("minion cancela", Decision::Cancel, None),
+            Outcome::Cancel { cancelled_question: false, closed_window: true }
+        );
+        assert!(!session.window_open(now));
+    }
+
+    #[test]
+    fn cancel_with_nothing_pending_says_so() {
+        let mut session = Session::new();
+        assert_eq!(
+            session.interpret("minion cancela", Decision::Cancel, None),
+            Outcome::Cancel { cancelled_question: false, closed_window: false }
+        );
+    }
+
+    /// A session that confirms costly commands scored below 0.85.
+    fn confirming() -> Session {
+        let mut session = Session::new();
+        session.confirms_below(0.85);
+        session
+    }
+
+    #[test]
+    fn a_costly_command_below_the_threshold_is_confirmed_not_run() {
+        let question = confirming()
+            .ask_confirm(&Decision::Run("cerrar ventana"), 0.8, 1)
+            .expect("worth confirming");
+        assert_eq!(question.text, "¿Cerrar la ventana?");
+    }
+
+    #[test]
+    fn a_costly_command_at_or_above_the_threshold_just_runs() {
+        assert!(confirming().ask_confirm(&Decision::Run("cerrar ventana"), 0.85, 1).is_none());
+        assert!(confirming().ask_confirm(&Decision::Run("cerrar ventana"), 0.95, 1).is_none());
+    }
+
+    #[test]
+    fn an_ordinary_command_is_never_confirmed() {
+        assert!(confirming().ask_confirm(&Decision::Run("abrir Chrome"), 0.5, 1).is_none());
+    }
+
+    #[test]
+    fn zero_never_confirms() {
+        assert!(Session::new().ask_confirm(&Decision::Run("cerrar ventana"), 0.1, 1).is_none());
+    }
+
+    #[test]
+    fn nothing_is_confirmed_while_dictating() {
+        let mut session = confirming();
+        say(&mut session, "minion empieza a dictar");
+        assert!(session.ask_confirm(&Decision::Run("cerrar ventana"), 0.1, 1).is_none());
+    }
+
+    #[test]
+    fn confirming_yes_carries_out_the_decision() {
+        let mut session = confirming();
+        let now = Instant::now();
+        let question = session
+            .ask_confirm(&Decision::Run("cerrar ventana"), 0.8, 1)
+            .expect("worth confirming");
+        session.open_question("minion cierra la ventana", question, now);
+        match session.answer_question("si", now) {
+            Some(Reply::ConfirmYes { decision, repeats, .. }) => {
+                assert_eq!(decision, Decision::Run("cerrar ventana"));
+                assert_eq!(repeats, 1);
+            }
+            other => panic!("expected a confirmed yes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn declining_a_confirmation_runs_nothing() {
+        let mut session = confirming();
+        let now = Instant::now();
+        let question = session
+            .ask_confirm(&Decision::Run("cerrar ventana"), 0.8, 1)
+            .expect("worth confirming");
+        session.open_question("minion cierra la ventana", question, now);
+        assert!(matches!(
+            session.answer_question("no", now),
+            Some(Reply::No { answered: true, .. })
+        ));
+    }
+
+    #[test]
+    fn quitting_an_application_is_confirmed_by_name() {
+        let question = confirming()
+            .ask_confirm(
+                &Decision::Quit { name: "Chrome", bundle_id: "com.google.Chrome" },
+                0.8,
+                1,
+            )
+            .expect("worth confirming");
+        assert_eq!(question.text, "¿Salir de Chrome?");
+    }
+
+    #[test]
+    fn a_pause_decision_becomes_a_pause_outcome() {
+        let mut session = Session::new();
+        let spec = commands::PauseSpec::For(Duration::from_secs(600), "diez minutos".to_string());
+        assert_eq!(
+            session.interpret("minion espera diez minutos", Decision::Pause(spec.clone()), None),
+            Outcome::Pause(spec)
+        );
+    }
+
+    #[test]
+    fn cancel_bare_word_is_decided_as_cancel() {
+        for phrase in ["minion cancela", "minion para", "minion basta"] {
+            assert_eq!(decide(phrase), Decision::Cancel, "«{phrase}»");
+        }
+        // With an object, "cancela" keeps its old meaning (escape).
+        assert_eq!(decide("minion cancela esto"), Decision::Run("cancelar"));
     }
 }

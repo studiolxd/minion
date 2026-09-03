@@ -11,7 +11,9 @@ aliases = ["terminal", "la terminal", "consola"]
 [[apps]]
 name = "VS Code"
 bundle_id = "com.microsoft.VSCode"
-aliases = ["visual studio", "vs code", "vsc"]
+# "abreu s code" in the log is "abre" + "u s code" — the recogniser
+# spelling out the initials rather than saying "vi ese".
+aliases = ["visual studio", "vs code", "vsc", "u s code", "uve ese code"]
 
 # ── Inside a terminal ───────────────────────────────────────────────────
 #
@@ -21,7 +23,9 @@ aliases = ["visual studio", "vs code", "vsc"]
 
 [[commands]]
 name = "interrumpir"
-phrases = ["cancela esto", "cancela"]
+# Bare "cancela" is Minion's own cancel word now (see macos.toml's
+# "cancelar"); "cancela esto" still means Ctrl-C here.
+phrases = ["cancela esto"]
 keys = "ctrl-c"
 bundles = ["com.apple.Terminal"]
 
