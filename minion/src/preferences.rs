@@ -453,6 +453,52 @@ impl Popup {
     }
 }
 
+/// What a model-listing thread hands back to the next poll.
+type ModelFetch = Result<Vec<crate::ai::ModelInfo>, crate::ai::AiError>;
+
+/// A dropdown whose entries are replaced wholesale at runtime — unlike
+/// [`Popup`], whose values never change after construction. The model
+/// popup is the one thing here that needs this: each backend has its own
+/// list, fetched after the window is already open.
+struct ModelPopup {
+    control: Retained<NSPopUpButton>,
+    /// The value behind each entry, in the same order. In a `RefCell`
+    /// because [`Self::rebuild`] replaces the whole thing.
+    values: std::cell::RefCell<Vec<String>>,
+    last: Cell<isize>,
+}
+
+impl ModelPopup {
+    fn value(&self) -> String {
+        let index = self.control.indexOfSelectedItem().max(0) as usize;
+        self.values.borrow().get(index).cloned().unwrap_or_default()
+    }
+
+    fn changed(&self) -> Option<String> {
+        let now = self.control.indexOfSelectedItem();
+        (now != self.last.get()).then(|| {
+            self.last.set(now);
+            self.value()
+        })
+    }
+
+    /// Replaces every entry, selecting whichever one carries `target` (or
+    /// the first — «Por defecto» or the provider's own wording for it —
+    /// when nothing matches).
+    fn rebuild(&self, options: &[crate::ai::ModelOption], target: &str) {
+        self.control.removeAllItems();
+        let mut values = Vec::with_capacity(options.len());
+        for option in options {
+            self.control.addItemWithTitle(&NSString::from_str(&option.label));
+            values.push(option.value.clone());
+        }
+        let index = values.iter().position(|value| value == target).unwrap_or(0);
+        self.control.selectItemAtIndex(index as isize);
+        self.last.set(index as isize);
+        *self.values.borrow_mut() = values;
+    }
+}
+
 /// A checkbox and the value it last had.
 struct Switch {
     control: Retained<NSButton>,
@@ -634,8 +680,20 @@ pub struct Preferences {
     ai_save_key: Press,
     ai_forget_key: Press,
     ai_key_status: Retained<NSTextField>,
+    /// «Por defecto», the list [`crate::ai::list_models`] found, then
+    /// «Otro…». Rebuilt every time the backend changes or a fetch comes
+    /// back — see [`ModelPopup`], which unlike [`Popup`] allows that.
+    ai_model_popup: ModelPopup,
+    /// The custom id, typed in only when the popup is on «Otro…».
     ai_model_field: Retained<NSTextField>,
     last_ai_model: std::cell::RefCell<String>,
+    ai_model_refresh: Press,
+    ai_model_status: Retained<NSTextField>,
+    /// Filled in by the fetch thread — see [`crate::ai::list_models`] and
+    /// [`crate::ai::refresh_models`] — and read on the next poll, the same
+    /// pattern as `ai_probe_result` below.
+    ai_model_result: Arc<Mutex<Option<ModelFetch>>>,
+    ai_model_running: Cell<bool>,
     /// Only meaningful for Codex, whose installed CLI may name a model the
     /// user's ChatGPT plan does not actually allow.
     ai_codex_hint: Retained<NSTextField>,
@@ -826,18 +884,6 @@ fn hidable_hint(layout: &mut Layout, mtm: MainThreadMarker, text: &str) -> Retai
     layout.add(&view);
     layout.gap(spacing::AFTER_HINT);
     view
-}
-
-/// What the model field's placeholder says: the backend's own default, or
-/// nothing for a CLI agent, which has no fixed one to name.
-fn model_placeholder(providers: &[crate::ai::ProviderInfo], backend: &str) -> String {
-    providers
-        .iter()
-        .find(|info| info.id == backend)
-        .map(|info| info.default_model)
-        .filter(|model| !model.is_empty())
-        .map(|model| format!("por defecto: {model}"))
-        .unwrap_or_default()
 }
 
 impl Preferences {
@@ -1183,21 +1229,66 @@ impl Preferences {
         layout.gap(spacing::SIBLING);
         layout.hint(
             "La clave se guarda en el llavero de macOS, nunca en config.toml \
-             ni en el registro; nunca se vuelve a mostrar aquí. También se \
-             puede guardar con «minion ai set-key <backend>» en la terminal.",
+             ni en el registro, y no vuelve a mostrarse aquí — solo un \
+             adelanto. Para cambiarla, olvida la guardada y escribe la nueva.",
             0.0,
         );
 
         layout.field_label("Modelo");
+        // The list itself is empty until the fetch that starts after this
+        // window is built comes back — see `sync_ai_provider_controls`,
+        // called once at the end of `Preferences::new`. Only «Por
+        // defecto»/«Otro…» exist yet, so the popup never waits on a
+        // network call to appear.
+        let initial_model_options =
+            crate::ai::model_popup_options(current_backend, &[]);
+        let initial_model_target = if ai_settings.model.is_empty() {
+            String::new()
+        } else {
+            crate::ai::CUSTOM_MODEL.to_string()
+        };
+        let initial_model_options_ref: Vec<(&str, &str)> = initial_model_options
+            .iter()
+            .map(|option| (option.label.as_str(), option.value.as_str()))
+            .collect();
+        let ai_model_popup_control = layout.popup(&initial_model_options_ref, &initial_model_target);
+        let ai_model_popup = ModelPopup {
+            control: ai_model_popup_control.control,
+            values: std::cell::RefCell::new(ai_model_popup_control.values),
+            last: ai_model_popup_control.last,
+        };
+
+        let model_buttons_row = layout.place(spacing::BUTTON, 0.0);
+        // Safety: no target and no action, so nothing is called back into.
+        let ai_model_refresh = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str("Actualizar modelos"),
+                None,
+                None,
+                mtm,
+            )
+        };
+        ai_model_refresh.setFrame(narrow(model_buttons_row, 140.0));
+        layout.add_control(&ai_model_refresh, "Actualizar la lista de modelos");
+        let ai_model_status = plain_label(
+            mtm,
+            "",
+            beside(model_buttons_row, 140.0, layout.content_width() - 140.0 - spacing::SIBLING),
+        );
+        layout.add(&ai_model_status);
+        layout.gap(spacing::SIBLING);
+
         let ai_model_field = NSTextField::new(mtm);
         ai_model_field.setStringValue(&NSString::from_str(&ai_settings.model));
-        ai_model_field.setPlaceholderString(Some(&NSString::from_str(&model_placeholder(
-            providers,
-            current_backend,
-        ))));
+        ai_model_field.setPlaceholderString(Some(&NSString::from_str("identificador del modelo")));
         ai_model_field.setFrame(layout.place(spacing::FIELD, 0.0));
-        layout.add_control(&ai_model_field, "Modelo");
+        layout.add_control(&ai_model_field, "Identificador del modelo");
         layout.gap(spacing::SIBLING);
+        layout.hint(
+            "Solo para «Otro…»: el identificador de un modelo que la lista \
+             no trae, por ejemplo en un despliegue privado.",
+            0.0,
+        );
         let ai_codex_hint = hidable_hint(
             &mut layout,
             mtm,
@@ -1452,8 +1543,13 @@ impl Preferences {
             ai_save_key: Press::new(ai_save_key),
             ai_forget_key: Press::new(ai_forget_key),
             ai_key_status,
+            ai_model_popup,
             ai_model_field,
             last_ai_model: std::cell::RefCell::new(ai_settings.model.clone()),
+            ai_model_refresh: Press::new(ai_model_refresh),
+            ai_model_status,
+            ai_model_result: Arc::new(Mutex::new(None)),
+            ai_model_running: Cell::new(false),
             ai_codex_hint,
             ai_base_url_label,
             ai_base_url_field,
@@ -1564,24 +1660,27 @@ impl Preferences {
         let info = providers.iter().find(|info| info.id == backend);
         let needs_key = info.is_some_and(|info| info.needs_key);
 
+        // A key already on file replaces the entry field and «Guardar
+        // clave» with a masked preview and «Olvidar clave»: the only way
+        // to change a stored key is to forget it first, so there is never
+        // a moment where typing into the field could look like it is
+        // editing the one already saved.
+        let preview = needs_key.then(|| crate::ai::key_preview(&backend)).flatten();
+        let has_key = preview.is_some();
+
         self.ai_key_label.setHidden(!needs_key);
-        self.ai_key_field.setHidden(!needs_key);
-        self.ai_save_key.control.setHidden(!needs_key);
-        self.ai_forget_key.control.setHidden(!needs_key);
+        self.ai_key_field.setHidden(!needs_key || has_key);
+        self.ai_save_key.control.setHidden(!needs_key || has_key);
+        self.ai_forget_key.control.setHidden(!needs_key || !has_key);
         self.ai_key_status.setHidden(!needs_key);
         if needs_key {
             self.ai_key_field.setStringValue(&NSString::from_str(""));
-            let text = if crate::ai::has_key(&backend) {
-                "Hay una clave guardada en el llavero.".to_string()
-            } else {
-                "Falta la clave.".to_string()
+            let text = match &preview {
+                Some(preview) => format!("Clave guardada: {preview}"),
+                None => "Falta la clave.".to_string(),
             };
             self.ai_key_status.setStringValue(&NSString::from_str(&text));
         }
-
-        self.ai_model_field.setPlaceholderString(Some(&NSString::from_str(&model_placeholder(
-            providers, &backend,
-        ))));
 
         self.ai_codex_hint.setHidden(backend != "codex");
 
@@ -1589,6 +1688,66 @@ impl Preferences {
         self.ai_base_url_label.setHidden(!base_url);
         self.ai_base_url_field.setHidden(!base_url);
         self.ai_base_url_hint.setHidden(!base_url);
+
+        self.start_model_fetch();
+    }
+
+    /// Starts listing `[ai] backend`'s models on a worker thread, unless it
+    /// needs a key that is not on file — in which case there is nothing to
+    /// fetch, and the popup says so instead of trying.
+    fn start_model_fetch(&self) {
+        let backend = self.ai_backend.value();
+        let providers = crate::ai::providers();
+        let needs_key = providers.iter().find(|info| info.id == backend).is_some_and(|info| info.needs_key);
+        // Selecting a different provider means the previous one's models
+        // do not belong in the popup any more, fetch or no fetch.
+        self.apply_model_list(&[]);
+        if needs_key && !crate::ai::has_key(&backend) {
+            self.ai_model_running.set(false);
+            self.ai_model_status.setStringValue(&NSString::from_str(
+                "No se pudo listar los modelos: falta la clave.",
+            ));
+            return;
+        }
+        self.ai_model_running.set(true);
+        self.ai_model_status.setStringValue(&NSString::from_str("Cargando modelos…"));
+        let slot = Arc::clone(&self.ai_model_result);
+        std::thread::spawn(move || {
+            let result = crate::ai::list_models(&backend);
+            if let Ok(mut held) = slot.lock() {
+                *held = Some(result);
+            }
+        });
+    }
+
+    /// Rebuilds the model popup from a fetch's result, keeping the
+    /// configured model selected when the list has it and falling back to
+    /// «Otro…» when it does not (a private deployment, or a list that
+    /// simply has not loaded yet).
+    fn apply_model_list(&self, models: &[crate::ai::ModelInfo]) {
+        let backend = self.ai_backend.value();
+        let options = crate::ai::model_popup_options(&backend, models);
+        let current = self.last_ai_model.borrow().clone();
+        let target = if current.is_empty() {
+            String::new()
+        } else if options.iter().any(|option| option.value == current) {
+            current
+        } else {
+            crate::ai::CUSTOM_MODEL.to_string()
+        };
+        self.ai_model_popup.rebuild(&options, &target);
+        self.sync_model_custom_field();
+    }
+
+    /// Shows the custom-id field only while the popup is on «Otro…», and
+    /// starts it off with whatever model is configured so choosing «Otro…»
+    /// for an id the fetch just did not have does not blank it.
+    fn sync_model_custom_field(&self) {
+        let is_custom = self.ai_model_popup.value() == crate::ai::CUSTOM_MODEL;
+        self.ai_model_field.setHidden(!is_custom);
+        if is_custom && self.ai_model_field.stringValue().to_string().trim().is_empty() {
+            self.ai_model_field.setStringValue(&NSString::from_str(&self.last_ai_model.borrow()));
+        }
     }
 
     /// Reads the controls and writes through anything that moved.
@@ -1768,11 +1927,11 @@ impl Preferences {
                         if config::load().ai.api_key != "keychain" {
                             save_ai("api_key", &config::toml_string("keychain"));
                         }
-                        self.ai_key_status.setStringValue(&NSString::from_str(&format!(
-                            "Clave guardada en el llavero ({}).",
-                            chrono::Local::now().format("%d/%m/%Y")
-                        )));
                         self.refresh_ai_backend_labels(None);
+                        // Swaps the field and «Guardar clave» for the
+                        // masked preview and «Olvidar clave», and starts
+                        // the fetch a key unlocks.
+                        self.sync_ai_provider_controls();
                     }
                     Err(why) => {
                         self.ai_key_status
@@ -1786,8 +1945,8 @@ impl Preferences {
             let backend = self.ai_backend.value();
             match crate::ai::forget_key(&backend) {
                 Ok(()) => {
-                    self.ai_key_status.setStringValue(&NSString::from_str("Se ha olvidado la clave."));
                     self.refresh_ai_backend_labels(None);
+                    self.sync_ai_provider_controls();
                 }
                 Err(why) => {
                     self.ai_key_status
@@ -1796,11 +1955,52 @@ impl Preferences {
             }
             changed = true;
         }
-        if !self.is_editing(&self.ai_model_field) {
+        if let Some(value) = self.ai_model_popup.changed() {
+            self.sync_model_custom_field();
+            if value != crate::ai::CUSTOM_MODEL {
+                save_ai("model", &config::toml_string(&value));
+                *self.last_ai_model.borrow_mut() = value;
+            }
+            changed = true;
+        }
+        // Only committed while «Otro…» is chosen: the popup's own entries
+        // already wrote `[ai] model` the moment they were picked.
+        if self.ai_model_popup.value() == crate::ai::CUSTOM_MODEL && !self.is_editing(&self.ai_model_field) {
             let typed = self.ai_model_field.stringValue().to_string();
-            if typed.trim() != self.last_ai_model.borrow().trim() {
+            if !typed.trim().is_empty() && typed.trim() != self.last_ai_model.borrow().trim() {
                 save_ai("model", &config::toml_string(typed.trim()));
                 *self.last_ai_model.borrow_mut() = typed;
+                changed = true;
+            }
+        }
+        if self.ai_model_refresh.clicked() && !self.ai_model_running.get() {
+            self.ai_model_running.set(true);
+            self.ai_model_status.setStringValue(&NSString::from_str("Cargando modelos…"));
+            let backend = self.ai_backend.value();
+            let slot = Arc::clone(&self.ai_model_result);
+            std::thread::spawn(move || {
+                let result = crate::ai::refresh_models(&backend);
+                if let Ok(mut held) = slot.lock() {
+                    *held = Some(result);
+                }
+            });
+            changed = true;
+        }
+        if let Ok(mut slot) = self.ai_model_result.lock() {
+            if let Some(result) = slot.take() {
+                self.ai_model_running.set(false);
+                match result {
+                    Ok(models) => {
+                        self.ai_model_status.setStringValue(&NSString::from_str(""));
+                        self.apply_model_list(&models);
+                    }
+                    Err(why) => {
+                        self.ai_model_status.setStringValue(&NSString::from_str(&format!(
+                            "No se pudo listar los modelos: {why}"
+                        )));
+                        self.apply_model_list(&[]);
+                    }
+                }
                 changed = true;
             }
         }
@@ -2505,9 +2705,11 @@ mod tests {
     }
 
     #[test]
-    fn the_model_placeholder_names_the_backend_default_and_a_cli_agent_has_none() {
-        let providers = crate::ai::providers();
-        assert_eq!(model_placeholder(providers, "openai"), "por defecto: gpt-4o-mini");
-        assert_eq!(model_placeholder(providers, "claude-code"), "");
+    fn every_provider_has_a_wired_up_default_entry_in_the_model_popup() {
+        for info in crate::ai::providers() {
+            let options = crate::ai::model_popup_options(info.id, &[]);
+            assert_eq!(options.len(), 2, "{}", info.id);
+            assert_eq!(options.last().unwrap().value, crate::ai::CUSTOM_MODEL, "{}", info.id);
+        }
     }
 }

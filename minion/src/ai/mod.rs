@@ -496,10 +496,199 @@ pub fn has_key(provider: &str) -> bool {
     keychain_key(provider).is_some()
 }
 
+/// Masks a key down to its first and last four characters — enough for the
+/// person who stored it to recognise which one it is, never enough to
+/// reconstruct it. A key too short for that to hide anything is shown as a
+/// plain "hidden" mark instead of a preview that would give most of it
+/// away.
+pub fn mask_key(key: &str) -> String {
+    let chars: Vec<char> = key.chars().collect();
+    if chars.len() < 12 {
+        return "••••…".to_string();
+    }
+    let head: String = chars[..4].iter().collect();
+    let tail: String = chars[chars.len() - 4..].iter().collect();
+    format!("{head}…{tail}")
+}
+
+/// A masked preview of the key on file for `provider`, for the
+/// preferences window to show once a key is stored instead of the entry
+/// field — through the same [`Keychain`] indirection as [`has_key`], so a
+/// test run never touches the real one.
+pub fn key_preview(provider: &str) -> Option<String> {
+    keychain_key(provider).map(|key| mask_key(&key))
+}
+
 /// Removes whatever key is on file for `provider`. Not an error when
 /// there was none.
 pub fn forget_key(provider: &str) -> Result<(), String> {
     (keychain().delete)(provider)
+}
+
+/// One model a provider says it can use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelInfo {
+    /// What `[ai] model` is set to.
+    pub id: String,
+    /// What the popup shows. Falls back to `id` when a provider has
+    /// nothing nicer to call it.
+    pub label: String,
+}
+
+impl ModelInfo {
+    fn plain(id: impl Into<String>) -> Self {
+        let id = id.into();
+        Self { label: id.clone(), id }
+    }
+}
+
+/// One entry the model popup shows: a label, and the `[ai] model` value
+/// choosing it writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelOption {
+    pub label: String,
+    pub value: String,
+}
+
+/// The value a chosen [`ModelOption`] carries for "type your own" — picked
+/// when the stored model is not one [`list_models`] turned up, whether
+/// because it is a private deployment or because the list has not loaded
+/// yet.
+pub const CUSTOM_MODEL: &str = "__custom__";
+
+/// How long listing a provider's models may take. Same order of magnitude
+/// as [`PROBE_TIMEOUT`]: this is a person waiting on a popup, not a batch
+/// job.
+pub const MODELS_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The wording the popup's first entry uses for "nothing chosen", per
+/// provider — the CLI agents each have their own idea of what that means,
+/// and everyone else just gets "Por defecto".
+fn default_model_label(provider: &str) -> &'static str {
+    match provider {
+        "claude-code" => "Por defecto del plan",
+        "codex" => "Por defecto de Codex",
+        _ => "Por defecto",
+    }
+}
+
+/// Builds the popup's entries: the provider's own "default" wording
+/// first, then whatever [`list_models`] found, then «Otro…» for a custom
+/// id kept for a private deployment.
+///
+/// Pure — `models` is already fetched by the caller — so the popup's
+/// content can be checked without a network call.
+pub fn model_popup_options(provider: &str, models: &[ModelInfo]) -> Vec<ModelOption> {
+    let mut options =
+        vec![ModelOption { label: default_model_label(provider).to_string(), value: String::new() }];
+    for model in models {
+        options.push(ModelOption { label: model.label.clone(), value: model.id.clone() });
+    }
+    options.push(ModelOption { label: "Otro…".to_string(), value: CUSTOM_MODEL.to_string() });
+    options
+}
+
+/// The models a provider has fetched already, kept for the life of the
+/// process — one popup opening should not mean one request per keystroke,
+/// and the list does not change while Minion is running.
+static MODEL_CACHE: Mutex<Option<std::collections::HashMap<String, Vec<ModelInfo>>>> =
+    Mutex::new(None);
+
+fn cached_models(provider: &str) -> Option<Vec<ModelInfo>> {
+    MODEL_CACHE.lock().ok()?.as_ref()?.get(provider).cloned()
+}
+
+fn cache_models(provider: &str, models: Vec<ModelInfo>) {
+    if let Ok(mut held) = MODEL_CACHE.lock() {
+        held.get_or_insert_with(std::collections::HashMap::new).insert(provider.to_string(), models);
+    }
+}
+
+/// The models `provider` offers, from the process-lifetime cache if it is
+/// there already.
+pub fn list_models(provider: &str) -> Result<Vec<ModelInfo>, AiError> {
+    if let Some(cached) = cached_models(provider) {
+        return Ok(cached);
+    }
+    refresh_models(provider)
+}
+
+/// The models `provider` offers, ignoring whatever is cached — for
+/// «Actualizar modelos».
+pub fn refresh_models(provider: &str) -> Result<Vec<ModelInfo>, AiError> {
+    let models = fetch_models(provider)?;
+    cache_models(provider, models.clone());
+    Ok(models)
+}
+
+/// Sorted by id, with duplicates collapsed.
+fn sorted_models(mut models: Vec<ModelInfo>) -> Vec<ModelInfo> {
+    models.sort_by(|a, b| a.id.cmp(&b.id));
+    models.dedup_by(|a, b| a.id == b.id);
+    models
+}
+
+/// Moves the entry matching `default`, if there is one, to the front —
+/// providers answer their model list in whatever order they like, and the
+/// one already in use is the one worth seeing first.
+fn move_default_first(default: &str, mut models: Vec<ModelInfo>) -> Vec<ModelInfo> {
+    if let Some(index) = models.iter().position(|model| model.id == default) {
+        let found = models.remove(index);
+        models.insert(0, found);
+    }
+    models
+}
+
+/// The key stored for `provider`, or the Spanish complaint [`list_models`]
+/// surfaces under the popup when there is none.
+fn stored_key_for_listing(provider: &str) -> Result<String, AiError> {
+    keychain_key(provider).ok_or_else(|| {
+        AiError::NotConfigured(format!("no hay clave guardada para «{provider}»"))
+    })
+}
+
+/// Asks `provider` itself, dispatching by kind. Not cached — [`list_models`]
+/// and [`refresh_models`] own that.
+fn fetch_models(provider: &str) -> Result<Vec<ModelInfo>, AiError> {
+    match provider {
+        "claude-code" => Ok(cli::CLAUDE_CODE_MODELS
+            .iter()
+            .map(|(id, label)| ModelInfo { id: (*id).to_string(), label: (*label).to_string() })
+            .collect()),
+        "gemini-cli" => Ok(cli::GEMINI_MODELS.iter().copied().map(ModelInfo::plain).collect()),
+        "codex" => Ok(cli::codex_configured_model()
+            .map(|model| {
+                vec![ModelInfo { label: format!("El de tu config.toml («{model}»)"), id: model }]
+            })
+            .unwrap_or_default()),
+        "anthropic" => {
+            let key = stored_key_for_listing("anthropic")?;
+            let headers = vec![
+                "content-type: application/json".to_string(),
+                format!("anthropic-version: {}", anthropic::API_VERSION),
+                format!("x-api-key: {key}"),
+            ];
+            let body = get_json(anthropic::MODELS_URL, &headers, MODELS_TIMEOUT)?;
+            let models = anthropic::parse_models_response(&body)?;
+            Ok(move_default_first(anthropic::DEFAULT_MODEL, sorted_models(models)))
+        }
+        _ => {
+            let preset = openai_compat::preset(provider).ok_or_else(|| {
+                AiError::NotConfigured(format!("no conozco el backend «{provider}»"))
+            })?;
+            let key =
+                if preset.needs_key { stored_key_for_listing(provider)? } else { String::new() };
+            let url = format!("{}/models", preset.base_url.trim_end_matches('/'));
+            let mut headers = vec!["content-type: application/json".to_string()];
+            if !key.is_empty() {
+                headers.push(format!("authorization: Bearer {key}"));
+            }
+            let body = get_json(&url, &headers, MODELS_TIMEOUT)?;
+            let ids = openai_compat::parse_models_response(&body)?;
+            let models: Vec<ModelInfo> = ids.into_iter().map(ModelInfo::plain).collect();
+            Ok(move_default_first(preset.model, sorted_models(models)))
+        }
+    }
 }
 
 /// One backend `[ai] backend` accepts, as the preferences window's
@@ -1000,17 +1189,35 @@ pub fn post_json(
     body: &str,
     timeout: Duration,
 ) -> Result<String, AiError> {
+    request_json("POST", url, headers, Some(body), timeout)
+}
+
+/// Sends one `GET` and returns the body that came back. Same reasoning as
+/// [`post_json`] — everything goes to curl over stdin, nothing on `argv`.
+pub fn get_json(url: &str, headers: &[String], timeout: Duration) -> Result<String, AiError> {
+    request_json("GET", url, headers, None, timeout)
+}
+
+fn request_json(
+    method: &str,
+    url: &str,
+    headers: &[String],
+    body: Option<&str>,
+    timeout: Duration,
+) -> Result<String, AiError> {
     use std::io::Write;
 
     let mut config = String::new();
     config.push_str("silent\nshow-error\n");
     config.push_str(&format!("max-time = {}\n", timeout.as_secs()));
-    config.push_str("request = \"POST\"\n");
+    config.push_str(&format!("request = \"{method}\"\n"));
     config.push_str(&format!("url = {}\n", curl_quote(url)));
     for header in headers {
         config.push_str(&format!("header = {}\n", curl_quote(header)));
     }
-    config.push_str(&format!("data-raw = {}\n", curl_quote(body)));
+    if let Some(body) = body {
+        config.push_str(&format!("data-raw = {}\n", curl_quote(body)));
+    }
 
     let mut child = std::process::Command::new("/usr/bin/curl")
         .arg("--config")
@@ -1315,5 +1522,79 @@ mod tests {
     #[test]
     fn forgetting_a_key_that_was_never_there_is_not_an_error() {
         assert!(forget_key("proveedor-sin-clave-de-prueba").is_ok());
+    }
+
+    #[test]
+    fn a_long_key_is_masked_to_its_first_and_last_four() {
+        assert_eq!(mask_key("sk-abcdefghijx9Q2"), "sk-a…x9Q2");
+    }
+
+    #[test]
+    fn a_short_key_is_fully_hidden() {
+        assert_eq!(mask_key("sk-short"), "••••…");
+    }
+
+    #[test]
+    fn a_stored_key_has_a_masked_preview_and_a_forgotten_one_has_none() {
+        assert_eq!(key_preview("proveedor-preview-de-prueba"), None);
+        store_key("proveedor-preview-de-prueba", "sk-abcdefghijx9Q2").unwrap();
+        assert_eq!(key_preview("proveedor-preview-de-prueba").as_deref(), Some("sk-a…x9Q2"));
+        forget_key("proveedor-preview-de-prueba").unwrap();
+        assert_eq!(key_preview("proveedor-preview-de-prueba"), None);
+    }
+
+    #[test]
+    fn the_popup_lists_the_default_first_then_the_models_then_otro() {
+        let models = vec![
+            ModelInfo { id: "gpt-4o".into(), label: "gpt-4o".into() },
+            ModelInfo { id: "gpt-4o-mini".into(), label: "gpt-4o-mini".into() },
+        ];
+        let options = model_popup_options("openai", &models);
+        assert_eq!(options.len(), 4);
+        assert_eq!(options[0], ModelOption { label: "Por defecto".into(), value: String::new() });
+        assert_eq!(options[1].value, "gpt-4o");
+        assert_eq!(options[2].value, "gpt-4o-mini");
+        assert_eq!(
+            options[3],
+            ModelOption { label: "Otro…".into(), value: CUSTOM_MODEL.to_string() }
+        );
+    }
+
+    #[test]
+    fn the_default_entry_is_worded_per_provider() {
+        assert_eq!(model_popup_options("claude-code", &[])[0].label, "Por defecto del plan");
+        assert_eq!(model_popup_options("codex", &[])[0].label, "Por defecto de Codex");
+        assert_eq!(model_popup_options("mistral", &[])[0].label, "Por defecto");
+    }
+
+    #[test]
+    fn an_empty_model_list_still_has_the_default_and_otro() {
+        let options = model_popup_options("gemini-cli", &[]);
+        assert_eq!(options.len(), 2);
+    }
+
+    #[test]
+    fn fixed_lists_need_no_key_and_no_network() {
+        assert_eq!(list_models("claude-code").unwrap().len(), 3);
+        assert_eq!(list_models("gemini-cli").unwrap(), vec![
+            ModelInfo::plain("gemini-2.5-pro"),
+            ModelInfo::plain("gemini-2.5-flash"),
+        ]);
+    }
+
+    #[test]
+    fn an_http_provider_without_a_key_is_refused_before_any_request() {
+        assert!(matches!(fetch_models("openai"), Err(AiError::NotConfigured(_))));
+    }
+
+    #[test]
+    fn moving_the_default_first_leaves_the_rest_sorted() {
+        let models = sorted_models(vec![
+            ModelInfo::plain("b"),
+            ModelInfo::plain("a"),
+            ModelInfo::plain("c"),
+        ]);
+        let ordered = move_default_first("c", models);
+        assert_eq!(ordered.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), vec!["c", "a", "b"]);
     }
 }

@@ -25,6 +25,9 @@ pub const DEFAULT_URL: &str = "https://api.anthropic.com/v1/messages";
 /// Used when `[ai] model` is empty.
 pub const DEFAULT_MODEL: &str = "claude-opus-5";
 
+/// Where `ai::list_models("anthropic")` asks.
+pub const MODELS_URL: &str = "https://api.anthropic.com/v1/models";
+
 /// Same reasoning as the OpenAI-compatible side: this is read out loud.
 const MAX_TOKENS: u32 = 400;
 
@@ -103,6 +106,39 @@ pub fn parse_response(body: &str) -> Result<String, AiError> {
         return Err(AiError::Parse("respuesta sin texto".into()));
     }
     Ok(text)
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelsResponse {
+    #[serde(default)]
+    data: Vec<ModelEntry>,
+    #[serde(default)]
+    error: Option<ApiError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelEntry {
+    id: String,
+    #[serde(default)]
+    display_name: String,
+}
+
+/// Reads `GET /v1/models`'s `data[].id` and `display_name`. The label
+/// falls back to the id itself for the odd entry with nothing nicer.
+pub fn parse_models_response(body: &str) -> Result<Vec<super::ModelInfo>, AiError> {
+    let response: ModelsResponse =
+        serde_json::from_str(body).map_err(|e| AiError::Parse(format!("{e}: {body}")))?;
+    if let Some(error) = response.error {
+        return Err(AiError::Backend(error.message));
+    }
+    Ok(response
+        .data
+        .into_iter()
+        .map(|entry| super::ModelInfo {
+            label: if entry.display_name.is_empty() { entry.id.clone() } else { entry.display_name },
+            id: entry.id,
+        })
+        .collect())
 }
 
 /// A live conversation with the Anthropic API.
@@ -229,5 +265,45 @@ mod tests {
     #[test]
     fn html_from_a_proxy_is_a_parse_error_not_a_panic() {
         assert!(matches!(parse_response("<html>502</html>"), Err(AiError::Parse(_))));
+    }
+
+    /// A real `/v1/models` answer, trimmed of the fields Minion does not
+    /// read.
+    const MODELS: &str = r#"{
+      "data": [
+        {"type": "model", "id": "claude-opus-5", "display_name": "Claude Opus 5", "created_at": "2026-01-01T00:00:00Z"},
+        {"type": "model", "id": "claude-sonnet-5", "display_name": "Claude Sonnet 5", "created_at": "2026-01-01T00:00:00Z"}
+      ],
+      "has_more": false,
+      "first_id": "claude-opus-5",
+      "last_id": "claude-sonnet-5"
+    }"#;
+
+    #[test]
+    fn models_are_read_with_their_display_name() {
+        let models = parse_models_response(MODELS).unwrap();
+        assert_eq!(
+            models,
+            vec![
+                super::super::ModelInfo { id: "claude-opus-5".into(), label: "Claude Opus 5".into() },
+                super::super::ModelInfo {
+                    id: "claude-sonnet-5".into(),
+                    label: "Claude Sonnet 5".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_missing_display_name_falls_back_to_the_id() {
+        let body = r#"{"data":[{"type":"model","id":"claude-haiku-5"}]}"#;
+        let models = parse_models_response(body).unwrap();
+        assert_eq!(models[0].label, "claude-haiku-5");
+    }
+
+    #[test]
+    fn a_models_error_is_reported_with_its_message() {
+        let body = r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#;
+        assert_eq!(parse_models_response(body), Err(AiError::Backend("invalid x-api-key".into())));
     }
 }
