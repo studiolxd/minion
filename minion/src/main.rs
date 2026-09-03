@@ -9,6 +9,7 @@
 
 mod actions;
 mod answers;
+mod api;
 mod audio;
 mod commands;
 mod config;
@@ -19,6 +20,7 @@ mod icon;
 mod journal;
 mod learn;
 mod models;
+mod notify;
 mod preferences;
 mod session;
 mod spanish;
@@ -26,6 +28,7 @@ mod speech;
 mod startup;
 mod speaker;
 mod text;
+mod timers;
 
 use std::cell::Cell;
 use std::path::Path;
@@ -984,6 +987,42 @@ fn run_menu_bar(
                     open_for_timer.store(true, Ordering::Relaxed);
                 }
             }
+
+            // Timers and alarms due since the last check — see
+            // answers::announce_due_timers for the chime, the spoken
+            // reply and the notification each one gets.
+            answers::announce_due_timers();
+
+            // Requests left by `minion run "…"` / `minion say "…"`: a
+            // second process, typically a keyboard shortcut, asking this
+            // running copy to act or speak. Handled here rather than on
+            // the listening thread — see api.rs for why — so a `run`
+            // cannot continue a dictation session or be undone with
+            // "deshaz", and the speaker check does not apply to it at all.
+            let requests = api::pending();
+            if !requests.is_empty() {
+                let config = config::load();
+                let voice = config.voice();
+                let device = config.speaker();
+                let context = actions::frontmost_app();
+                let reply = api::ReplySettings {
+                    voice: voice.as_deref(),
+                    rate: config.speech_rate(),
+                    device: device.as_deref(),
+                    speak: config.speak,
+                    notifications: config.notifications,
+                };
+                for request in &requests {
+                    api::handle(request, &reply, context.as_deref());
+                }
+            }
+
+            // Written only when it disagrees with what is already on
+            // disk, so `minion status` has something to read without the
+            // timer rewriting the file once a second regardless.
+            let listening = active_for_timer.load(Ordering::Relaxed);
+            let on_disk = api::read_status_file();
+            api::write_status_if_changed(listening, on_disk.as_deref());
         }
 
         // The rest of this closure is the expensive part: reading every
@@ -1491,7 +1530,14 @@ fn main() -> Result<()> {
                  minion learn [--apply]      convierte en alias lo que no entendió\n  \
                  minion enroll               aprende tu voz desde la terminal\n  \
                  minion export-icon <dir>    guarda el icono como .iconset\n  \
+                 minion run \"orden\"          la ejecuta, como si la hubieras dicho\n  \
+                 minion say \"texto\"          lo dice en voz alta\n  \
+                 minion status               si Minion está escuchando o en pausa\n  \
                  minion --help               esto\n\n\
+                 «run» y «say» dejan un aviso para la copia que ya está en\n\
+                 marcha y no hacen nada si no hay ninguna — útil para atajos\n\
+                 de teclado (Atajos.app, Raycast): un atajo con\n\
+                 «minion run \"cierra la pestaña\"» hace lo mismo que decirlo.\n\n\
                  Variables de entorno:\n  \
                  MINION_MODEL                carpeta del modelo de reconocimiento\n\n\
                  Registro: ~/Library/Logs/minion.log\n\
@@ -1514,6 +1560,22 @@ fn main() -> Result<()> {
             let config = config::load();
             commands::configure(&config);
             learn::run(&config, apply);
+            return Ok(());
+        }
+        if argument == "run" || argument == "say" {
+            let Some(text) = std::env::args().nth(2) else {
+                eprintln!("Uso: minion {argument} \"texto\"");
+                std::process::exit(1);
+            };
+            let request = if argument == "run" { api::request_run(&text) } else { api::request_say(&text) };
+            if let Err(reason) = request {
+                eprintln!("No se pudo dejar el aviso para Minion: {reason}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        if argument == "status" {
+            api::print_status();
             return Ok(());
         }
     }

@@ -32,7 +32,26 @@ point and there is nowhere else to put it.
 «minion, ¿qué volumen tengo?»
 «minion, ¿me oyes?»                → «Sí, te escucho»
 «minion, ¿qué he dicho hoy?»       → «40 órdenes hoy, y 3 que no entendí»
+«minion, ¿qué suena?»              → «Vértigo de Ela Minus»
+«minion, ¿qué apps tengo abiertas?»
+«minion, ¿cuánto espacio queda?»   → «212.4 GB libres»
+«minion, ¿estoy conectado?»
+«minion, ¿qué día de la semana es el 12?»
 ```
+
+**Temporizadores y alarmas** — «pon un temporizador de cinco minutos»,
+«avísame en diez minutos», «pon una alarma a las ocho y media». Numbers as
+words (1–59, «y media», «y cuarto», «menos cuarto»). «¿cuánto queda?» and
+«cancela el temporizador» work on whatever is pending. When one goes off:
+a chime, a spoken line, and a Notification Center banner — the banner
+regardless of `speak`, since the point of a timer is to be noticed even
+from another room.
+
+**Reading aloud** — «lee esto» / «lee la selección» copies the current
+selection (⌘C, then puts the previous clipboard back), «lee el
+portapapeles» reads whatever is already on it, «para de leer» stops
+mid-sentence. Long text is read one sentence at a time so it can actually
+be interrupted rather than only after the whole thing finishes.
 
 It stays quiet for commands. Opening Chrome is something you can see, and
 announcing it would be noise arriving after the fact — the icon's blink
@@ -150,7 +169,38 @@ minion --help                       # this, in Spanish
 minion enroll                       # record a voice profile without the window
 minion export-icon <directory>      # write the menu-bar face as a .iconset
 minion learn [--apply]              # turn `unknown` log lines into aliases
+minion run "abre chrome"            # runs an order, as if you had said it
+minion say "hola"                   # speaks (or notifies) some text
+minion status                       # whether the running copy is listening
 ```
+
+## Local API
+
+`minion run` and `minion say` leave a small request file for the copy that
+is already running and exit immediately — they do nothing on their own,
+and nothing if Minion is not running. The running copy picks the request up
+on the same once-a-second timer that already checks for a duplicate
+launch, runs it with the wake word prefixed (`run`) or speaks it directly
+(`say`), and logs it as `api` rather than `ran`, so the two sources stay
+apart in `minion.log`.
+
+This is meant for a keyboard shortcut or a launcher, not for scripting a
+sequence of steps: a `run` command is not part of a dictation session and
+cannot be undone with "deshaz" the way something actually heard can, and
+the speaker check does not apply to it — running it from a shortcut has
+already proven who is at the keyboard.
+
+**Raycast** — a Script Command:
+
+```bash
+#!/bin/bash
+# @raycast.title Minion: cierra la pestaña
+# @raycast.mode silent
+/Applications/Minion.app/Contents/MacOS/minion run "cierra la pestaña"
+```
+
+**Atajos (Shortcuts.app)** — a "Run Shell Script" action calling the same
+binary and arguments, bound to whatever trigger you like.
 
 ## How it works
 
@@ -413,7 +463,7 @@ what is still missing rather than everything that ever failed.
 cargo test
 ```
 
-179 tests. The ones that matter most check that ordinary conversation is
+235 tests. The ones that matter most check that ordinary conversation is
 ignored, that every declared phrase reaches its own command, and that no
 two commands claim the same phrase.
 

@@ -6,13 +6,21 @@
 //!
 //! Kept short and plain. A reply heard forty times a day should not be
 //! trying to entertain.
+//!
+//! Two questions carry data the fixed [`ASKED`] table cannot hold — a
+//! duration, a clock time — so [`asked`] parses those itself, in
+//! [`crate::timers`], before falling back to the table. Everything else,
+//! including "cancela el temporizador" and "¿cuánto queda?", is a plain
+//! phrase like any other.
 
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
-use chrono::{Datelike, Local, Timelike};
+use chrono::{Datelike, Local, NaiveDate, NaiveTime, Timelike};
+use objc2_app_kit::{NSApplicationActivationPolicy, NSWorkspace};
 
 /// The questions Minion can answer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Question {
     Time,
     Date,
@@ -22,6 +30,23 @@ pub enum Question {
     Activity,
     /// What can I say? Opens the list rather than reciting it.
     Help,
+    /// "pon un temporizador de cinco minutos" — how long, and the words
+    /// that named it, for the confirmation reply.
+    Timer(Duration, String),
+    /// "pon una alarma a las ocho y media" — when, and the words that
+    /// named it.
+    Alarm(NaiveTime, String),
+    CancelTimer,
+    TimeLeft,
+    NowPlaying,
+    OpenApps,
+    DiskSpace,
+    Connectivity,
+    /// "¿qué día de la semana es el 12?" — the day of the current month.
+    Weekday(u32),
+    ReadSelection,
+    ReadClipboard,
+    StopReading,
 }
 
 /// Ways of asking each one.
@@ -32,18 +57,65 @@ const ASKED: &[(Question, &[&str])] = &[
     (Question::Volume, &["que volumen tengo", "como esta el volumen"]),
     (Question::Listening, &["me oyes", "me escuchas", "estas ahi"]),
     (Question::Activity, &["que he dicho hoy", "cuantas ordenes llevo"]),
+    (Question::CancelTimer, &["cancela el temporizador", "cancela la alarma", "quita el temporizador"]),
+    (Question::TimeLeft, &["cuanto queda", "cuanto falta", "cuanto queda del temporizador"]),
+    (Question::NowPlaying, &["que suena", "que esta sonando", "que cancion es esta", "que se esta escuchando"]),
+    (Question::OpenApps, &["que apps tengo abiertas", "que aplicaciones tengo abiertas", "que tengo abierto"]),
+    (Question::DiskSpace, &["cuanto espacio queda", "cuanto espacio libre tengo", "cuanto disco me queda"]),
+    (Question::Connectivity, &["estoy conectado", "tengo internet", "hay conexion", "tengo conexion a internet"]),
+    (Question::ReadSelection, &["lee esto", "lee la seleccion"]),
+    (Question::ReadClipboard, &["lee el portapapeles"]),
+    (Question::StopReading, &["para de leer", "deja de leer"]),
     (Question::Help, &["que puedes hacer", "que te puedo decir", "ayuda",
                        "que ordenes hay", "que se decir"]),
 ];
 
+/// A duration, a clock time, or a day of the month named inside the
+/// sentence — the three things [`ASKED`]'s fixed phrasings cannot hold,
+/// since the number is never the same twice.
+///
+/// Gated on a keyword first, so "pon música" is never mistaken for a
+/// timer just because some other sentence happens to share a number word
+/// with it.
+fn parse_variable(rest: &str) -> Option<Question> {
+    if rest.contains("temporizador") || rest.contains("avisa") {
+        if let Some((duration, label)) = crate::timers::parse_duration(rest) {
+            return Some(Question::Timer(duration, label));
+        }
+    }
+    if rest.contains("alarma") {
+        if let Some((time, label)) = crate::timers::parse_alarm(rest) {
+            return Some(Question::Alarm(time, label));
+        }
+    }
+    if rest.contains("dia") && rest.contains("semana") {
+        if let Some(day) = weekday_target(rest) {
+            return Some(Question::Weekday(day));
+        }
+    }
+    None
+}
+
+/// The day-of-month named after "el" in "¿qué día de la semana es el 12?".
+fn weekday_target(rest: &str) -> Option<u32> {
+    let words: Vec<&str> = rest.split_whitespace().collect();
+    let position = words.iter().position(|w| *w == "el")?;
+    let (day, _) = crate::timers::number_at(&words, position + 1)?;
+    (1..=31).contains(&day).then_some(day)
+}
+
 /// Recognises a question, if the sentence is one.
 pub fn asked(rest: &str, threshold: f32) -> Option<Question> {
+    if let Some(question) = parse_variable(rest) {
+        return Some(question);
+    }
+
     let mut best: Option<(Question, f32)> = None;
     for (question, phrasings) in ASKED {
         for phrasing in *phrasings {
             let score = crate::text::similarity(rest, phrasing);
-            if score >= threshold && best.is_none_or(|(_, previous)| score > previous) {
-                best = Some((*question, score));
+            if score >= threshold && best.as_ref().is_none_or(|(_, previous)| score > *previous) {
+                best = Some((question.clone(), score));
             }
         }
     }
@@ -66,6 +138,95 @@ pub fn answer(question: Question, listening: bool) -> String {
         // Answered by opening the window: reading forty commands aloud
         // would be worse than useless.
         Question::Help => "Te abro la lista.".into(),
+        Question::Timer(duration, label) => {
+            crate::timers::schedule_timer(duration, label.clone());
+            format!("Temporizador de {label}.")
+        }
+        Question::Alarm(time, label) => {
+            crate::timers::schedule_alarm(time, label.clone());
+            format!("Alarma {label}.")
+        }
+        Question::CancelTimer => match crate::timers::cancel_all() {
+            0 => "No tenías ningún temporizador ni alarma.".into(),
+            1 => "Cancelado.".into(),
+            n => format!("Cancelados {n}."),
+        },
+        Question::TimeLeft => match crate::timers::time_left() {
+            None => "No tienes ningún temporizador ni alarma.".into(),
+            Some((label, seconds)) => spoken_time_left(&label, seconds),
+        },
+        Question::NowPlaying => now_playing(),
+        Question::OpenApps => open_apps(),
+        Question::DiskSpace => disk_space(),
+        Question::Connectivity => connectivity(),
+        Question::Weekday(day) => weekday_of(day),
+        Question::ReadSelection => match read_selection() {
+            Some(text) => text,
+            None => "No hay nada seleccionado.".into(),
+        },
+        Question::ReadClipboard => match read_clipboard() {
+            Some(text) => text,
+            None => "El portapapeles está vacío.".into(),
+        },
+        Question::StopReading => {
+            crate::speech::stop();
+            "Vale.".into()
+        }
+    }
+}
+
+/// The chime a finished timer plays, before it is spoken and notified.
+const CHIME: &str = "/System/Library/Sounds/Glass.aiff";
+
+/// Announces every timer or alarm that came due since the last check: a
+/// chime, a spoken line, and a notification.
+///
+/// The notification is posted regardless of `speak`, and regardless of
+/// whether Minion is even listening right now — the whole point of a
+/// timer is to be noticed from another room, or with the sound off, which
+/// a spoken reply alone cannot do.
+pub fn announce_due_timers() {
+    let due = crate::timers::take_due();
+    if due.is_empty() {
+        return;
+    }
+    let config = crate::config::load();
+    for timer in due {
+        let message = match timer.kind {
+            crate::timers::Kind::Timer => format!("Han pasado {}.", timer.label),
+            crate::timers::Kind::Alarm => format!("Alarma: {}.", timer.label),
+        };
+        crate::journal::write(&format!("timer    {message}"));
+        if config.sounds {
+            let _ = crate::actions::play_sound(CHIME);
+        }
+        if config.speak {
+            let deaf = std::sync::atomic::AtomicBool::new(false);
+            crate::speech::say(
+                &message,
+                config.voice().as_deref(),
+                config.speech_rate(),
+                config.speaker().as_deref(),
+                &deaf,
+                Duration::from_millis(200),
+            );
+        }
+        if config.notifications {
+            crate::notify::post("Minion", &message);
+        }
+    }
+}
+
+/// "quedan cuatro minutos", or the seconds themselves once it is nearly
+/// due — a countdown in minutes would round "quedan 0 minutos" right up
+/// until it fires.
+fn spoken_time_left(label: &str, seconds: i64) -> String {
+    if seconds < 60 {
+        format!("Quedan {seconds} segundos para {label}.")
+    } else {
+        let minutes = (seconds + 30) / 60;
+        let unit = if minutes == 1 { "minuto" } else { "minutos" };
+        format!("Quedan {minutes} {unit} para {label}.")
     }
 }
 
@@ -118,6 +279,20 @@ fn spoken_date() -> String {
         .unwrap_or("");
     let month = MONTHS.get(now.month0() as usize).copied().unwrap_or("");
     format!("{day}, {} de {month}", now.day())
+}
+
+/// The weekday of `day` in the current month, spoken the same way
+/// [`spoken_date`] names one.
+fn weekday_of(day: u32) -> String {
+    const DAYS: &[&str] = &[
+        "lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo",
+    ];
+    let now = Local::now();
+    let Some(date) = NaiveDate::from_ymd_opt(now.year(), now.month(), day) else {
+        return format!("Este mes no tiene día {day}.");
+    };
+    let name = DAYS.get(date.weekday().num_days_from_monday() as usize).copied().unwrap_or("");
+    format!("El {day} es {name}.")
 }
 
 fn battery() -> String {
@@ -179,6 +354,136 @@ fn activity() -> String {
     }
 }
 
+/// The track playing in Spotify or Music, whichever is running — Spotify
+/// first, since it is the more likely of the two to be open at all.
+fn now_playing() -> String {
+    const SCRIPT: &str = r#"
+        if application "Spotify" is running then
+            tell application "Spotify"
+                if player state is playing then
+                    name of current track & " de " & artist of current track
+                else
+                    "Spotify está en pausa."
+                end if
+            end tell
+        else if application "Music" is running then
+            tell application "Music"
+                if player state is playing then
+                    name of current track & " de " & artist of current track
+                else
+                    "Music está en pausa."
+                end if
+            end tell
+        else
+            "No suena nada."
+        end if
+    "#;
+    let Ok(output) = Command::new("/usr/bin/osascript").arg("-e").arg(SCRIPT).output() else {
+        return "No he podido mirar qué suena.".into();
+    };
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() {
+        "No he podido mirar qué suena.".into()
+    } else {
+        text
+    }
+}
+
+/// Regular, user-facing applications — not menu-bar extras and background
+/// helpers, which `NSRunningApplication` also lists but nobody thinks of
+/// as "open". Up to eight names: past that it is a listing, not an answer.
+fn open_apps() -> String {
+    let workspace = NSWorkspace::sharedWorkspace();
+    let running = workspace.runningApplications();
+    let mut names: Vec<String> = Vec::new();
+    for app in running.iter() {
+        if names.len() >= 8 {
+            break;
+        }
+        if app.activationPolicy() != NSApplicationActivationPolicy::Regular {
+            continue;
+        }
+        if let Some(name) = app.localizedName() {
+            names.push(name.to_string());
+        }
+    }
+    if names.is_empty() {
+        "No veo ninguna aplicación abierta.".into()
+    } else {
+        names.join(", ")
+    }
+}
+
+/// Free space on the startup disk, `statvfs` rather than `df`: one syscall
+/// instead of a subprocess and a column to parse.
+fn disk_space() -> String {
+    let root = std::ffi::CString::new("/").expect("no interior nul");
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let ok = unsafe { libc::statvfs(root.as_ptr(), &mut stat) } == 0;
+    if !ok {
+        return "No he podido mirar el espacio libre.".into();
+    }
+    let available_bytes = stat.f_bavail as u64 * stat.f_frsize as u64;
+    let gib = available_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    format!("{gib:.1} GB libres.")
+}
+
+/// A one-second TCP connect to a well-known address, rather than anything
+/// that needs entitlements or a framework of its own. Bounded: this runs
+/// on the thread that is about to speak the answer, never the one
+/// listening for the next utterance, but it still must not hang if the
+/// network is down rather than merely absent.
+fn connectivity() -> String {
+    use std::net::{TcpStream, ToSocketAddrs};
+    let Ok(mut addresses) = "1.1.1.1:443".to_socket_addrs() else {
+        return "No he podido comprobarlo.".into();
+    };
+    let Some(address) = addresses.next() else {
+        return "No he podido comprobarlo.".into();
+    };
+    match TcpStream::connect_timeout(&address, Duration::from_secs(1)) {
+        Ok(_) => "Sí, tienes conexión.".into(),
+        Err(_) => "No, no tienes conexión.".into(),
+    }
+}
+
+/// Reads the clipboard as plain text, via `pbpaste` rather than
+/// `NSPasteboard` directly — one process instead of a new AppKit
+/// dependency, for exactly the two operations this needs.
+fn read_clipboard() -> Option<String> {
+    let output = Command::new("/usr/bin/pbpaste").output().ok()?;
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+fn write_clipboard(text: &str) {
+    use std::io::Write;
+    let Ok(mut child) = Command::new("/usr/bin/pbcopy").stdin(Stdio::piped()).spawn() else {
+        return;
+    };
+    if let Some(stdin) = child.stdin.as_mut() {
+        let _ = stdin.write_all(text.as_bytes());
+    }
+    let _ = child.wait();
+}
+
+/// Copies whatever is selected in the frontmost application, reads it, and
+/// puts the previous clipboard back — the same courtesy any tool that
+/// borrows the clipboard for a moment owes the thing it overwrote.
+fn read_selection() -> Option<String> {
+    let previous = read_clipboard();
+    crate::actions::press(crate::actions::key::C, crate::actions::Mods::CMD).ok()?;
+    // The pasteboard is filled asynchronously by whatever ⌘C reached; give
+    // it a moment before reading it back, or this reads the *old* clipboard
+    // — which is exactly what it is about to overwrite anyway.
+    std::thread::sleep(Duration::from_millis(150));
+    let copied = read_clipboard();
+    if let Some(previous) = previous {
+        write_clipboard(&previous);
+    }
+    copied
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,5 +530,93 @@ mod tests {
         let spoken = spoken_date();
         assert!(spoken.contains(" de "), "got «{spoken}»");
         assert!(spoken.contains(','), "should name the weekday, got «{spoken}»");
+    }
+
+    #[test]
+    fn a_timer_is_recognised_and_its_reply_names_what_was_asked() {
+        let question = asked("pon un temporizador de cinco minutos", 0.7);
+        assert_eq!(
+            question,
+            Some(Question::Timer(Duration::from_secs(300), "cinco minutos".into()))
+        );
+        assert_eq!(answer(question.unwrap(), true), "Temporizador de cinco minutos.");
+        crate::timers::cancel_all();
+    }
+
+    #[test]
+    fn asking_to_be_told_recognises_the_same_shape_as_pon() {
+        let question = asked("avisame en diez minutos", 0.7);
+        assert_eq!(
+            question,
+            Some(Question::Timer(Duration::from_secs(600), "diez minutos".into()))
+        );
+        crate::timers::cancel_all();
+    }
+
+    #[test]
+    fn an_alarm_is_recognised() {
+        let question = asked("pon una alarma a las ocho y media", 0.7);
+        assert!(matches!(question, Some(Question::Alarm(_, _))));
+        if let Some(Question::Alarm(_, label)) = question {
+            assert_eq!(label, "a las ocho y media");
+        }
+        crate::timers::cancel_all();
+    }
+
+    #[test]
+    fn cancel_and_time_left_are_plain_phrases() {
+        assert_eq!(asked("cancela el temporizador", 0.7), Some(Question::CancelTimer));
+        assert_eq!(asked("cuanto queda", 0.7), Some(Question::TimeLeft));
+    }
+
+    #[test]
+    fn a_weekday_question_carries_the_day_it_asked_about() {
+        assert_eq!(
+            asked("que dia de la semana es el 12", 0.7),
+            Some(Question::Weekday(12))
+        );
+    }
+
+    #[test]
+    fn the_weekday_answer_names_a_real_day() {
+        const DAYS: &[&str] = &[
+            "lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo",
+        ];
+        let spoken = weekday_of(12);
+        assert!(DAYS.iter().any(|day| spoken.contains(day)), "got «{spoken}»");
+    }
+
+    #[test]
+    fn a_day_outside_the_month_says_so_instead_of_panicking() {
+        let spoken = weekday_of(97);
+        assert!(spoken.contains("no tiene"), "got «{spoken}»");
+    }
+
+    #[test]
+    fn read_aloud_and_notification_questions_are_recognised() {
+        assert_eq!(asked("lee esto", 0.7), Some(Question::ReadSelection));
+        assert_eq!(asked("lee la seleccion", 0.7), Some(Question::ReadSelection));
+        assert_eq!(asked("lee el portapapeles", 0.7), Some(Question::ReadClipboard));
+        assert_eq!(asked("para de leer", 0.7), Some(Question::StopReading));
+        assert_eq!(asked("que suena", 0.7), Some(Question::NowPlaying));
+        assert_eq!(asked("que apps tengo abiertas", 0.7), Some(Question::OpenApps));
+        assert_eq!(asked("cuanto espacio queda", 0.7), Some(Question::DiskSpace));
+        assert_eq!(asked("estoy conectado", 0.7), Some(Question::Connectivity));
+    }
+
+    #[test]
+    fn stopping_a_read_answers_and_does_not_panic_with_nothing_playing() {
+        assert_eq!(answer(Question::StopReading, true), "Vale.");
+    }
+
+    #[test]
+    fn a_missing_clipboard_gets_a_spoken_reply_not_a_crash() {
+        // Cannot force the real clipboard empty from a test — this only
+        // exercises the "nothing on it" branch of the reply, in case
+        // read_clipboard ever returns None in this environment (a CI
+        // runner, say, with no pasteboard server).
+        if read_clipboard().is_none() {
+            assert_eq!(answer(Question::ReadClipboard, true), "El portapapeles está vacío.");
+        }
     }
 }
