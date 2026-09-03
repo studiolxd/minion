@@ -60,7 +60,7 @@ use commands::Decision;
 use session::{Outcome, Reply, Session, Undoable};
 
 /// What the tooltip says when there is nothing more particular to report.
-const TOOLTIP_IDLE: &str = "Minion — control por voz";
+const TOOLTIP_IDLE: &str = concat!("Minion ", env!("CARGO_PKG_VERSION"), " — control por voz");
 const TOOLTIP_LISTENING: &str = "Minion — escuchando";
 const TOOLTIP_PAUSED: &str = "Minion — en pausa";
 /// Push-to-talk's own pair, used instead of the two above when
@@ -2306,12 +2306,19 @@ fn main() -> Result<()> {
     // before any of that is set up.
     let first_argument = std::env::args().nth(1);
     if let Some(argument) = first_argument.as_deref() {
+        // The version, from the crate metadata: `Cargo.toml` is the one
+        // place it is written down, and `build-app.sh` reads the same
+        // line for the bundle's Info.plist.
+        if matches!(argument, "--version" | "-V" | "version") {
+            println!("minion {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
         if matches!(argument, "--help" | "-h" | "help") {
             // Spanish: everything the person running this reads is in
             // Spanish, and this is read by nobody else. Without it,
             // `minion --help` went looking for a model called «--help».
             println!(
-                "Minion — control por voz en español.\n\n\
+                "Minion {version} — control por voz en español.\n\n\
                  Uso:\n  \
                  minion                      escucha y obedece (el uso normal)\n  \
                  minion <ruta-al-modelo>     igual, con el modelo de esa carpeta\n  \
@@ -2332,6 +2339,7 @@ fn main() -> Result<()> {
                  minion corpus --from-log <grabaciones> <destino>\n\
                  \x20                            arranca un corpus.toml a partir de\n\
                  \x20                            una carpeta de grabaciones y el registro\n  \
+                 minion --version            la versión instalada\n  \
                  minion --help               esto\n\n\
                  «run» y «say» dejan un aviso para la copia que ya está en\n\
                  marcha y no hacen nada si no hay ninguna — útil para atajos\n\
@@ -2340,7 +2348,8 @@ fn main() -> Result<()> {
                  Variables de entorno:\n  \
                  MINION_MODEL                carpeta del modelo de reconocimiento\n\n\
                  Registro: ~/Library/Logs/minion.log\n\
-                 Ajustes:  ~/Library/Application Support/Minion/config.toml"
+                 Ajustes:  ~/Library/Application Support/Minion/config.toml",
+                version = env!("CARGO_PKG_VERSION")
             );
             return Ok(());
         }
