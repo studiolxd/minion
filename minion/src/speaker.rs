@@ -94,22 +94,63 @@ pub fn profile_path() -> Option<PathBuf> {
     Some(PathBuf::from(home).join("Library/Application Support/Minion/voice.txt"))
 }
 
-/// Reads the enrolled voice, if there is one.
-pub fn load_profile() -> Option<Embedding> {
+/// Identifies the model a profile was made with.
+///
+/// Embeddings only mean anything against the model that produced them: the
+/// same voice through a different model gives different numbers, and
+/// comparing across the two would quietly stop recognising its owner. The
+/// file's size is enough to tell one model from another here.
+fn model_fingerprint(model_dir: &str) -> Option<u64> {
+    let path = std::path::Path::new(model_dir).join("speaker.onnx");
+    fs::metadata(path).ok().map(|m| m.len())
+}
+
+/// Reads the enrolled voice, if there is one made with this model.
+///
+/// A profile from another model is ignored rather than used, and says so:
+/// silently failing to recognise someone is the worse outcome.
+pub fn load_profile_for(model_dir: &str) -> Option<Embedding> {
     let contents = fs::read_to_string(profile_path()?).ok()?;
-    let values: Vec<f32> = contents
+
+    let mut lines = contents.lines();
+    let first = lines.next()?;
+    let (stored_model, numbers) = match first.strip_prefix("# model ") {
+        Some(fingerprint) => (fingerprint.trim().parse::<u64>().ok(), lines.next()?),
+        // Written before profiles recorded their model: trust it.
+        None => (None, first),
+    };
+
+    if let (Some(stored), Some(current)) = (stored_model, model_fingerprint(model_dir)) {
+        if stored != current {
+            crate::journal::write(
+                "The stored voice was made with a different speech model and no \
+                 longer applies. Train it again from Preferences.",
+            );
+            return None;
+        }
+    }
+
+    let values: Vec<f32> = numbers
         .split_whitespace()
         .filter_map(|n| n.parse().ok())
         .collect();
     (!values.is_empty()).then_some(values)
 }
 
-/// Stores an enrolled voice.
+/// Whether a voice has been enrolled at all, whatever model made it.
+pub fn has_profile() -> bool {
+    profile_path().is_some_and(|path| path.exists())
+}
+
+/// Stores an enrolled voice, noting which model made it.
 ///
 /// Does nothing under test. The profile belongs to whoever is running
 /// Minion, and a test run wrote one made of arithmetic — which would have
 /// left the machine refusing to listen to its owner.
-pub fn save_profile(embedding: &[f32]) -> Result<()> {
+///
+/// Kept outside the application bundle on purpose, so reinstalling does
+/// not lose it.
+pub fn save_profile_for(model_dir: &str, embedding: &[f32]) -> Result<()> {
     if cfg!(test) {
         return Ok(());
     }
@@ -117,9 +158,13 @@ pub fn save_profile(embedding: &[f32]) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let text: Vec<String> = embedding.iter().map(|v| format!("{v:.6}")).collect();
-    fs::write(&path, text.join(" "))
-        .with_context(|| format!("writing {}", path.display()))?;
+    let numbers: Vec<String> = embedding.iter().map(|v| format!("{v:.6}")).collect();
+    let mut contents = String::new();
+    if let Some(fingerprint) = model_fingerprint(model_dir) {
+        contents.push_str(&format!("# model {fingerprint}\n"));
+    }
+    contents.push_str(&numbers.join(" "));
+    fs::write(&path, contents).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 
@@ -211,6 +256,31 @@ mod tests {
             return;
         };
         assert!(model.embed(&voiced(120.0, 0.2)).is_none(), "a fifth of a second is not a voice");
+    }
+
+    #[test]
+    fn a_profile_records_which_model_made_it() {
+        // Embeddings only mean anything against their own model, so the
+        // file has to say which one — otherwise a model change would stop
+        // recognition working with no explanation.
+        let written = "# model 24123456\n0.1 0.2 0.3";
+        let mut lines = written.lines();
+        let first = lines.next().unwrap();
+        let fingerprint = first.strip_prefix("# model ").and_then(|f| f.trim().parse::<u64>().ok());
+        assert_eq!(fingerprint, Some(24_123_456));
+        assert_eq!(lines.next(), Some("0.1 0.2 0.3"));
+    }
+
+    #[test]
+    fn a_profile_without_a_model_line_still_reads() {
+        // Profiles written before this existed have no header, and should
+        // keep working rather than being thrown away.
+        let written = "0.1 0.2 0.3";
+        let mut lines = written.lines();
+        let first = lines.next().unwrap();
+        assert!(first.strip_prefix("# model ").is_none());
+        let values: Vec<f32> = first.split_whitespace().filter_map(|n| n.parse().ok()).collect();
+        assert_eq!(values.len(), 3);
     }
 
     #[test]

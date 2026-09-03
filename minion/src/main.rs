@@ -276,7 +276,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                     if active_session.accept(embedding) {
                         note!("voice training finished");
                         // Adopt what was just learned, without a restart.
-                        if let Some(profile) = speaker::load_profile() {
+                        if let Some(profile) = speaker::load_profile_for(&model_path) {
                             if let Some(v) = voice.as_mut() {
                                 v.profile = profile;
                                 v.threshold = config_voice_threshold();
@@ -555,6 +555,7 @@ fn run_menu_bar(
     let open_for_timer = Arc::clone(&open_requested);
     let learn_for_timer = Arc::clone(&learn_requested);
     let training_for_timer = Arc::clone(&training);
+    let training_model_path = locate_model(None).unwrap_or_else(|_| "model".into());
     let report_for_timer = Rc::clone(&report);
     let sounds_for_timer = Arc::clone(&sounds_on);
     let voices_for_timer = Arc::clone(&log_voices_on);
@@ -565,7 +566,7 @@ fn run_menu_bar(
         // Voice training: the window asks, the listening loop answers.
         if panel_for_timer.take_training_request() {
             if let Ok(mut session) = training_for_timer.lock() {
-                *session = Some(enroll::Session::starting());
+                *session = Some(enroll::Session::starting(training_model_path.clone()));
                 panel_for_timer.show_training(
                     &session.as_ref().map_or(String::new(), |s| s.message.clone()),
                     false,
@@ -783,7 +784,7 @@ fn main() -> Result<()> {
     let training: Training = Arc::new(Mutex::new(None));
     let worker_training = Arc::clone(&training);
 
-    let voice = match speaker::load_profile() {
+    let voice = match speaker::load_profile_for(&model_path) {
         Some(profile) => match speaker::Speaker::load(&model_path) {
             Ok(model) => {
                 note!("Voice profile loaded — only your voice will be obeyed.");

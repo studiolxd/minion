@@ -414,7 +414,7 @@ impl Preferences {
             true,
         ));
         y -= 28.0;
-        let trained = crate::speaker::load_profile().is_some();
+        let trained = crate::speaker::has_profile();
         // Safety: no target and no action, so nothing is called back into.
         let train = unsafe {
             NSButton::buttonWithTitle_target_action(

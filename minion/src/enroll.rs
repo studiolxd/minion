@@ -35,6 +35,8 @@ pub const PROMPTS: &[&str] = &[
 /// that thread does the work and reports back through here.
 #[derive(Default)]
 pub struct Session {
+    /// Where the models live, so the profile records which one made it.
+    pub model_path: String,
     /// Voices collected so far.
     pub collected: Vec<crate::speaker::Embedding>,
     /// What to show the person right now.
@@ -44,8 +46,9 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn starting() -> Self {
+    pub fn starting(model_path: String) -> Self {
         Self {
+            model_path,
             collected: Vec::new(),
             message: format!("1/{SENTENCES} — di: «{}»", PROMPTS[0]),
             finished: false,
@@ -78,7 +81,7 @@ impl Session {
         }
 
         self.finished = true;
-        self.message = match finish(&self.collected) {
+        self.message = match finish(&self.model_path, &self.collected) {
             Ok(agreement) => format!(
                 "Listo. Tu voz queda registrada (coherencia {:.0}%).\n\
                  A partir de ahora solo te hará caso a ti.",
@@ -91,7 +94,7 @@ impl Session {
 }
 
 /// Averages, checks and stores what was collected.
-fn finish(collected: &[crate::speaker::Embedding]) -> Result<f32, String> {
+fn finish(model_path: &str, collected: &[crate::speaker::Embedding]) -> Result<f32, String> {
     let voice = crate::speaker::average(collected).ok_or("No se recogió nada.")?;
     let agreement = collected
         .iter()
@@ -107,7 +110,8 @@ fn finish(collected: &[crate::speaker::Embedding]) -> Result<f32, String> {
             agreement * 100.0
         ));
     }
-    crate::speaker::save_profile(&voice).map_err(|e| format!("No se pudo guardar: {e}"))?;
+    crate::speaker::save_profile_for(model_path, &voice)
+        .map_err(|e| format!("No se pudo guardar: {e}"))?;
     Ok(agreement)
 }
 
@@ -156,7 +160,7 @@ pub fn run(model_path: &str) -> Result<()> {
         ));
     }
 
-    speaker::save_profile(&voice)?;
+    speaker::save_profile_for(model_path, &voice)?;
     println!("Listo. Coherencia entre muestras: {:.0}%.", worst * 100.0);
     println!("Reinicia Minion: a partir de ahora solo te hará caso a ti.");
     println!("Para deshacerlo, borra {}.", speaker::profile_path()
@@ -175,7 +179,7 @@ mod tests {
 
     #[test]
     fn the_count_names_what_it_is_asking_for() {
-        let mut session = Session::starting();
+        let mut session = Session::starting(String::new());
         assert!(
             session.message.starts_with("1/5"),
             "should open asking for the first: {}",
@@ -195,7 +199,7 @@ mod tests {
 
     #[test]
     fn a_short_utterance_asks_for_the_same_sentence_again() {
-        let mut session = Session::starting();
+        let mut session = Session::starting(String::new());
         session.accept(Some(fake_voice(1.0)));
         let asking = session.message.clone();
 
@@ -210,7 +214,7 @@ mod tests {
 
     #[test]
     fn it_finishes_after_the_last_sentence() {
-        let mut session = Session::starting();
+        let mut session = Session::starting(String::new());
         for _ in 0..SENTENCES - 1 {
             assert!(!session.accept(Some(fake_voice(1.0))), "not done yet");
         }
