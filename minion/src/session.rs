@@ -211,6 +211,20 @@ impl Session {
         Outcome::Perform { decision, repeats }
     }
 
+    /// Decides what a heard phrase means for push-to-talk: every utterance
+    /// reaching this was, by construction, said while the shortcut was
+    /// held, so the wake word is never required — there is no window to
+    /// time out or to log about, unlike [`Session::resolve`].
+    pub fn resolve_held(&mut self, part: &str, context: Option<&str>) -> (Decision, f32) {
+        let (decision, confidence) = commands::decide_in(part, context);
+        if self.dictating || decision != Decision::Ignored {
+            return (decision, confidence);
+        }
+        let wake = commands::wake_words().first().copied().unwrap_or("minion");
+        let prefixed = format!("{wake} {part}");
+        commands::decide_in(&prefixed, context)
+    }
+
     /// Discards whatever "deshaz lo que has hecho" would currently undo.
     ///
     /// `interpret` records a command as undoable the moment it is decided,
@@ -516,6 +530,31 @@ mod tests {
         let resolved = session.resolve("abre Chrome", now, None);
         assert_eq!(resolved.window_after, None);
         assert!(session.window_open(now), "dictating must not have closed it either");
+    }
+
+    #[test]
+    fn push_to_talk_never_needs_the_wake_word() {
+        let mut session = Session::new();
+        let (decision, _) = session.resolve_held("abre Chrome", None);
+        assert!(!matches!(decision, Decision::Ignored | Decision::Unrecognised));
+    }
+
+    #[test]
+    fn push_to_talk_still_says_so_when_nothing_matches() {
+        let mut session = Session::new();
+        let (decision, _) = session.resolve_held("so fuddy", None);
+        assert_eq!(decision, Decision::Unrecognised);
+    }
+
+    #[test]
+    fn push_to_talk_still_lets_dictation_through_untouched() {
+        let mut session = Session::new();
+        let decision = decide("minion empieza a dictar");
+        session.interpret("minion empieza a dictar", decision, None);
+        // Once dictating, resolve_held must not try to prefix the wake
+        // word onto what is about to be typed.
+        let (decision, _) = session.resolve_held("abre Chrome", None);
+        assert_eq!(decision, decide("abre Chrome"));
     }
 
     #[test]

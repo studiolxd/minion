@@ -49,11 +49,21 @@ mod pending {
     pub const PAUSED: u8 = 2;
 }
 
-/// Starts watching for `shortcut`, flipping `active` when it arrives.
+/// How a shortcut controls listening.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Each press flips listening on or off — the everyday pause/resume.
+    Toggle,
+    /// Listening follows the key: down while held, off the moment it comes
+    /// up. Push-to-talk.
+    Hold,
+}
+
+/// Starts watching for `shortcut`, controlling `active` as `mode` says.
 ///
 /// Returns whether the shortcut could be read. The thread runs for the life
 /// of the process.
-pub fn watch(shortcut: &str, active: Arc<AtomicBool>) -> bool {
+pub fn watch(shortcut: &str, active: Arc<AtomicBool>, mode: Mode) -> bool {
     let Some((code, mods)) = crate::actions::parse_shortcut(shortcut) else {
         return false;
     };
@@ -67,19 +77,25 @@ pub fn watch(shortcut: &str, active: Arc<AtomicBool>) -> bool {
     let tap_seen = Arc::clone(&seen);
 
     std::thread::spawn(move || {
+        // Hold needs the release too, to stop listening the moment the key
+        // comes up; Toggle only ever cares about the press.
+        let mut events = vec![
+            CGEventType::KeyDown,
+            // Not keys: the two ways macOS tells a tap it has been turned
+            // off. Without them there is no way to know.
+            CGEventType::TapDisabledByTimeout,
+            CGEventType::TapDisabledByUserInput,
+        ];
+        if mode == Mode::Hold {
+            events.push(CGEventType::KeyUp);
+        }
         let tap = CGEventTap::new(
             CGEventTapLocation::Session,
             CGEventTapPlacement::HeadInsertEventTap,
             // Listening only: the keystroke still reaches whatever has
             // focus, so the combination is shared rather than claimed.
             CGEventTapOptions::ListenOnly,
-            vec![
-                CGEventType::KeyDown,
-                // Not keys: the two ways macOS tells a tap it has been
-                // turned off. Without them there is no way to know.
-                CGEventType::TapDisabledByTimeout,
-                CGEventType::TapDisabledByUserInput,
-            ],
+            events,
             move |_proxy, kind, event| {
                 if matches!(
                     kind,
@@ -89,11 +105,25 @@ pub fn watch(shortcut: &str, active: Arc<AtomicBool>) -> bool {
                     return CallbackResult::Keep;
                 }
                 let pressed = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
-                if pressed != i64::from(code) || !modifiers_match(event.get_flags().bits(), mods)
-                {
+                if pressed != i64::from(code) {
                     return CallbackResult::Keep;
                 }
-                let now = !active.load(Ordering::Relaxed);
+                if matches!(kind, CGEventType::KeyUp) {
+                    // The release: modifiers may already have let go by the
+                    // time this arrives, so only the key itself is checked.
+                    // Toggle never registers for KeyUp at all, so this can
+                    // only run in Hold mode.
+                    active.store(false, Ordering::Relaxed);
+                    tap_seen.store(pending::PAUSED, Ordering::Relaxed);
+                    return CallbackResult::Keep;
+                }
+                if !modifiers_match(event.get_flags().bits(), mods) {
+                    return CallbackResult::Keep;
+                }
+                let now = match mode {
+                    Mode::Toggle => !active.load(Ordering::Relaxed),
+                    Mode::Hold => true,
+                };
                 active.store(now, Ordering::Relaxed);
                 // Nothing slower than an atomic store in here: a callback
                 // that dawdles is exactly what gets the tap turned off, and

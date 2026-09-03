@@ -144,6 +144,19 @@ pub struct Config {
     /// `None` means the default of 5; zero disables the window entirely,
     /// for someone who would rather every sentence start with «minion».
     pub conversation_seconds: Option<u64>,
+
+    /// "always" (the default) listens continuously; "hold" only listens
+    /// while `resume_shortcut` is held down, and does not need the wake
+    /// word while it is.
+    pub listen_mode: Option<String>,
+}
+
+/// How Minion decides when to listen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenMode {
+    Always,
+    /// Only while the shortcut is held down.
+    Hold,
 }
 
 /// A command of your own: what to say, and which keys to press.
@@ -207,6 +220,7 @@ impl Default for Config {
             speech_rate: None,
             unload_after_minutes: None,
             conversation_seconds: None,
+            listen_mode: None,
         }
     }
 }
@@ -505,6 +519,18 @@ impl Config {
         Duration::from_secs(self.conversation_seconds.unwrap_or(DEFAULT_CONVERSATION_SECONDS))
     }
 
+    /// Whether to listen continuously or only while the shortcut is held.
+    ///
+    /// Anything other than "hold" — including a typo — falls back to
+    /// "always", the safer default: a mistyped value should not leave
+    /// someone wondering why Minion never listens.
+    pub fn listen_mode(&self) -> ListenMode {
+        match self.listen_mode.as_deref() {
+            Some("hold") => ListenMode::Hold,
+            _ => ListenMode::Always,
+        }
+    }
+
     /// Commands defined in the file, as `'static` entries.
     ///
     /// Anything whose shortcut cannot be read is reported and skipped: one
@@ -719,6 +745,28 @@ mod tests {
 
         let custom: Config = toml::from_str("unload_after_minutes = 30").expect("should parse");
         assert_eq!(custom.idle_unload(), Some(Duration::from_secs(1800)));
+    }
+
+    #[test]
+    fn the_conversation_window_is_five_seconds_by_default_and_zero_disables_it() {
+        let default: Config = toml::from_str("").expect("empty config should parse");
+        assert_eq!(default.conversation_window(), Duration::from_secs(5));
+
+        let disabled: Config =
+            toml::from_str("conversation_seconds = 0").expect("should parse");
+        assert_eq!(disabled.conversation_window(), Duration::ZERO);
+    }
+
+    #[test]
+    fn listen_mode_defaults_to_always_and_a_typo_falls_back_to_it() {
+        let default: Config = toml::from_str("").expect("empty config should parse");
+        assert_eq!(default.listen_mode(), ListenMode::Always);
+
+        let hold: Config = toml::from_str(r#"listen_mode = "hold""#).expect("should parse");
+        assert_eq!(hold.listen_mode(), ListenMode::Hold);
+
+        let typo: Config = toml::from_str(r#"listen_mode = "holf""#).expect("should parse");
+        assert_eq!(typo.listen_mode(), ListenMode::Always);
     }
 
     #[test]

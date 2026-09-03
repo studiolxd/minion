@@ -69,6 +69,11 @@
 # disables the window, so every sentence needs the wake word. Default 5.
 # conversation_seconds = 5
 
+# Whether Minion listens continuously ("always") or only while the shortcut
+# below is held down ("hold" — push-to-talk; no wake word needed while
+# held). Anything other than "hold" behaves as "always". Default "always".
+# listen_mode = "always"
+
 # Keyboard shortcut that pauses and resumes from anywhere, written as it
 # appears on the menu: "ctrl-alt-m", "ctrl+shift+m". Empty disables it.
 # Default "ctrl-alt-m". (Not "alt-space": that collides with the remaps
