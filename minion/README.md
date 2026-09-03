@@ -11,13 +11,19 @@ Control your Mac by speaking Spanish. Always listening, entirely offline.
 Lives in the menu bar as a small face — eye open while listening, eye shut
 when paused. No Dock icon.
 
-The menu holds one toggle (Pausar / Escuchar), a *Registro* submenu
+The menu holds one toggle (Pausar / Escuchar), an *Últimas órdenes* submenu
+(the last five things heard, each with *Repetir*, *Crear alias…* and
+*Olvidar alias* — the last two only where it applies), a *Registro* submenu
 (*Aprender*, *Ver el registro*), *Ajustes…*, *Reiniciar*, *Ayuda*, and
 Salir.
 
 The icon is a template image drawn once as SVG, rendered for the menu bar
 at run time and for the app at build time, so the two cannot drift apart.
 macOS tints it from its alpha, black on a light bar and white on a dark one.
+Besides listening/paused it has faces for thinking (between an utterance
+ending and a slow decision, such as reloading the model), speaking (while
+it talks back), and dictating (goggle, pupil and smile cut through a
+mask), plus a blink for a command just carried out.
 
 ## Questions
 
@@ -93,6 +99,28 @@ Uses the system synthesiser and whichever Spanish voice macOS has, which
 costs nothing to ship and is good enough to settle the harder question of
 *when* to speak. Turn it off in preferences, or set `speak = false`.
 
+## Escuchando
+
+**Ventana de conversación** — for a few seconds after a command runs or a
+question is answered, the next sentence needs no wake word:
+«minion, abre Chrome» … «cierra la pestaña». `conversation_seconds`, 5 by
+default; 0 turns it off so every sentence needs «minion» again.
+
+**Empuñar para hablar** — with `listen_mode = "hold"`, Minion only listens
+while the pause/resume shortcut (`resume_shortcut`, `ctrl-alt-m` by
+default) is held down, and no wake word is needed while it is. Anything
+other than `"hold"` behaves as the default, always-on `"always"`.
+
+**Pausa automática** — locking the screen or letting the Mac sleep always
+pauses Minion, no configuration needed. With
+`pause_when_microphone_busy = true` (the default), it also pauses while
+another process is actually recording from the microphone — a video call,
+whatever the app — and resumes when that stops. The signal is CoreAudio's
+own list of processes with an input stream open right now, not which
+application is in front: Google Meet in a background browser tab counts,
+Teams in the foreground with no call does not. Needs macOS 14 (Sonoma) or
+later; on macOS 13 the option does nothing and says so once in the log.
+
 ## Ajustes
 
 A native window, opened from the menu (called *Ajustes* — macOS 13+'s name
@@ -115,6 +143,15 @@ documentation:
 - **tu voz** — enrol or forget the voice profile Minion checks commands
   against; *Olvidar mi voz* deletes it after confirming, and Minion goes
   back to obeying whoever speaks
+- **modo de escucha** — siempre, or only while the shortcut above is held
+- **conversación** — how many seconds after a command the wake word can be
+  skipped
+- **dictado** — spoken punctuation and auto-capitalisation, each its own
+  switch
+- **pausa automática** — pause while another app is actually recording
+- **avisos** — Notification Center banners for answers and timers
+- **búsqueda** — which engine a bare «busca X» reaches (Google, YouTube,
+  Wikipedia, Amazon)
 
 The menu bar's tooltip mirrors this without opening anything: it says
 whether Minion is listening or paused, and after each utterance shows the
@@ -165,6 +202,13 @@ Without it those commands fail invisibly: macOS accepts the key event and
 discards it, so the log shows the command running while nothing happens on
 screen. Minion checks at startup with `AXIsProcessTrusted`, says so in the
 log, and opens the settings pane for you.
+
+Two more permissions arrive later, each the first time it is actually
+needed rather than at startup: **Recordatorios**, the first time something
+is remembered, and **Calendarios**, the first time an event is read or
+added. Both are macOS's own prompt for the `osascript` call underneath —
+grant them from *Ajustes del Sistema → Privacidad y seguridad* the same
+way as the others.
 
 The permission is granted **per binary**, so rebuilding invalidates it.
 Install to /Applications and grant it there, rather than granting it to a
@@ -286,6 +330,19 @@ Telegram · Discord · Figma · Obsidian · Claude
 
 The list is not compiled in — see **Adding commands and applications**
 below. «Qué puedo decirle» in the menu always shows what is really loaded.
+
+An English name is also matched **by sound**, not just by one-letter
+slips: "Chrome" said in Spanish comes out closer to "cromo", and Minion
+reduces both the alias and what it heard to how they'd sound spoken that
+way before comparing them, rather than needing every mangling ("grum",
+"crum", "crumb"…) listed by hand.
+
+If what was heard is close to a known phrase but not quite an exact match,
+Minion asks about it out loud instead of staying silent: «¿Querías decir
+«abrir Safari»?», answered with «sí» or «no» within six seconds, no wake
+word needed. A «sí» is remembered as an alias, so the same near-miss works
+next time. Turn this off with `ask_before_learning = false` — Minion then
+only writes the near-miss to the log, for `minion learn` to pick up later.
 
 ### Web addresses
 
@@ -500,9 +557,15 @@ url = "https://intranet.example.com"
 A command says what it does with exactly one of `keys` (a shortcut),
 `action` (one of Minion's own: `volume:up`, `volume:down`, `volume:mute`,
 `volume:unmute`, `music:play`, `music:pause`, `music:next`,
-`music:previous`, `minion:sleep`), `text` (type this) or `url` (open this).
-There is deliberately no way to run a script from a vocabulary file: it is
-data that may have been downloaded, and data that runs is not data.
+`music:previous`, `minion:sleep`, `window:left`, `window:right`,
+`window:maximize`, `window:other-screen`, `system:brightness-up`,
+`system:brightness-down`, `system:dark-mode`, `system:wifi-on`,
+`system:wifi-off`, `system:empty-trash`, `system:sleep-display`,
+`system:screenshot-window`, `clipboard:clear`, `browser:copy-url`,
+`browser:duplicate-tab-safari`, `browser:duplicate-tab-chrome`), `text`
+(type this) or `url` (open this). There is deliberately no way to run a
+script from a vocabulary file: it is data that may have been downloaded,
+and data that runs is not data.
 
 The schema is documented in full at the top of `vocabulary/macos.toml`. A
 file that does not parse is reported in the log and skipped, and so is a
@@ -536,8 +599,29 @@ bundle_id = "notion.id"
 aliases = ["notion", "nocion"]
 ```
 
-A typo in the file is reported at startup and then ignored; it will not
-stop Minion from running.
+The file uses `deny_unknown_fields`: one misplaced or misspelled key
+invalidates the **whole file**, not just that key — a top-level setting
+must come before the first `[table]` header, such as `[audio]`, or TOML
+reads it as belonging to that table instead. When that happens Minion
+falls back to every default, says so in the log, and — since a config that
+has quietly gone back to defaults is easy to miss — also puts up a dialog
+on screen naming the problem, in Spanish, once at startup.
+
+Beyond the wake words, threshold and audio numbers above, the keys this
+round of work added, with their defaults:
+
+| Key | Default | What it does |
+|---|---|---|
+| `conversation_seconds` | `5` | seconds after a command the wake word can be skipped; `0` disables it |
+| `listen_mode` | `"always"` | `"hold"` for push-to-talk on `resume_shortcut` |
+| `pause_when_microphone_busy` | `true` | pause while another process is recording (macOS 14+) |
+| `spoken_punctuation` | `true` | turn spoken signs into punctuation while dictating |
+| `auto_capitalise` | `true` | capitalise sentence starts and «mayúscula» while dictating |
+| `ask_before_learning` | `true` | ask «¿Querías decir…?» about a near-miss, instead of only logging it |
+| `notifications` | `true` | Notification Center banners for answers, timers and blocked commands |
+| `search_engine` | `"google"` | which engine a bare «busca X» reaches |
+| `dictation_words` | *(none)* | `[[dictation_words]]`, names the recogniser reliably mangles |
+| `macros` | *(none)* | `[[macros]]`, named sequences of phrases |
 
 ## Tuning
 
@@ -619,7 +703,7 @@ what is still missing rather than everything that ever failed.
 cargo test
 ```
 
-235 tests. The ones that matter most check that ordinary conversation is
+383 tests (1 ignored). The ones that matter most check that ordinary conversation is
 ignored, that every declared phrase reaches its own command, and that no
 two commands claim the same phrase.
 
