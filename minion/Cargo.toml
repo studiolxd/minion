@@ -31,6 +31,9 @@ serde = { version = "1.0.229", features = ["derive"] }
 # Already in the dependency tree via ort; used directly here to read the
 # appcast.json a release publishes — see src/updater.rs. Everything else
 # Minion parses is TOML.
+# Already in the dependency tree via parakeet-rs; taken directly here to
+# read what AI backends answer — every one of them speaks JSON, and none
+# of them promises which fields it will add next.
 serde_json = "1.0.151"
 toml = "1.1.5"
 tray-icon = "0.24.2"
