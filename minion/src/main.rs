@@ -213,6 +213,7 @@ mod auto_pause {
     use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
     use core_foundation::string::CFString;
     use std::ffi::c_void;
+    use std::time::{Duration, Instant};
 
     /// Whether the login session is locked (password or Touch ID lock, the
     /// screen saver locking the screen).
@@ -291,6 +292,115 @@ mod auto_pause {
         None
     }
 
+    /// How long the pause condition must hold before listening actually
+    /// stops.
+    ///
+    /// The screen locking or the microphone flipping to another app for a
+    /// moment (CoreSpeech, a Spotlight preview, `siri.wakeupd`) is common
+    /// and harmless; only a condition that is still true after a beat is
+    /// worth interrupting listening for.
+    const PAUSE_AFTER: Duration = Duration::from_millis(1500);
+
+    /// How long the condition must have cleared before listening resumes.
+    ///
+    /// Longer than [`PAUSE_AFTER`] on purpose: flapping on resume (pausing
+    /// again a second after resuming) is exactly what a debounce this
+    /// asymmetric is meant to prevent, at the cost of a slightly later
+    /// resume once a meeting actually ends.
+    const RESUME_AFTER: Duration = Duration::from_secs(3);
+
+    /// What the debouncer decided this tick, if anything changed.
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum Action {
+        /// Nothing changed — still clear, still paused, or still waiting
+        /// out a debounce window.
+        None,
+        /// The condition has held long enough: pause, and log this reason.
+        Pause(String),
+        /// The condition has been clear long enough: resume.
+        Resume,
+    }
+
+    /// Turns a reason that flickers tick to tick into a pause/resume
+    /// decision that only fires on a debounced edge, logged once per
+    /// episode rather than once per 250 ms tick.
+    ///
+    /// Pure and driven by an injected `Instant`, so the 1.5 s/3 s timing
+    /// can be tested without sleeping.
+    #[derive(Debug, PartialEq, Eq)]
+    enum State {
+        Clear,
+        PendingPause { since: Instant, reason: String },
+        Paused,
+        PendingResume { since: Instant },
+    }
+
+    pub struct Debouncer {
+        state: State,
+    }
+
+    impl Debouncer {
+        pub fn new() -> Self {
+            Self { state: State::Clear }
+        }
+
+        /// Feed this tick's raw reason (before debouncing) and the current
+        /// time; get back what, if anything, should change right now.
+        pub fn tick(&mut self, reason: Option<String>, now: Instant) -> Action {
+            match (&self.state, reason) {
+                (State::Clear, None) => Action::None,
+                (State::Clear, Some(reason)) => {
+                    self.state = State::PendingPause { since: now, reason };
+                    Action::None
+                }
+                (State::PendingPause { since, reason }, Some(new_reason)) => {
+                    if now.duration_since(*since) >= PAUSE_AFTER {
+                        let reason = reason.clone();
+                        self.state = State::Paused;
+                        Action::Pause(reason)
+                    } else {
+                        // Still within the debounce window; keep the
+                        // original reason rather than restarting the
+                        // clock on every small wording change.
+                        let _ = new_reason;
+                        Action::None
+                    }
+                }
+                (State::PendingPause { .. }, None) => {
+                    // Cleared before it ever became a real pause.
+                    self.state = State::Clear;
+                    Action::None
+                }
+                (State::Paused, Some(_)) => Action::None,
+                (State::Paused, None) => {
+                    self.state = State::PendingResume { since: now };
+                    Action::None
+                }
+                (State::PendingResume { .. }, Some(_)) => {
+                    // The condition came back before it was clear long
+                    // enough — still paused, no new episode.
+                    self.state = State::Paused;
+                    Action::None
+                }
+                (State::PendingResume { since }, None) => {
+                    if now.duration_since(*since) >= RESUME_AFTER {
+                        self.state = State::Clear;
+                        Action::Resume
+                    } else {
+                        Action::None
+                    }
+                }
+            }
+        }
+
+        /// Discards any in-progress episode, as if the condition had just
+        /// cleared — used when a manual toggle overrides an auto-pause, so
+        /// the next episode starts its own debounce window from scratch.
+        pub fn reset(&mut self) {
+            self.state = State::Clear;
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -329,6 +439,109 @@ mod auto_pause {
             // panic or hang — that is the only thing worth checking here.
             let _ = display_asleep();
             let _ = screen_locked();
+        }
+
+        #[test]
+        fn a_brief_reason_never_pauses() {
+            // The whole point: CoreSpeech flickering for a few hundred ms
+            // must not trip the pause.
+            let mut debounce = Debouncer::new();
+            let start = Instant::now();
+            let busy = || Some("microphone in use by com.apple.CoreSpeech".to_string());
+            assert_eq!(debounce.tick(busy(), start), Action::None);
+            assert_eq!(
+                debounce.tick(busy(), start + Duration::from_millis(500)),
+                Action::None
+            );
+            // Clears again before 1.5 s — never should have paused.
+            assert_eq!(debounce.tick(None, start + Duration::from_millis(900)), Action::None);
+        }
+
+        #[test]
+        fn a_sustained_reason_pauses_after_the_debounce_window() {
+            let mut debounce = Debouncer::new();
+            let start = Instant::now();
+            let busy = || Some("the microphone is in use elsewhere".to_string());
+            assert_eq!(debounce.tick(busy(), start), Action::None);
+            assert_eq!(
+                debounce.tick(busy(), start + Duration::from_millis(1499)),
+                Action::None
+            );
+            assert_eq!(
+                debounce.tick(busy(), start + Duration::from_millis(1500)),
+                Action::Pause("the microphone is in use elsewhere".to_string())
+            );
+            // Already paused — no repeat action, no repeat log line.
+            assert_eq!(
+                debounce.tick(busy(), start + Duration::from_millis(2000)),
+                Action::None
+            );
+        }
+
+        #[test]
+        fn resume_needs_three_clear_seconds_and_only_fires_once() {
+            let mut debounce = Debouncer::new();
+            let start = Instant::now();
+            let busy = || Some("the screen is locked".to_string());
+            assert_eq!(debounce.tick(busy(), start), Action::None);
+            assert_eq!(
+                debounce.tick(busy(), start + PAUSE_AFTER),
+                Action::Pause("the screen is locked".to_string())
+            );
+            let cleared_at = start + PAUSE_AFTER;
+            assert_eq!(debounce.tick(None, cleared_at), Action::None);
+            assert_eq!(
+                debounce.tick(None, cleared_at + Duration::from_millis(2999)),
+                Action::None
+            );
+            assert_eq!(
+                debounce.tick(None, cleared_at + Duration::from_secs(3)),
+                Action::Resume
+            );
+            // Back to clear — no repeat resume action.
+            assert_eq!(
+                debounce.tick(None, cleared_at + Duration::from_secs(4)),
+                Action::None
+            );
+        }
+
+        #[test]
+        fn a_brief_gap_during_a_pause_does_not_start_a_new_episode() {
+            // The reason toggling off and on inside one meeting (someone
+            // glances at Spotlight) must not reset the resume debounce nor
+            // log a second "paused" line.
+            let mut debounce = Debouncer::new();
+            let start = Instant::now();
+            let busy = || Some("microphone in use by com.microsoft.teams2".to_string());
+            debounce.tick(busy(), start);
+            assert_eq!(debounce.tick(busy(), start + PAUSE_AFTER), Action::Pause(
+                "microphone in use by com.microsoft.teams2".to_string()
+            ));
+            let paused_at = start + PAUSE_AFTER;
+            assert_eq!(debounce.tick(None, paused_at + Duration::from_secs(1)), Action::None);
+            // Busy again before the 3 s resume window elapses.
+            assert_eq!(
+                debounce.tick(busy(), paused_at + Duration::from_millis(1500)),
+                Action::None
+            );
+            // Still paused, no resume — and no new "paused" log either.
+            assert_eq!(
+                debounce.tick(busy(), paused_at + Duration::from_secs(2)),
+                Action::None
+            );
+        }
+
+        #[test]
+        fn reset_starts_a_fresh_debounce_window() {
+            let mut debounce = Debouncer::new();
+            let start = Instant::now();
+            let busy = || Some("the screen is locked".to_string());
+            debounce.tick(busy(), start);
+            debounce.tick(busy(), start + PAUSE_AFTER);
+            debounce.reset();
+            // A manual override happened; the same still-true reason must
+            // debounce again from scratch rather than pausing immediately.
+            assert_eq!(debounce.tick(busy(), start + PAUSE_AFTER), Action::None);
         }
     }
 }
@@ -654,6 +867,9 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
     // knows the pause is its own to lift — a manual pause never sets this,
     // and so never gets silently overridden once the reason clears.
     let mut auto_paused = false;
+    // Turns the raw pause reason (checked below, tick by tick) into a
+    // debounced pause/resume edge — see `auto_pause::Debouncer`.
+    let mut auto_pause_debounce = auto_pause::Debouncer::new();
     // Energy: "auto" follows the battery, "battery" always behaves as if
     // on one, "performance" never unloads. Checking `pmset` on every 250 ms
     // tick would be wasteful for a value that changes on the order of
@@ -788,20 +1004,29 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                     if listening && auto_paused {
                         // Turned back on by something other than this
                         // check — the menu, the shortcut, a spoken order —
-                        // so the pause is no longer this feature's to lift.
+                        // so the pause is no longer this feature's to lift,
+                        // and the next episode debounces from scratch.
                         auto_paused = false;
+                        auto_pause_debounce.reset();
                     }
-                    let reason = auto_pause::reason(watch_microphone);
-                    if let Some(reason) = reason {
-                        if listening {
-                            active.store(false, Ordering::Relaxed);
-                            auto_paused = true;
-                            note!("paused automatically — {reason}");
+                    let action = auto_pause_debounce
+                        .tick(auto_pause::reason(watch_microphone), Instant::now());
+                    match action {
+                        auto_pause::Action::Pause(reason) => {
+                            if listening {
+                                active.store(false, Ordering::Relaxed);
+                                auto_paused = true;
+                                note!("paused automatically — {reason}");
+                            }
                         }
-                    } else if auto_paused {
-                        active.store(true, Ordering::Relaxed);
-                        auto_paused = false;
-                        note!("resumed automatically — the reason has gone away");
+                        auto_pause::Action::Resume => {
+                            if auto_paused {
+                                active.store(true, Ordering::Relaxed);
+                                auto_paused = false;
+                                note!("resumed automatically — the reason has gone away");
+                            }
+                        }
+                        auto_pause::Action::None => {}
                     }
                 }
                 // Battery state changes on the order of hours, not 250 ms —

@@ -186,8 +186,43 @@ fn process_objects() -> Option<Vec<AudioObjectID>> {
     Some(objects)
 }
 
-/// Ask CoreAudio, without the cache. Every process recording right now
-/// except this one.
+/// Apple bundle ids that mean an actual person is on a call or recording,
+/// not a system daemon that happened to touch the input stream.
+const APPLE_USER_FACING: &[&str] = &[
+    "com.apple.FaceTime",
+    "com.apple.QuickTimePlayerX",
+    "com.apple.VoiceMemos",
+    "com.apple.Safari",
+];
+
+/// Whether `bundle_id` names a benign Apple system process rather than
+/// someone actually using the microphone.
+///
+/// CoreSpeech, Siri, the Control Center and Universal Control daemons, and
+/// assorted `com.apple.audio.*` helpers all light up `IsRunningInput` in
+/// the ordinary course of dictation, "Hey Siri", or a nearby Mac's mouse
+/// crossing over — none of that is a meeting. Reading every `com.apple.*`
+/// process as "someone is recording" produced 176 pause/resume flaps in a
+/// single day's log, all of them `com.apple.CoreSpeech`. The exceptions are
+/// the Apple apps a person actually starts a call or recording in.
+pub fn is_benign_apple_daemon(bundle_id: &str) -> bool {
+    bundle_id.starts_with("com.apple.") && !APPLE_USER_FACING.contains(&bundle_id)
+}
+
+/// Whether `capture` should count as someone actually using the microphone.
+///
+/// A process CoreAudio knows only by pid (no bundle id) is kept: it is not
+/// a named Apple daemon we can vouch for, so the cautious reading is that
+/// it might be a person.
+fn is_real_user(capture: &Capture) -> bool {
+    match &capture.bundle_id {
+        Some(id) => !is_benign_apple_daemon(id),
+        None => true,
+    }
+}
+
+/// Ask CoreAudio, without the cache. Every process actually recording right
+/// now except this one and Apple's own benign daemons.
 fn capturing_now(own_pid: i32) -> Option<Vec<Capture>> {
     let objects = process_objects()?;
     let mut capturing = Vec::new();
@@ -202,6 +237,7 @@ fn capturing_now(own_pid: i32) -> Option<Vec<Capture>> {
         }
         capturing.push(Capture { pid, bundle_id: bundle_id(process) });
     }
+    capturing.retain(is_real_user);
     Some(capturing)
 }
 
@@ -320,6 +356,40 @@ mod tests {
         let start = Instant::now();
         cache.put(start, None);
         assert_eq!(cache.get(start), Some(None));
+    }
+
+    #[test]
+    fn benign_apple_daemons_are_recognised() {
+        assert!(is_benign_apple_daemon("com.apple.CoreSpeech"));
+        assert!(is_benign_apple_daemon("com.apple.siri.wakeupd"));
+        assert!(is_benign_apple_daemon("com.apple.controlcenter"));
+        assert!(is_benign_apple_daemon("com.apple.universalcontrol"));
+        assert!(is_benign_apple_daemon("com.apple.audio.SandboxHelper"));
+    }
+
+    #[test]
+    fn apple_apps_a_person_actually_uses_are_not_benign() {
+        assert!(!is_benign_apple_daemon("com.apple.FaceTime"));
+        assert!(!is_benign_apple_daemon("com.apple.QuickTimePlayerX"));
+        assert!(!is_benign_apple_daemon("com.apple.VoiceMemos"));
+        assert!(!is_benign_apple_daemon("com.apple.Safari"));
+    }
+
+    #[test]
+    fn non_apple_bundles_are_never_benign() {
+        assert!(!is_benign_apple_daemon("com.microsoft.teams2"));
+        assert!(!is_benign_apple_daemon("us.zoom.xos"));
+    }
+
+    #[test]
+    fn real_user_filter_keeps_real_apps_and_unnamed_processes() {
+        let daemon =
+            Capture { pid: 1031, bundle_id: Some("com.apple.CoreSpeech".to_string()) };
+        let facetime = Capture { pid: 42, bundle_id: Some("com.apple.FaceTime".to_string()) };
+        let unnamed = Capture { pid: 99, bundle_id: None };
+        assert!(!is_real_user(&daemon));
+        assert!(is_real_user(&facetime));
+        assert!(is_real_user(&unnamed));
     }
 
     #[test]
