@@ -128,11 +128,13 @@ pub const DARK_MODE_TOGGLE: &str = "tell application \"System Events\" \
 pub const WIFI_ON: &str = "do shell script \"/usr/sbin/networksetup -setairportpower en0 on\"";
 pub const WIFI_OFF: &str = "do shell script \"/usr/sbin/networksetup -setairportpower en0 off\"";
 
-/// Empties the Trash through Finder, which shows Finder's own confirmation
-/// dialog as long as "Warn before emptying the Trash" is on — the default,
-/// and left alone here on purpose: no destructive action from a single
-/// phrase.
-pub const EMPTY_TRASH: &str = "tell application \"Finder\" to empty trash";
+/// Empties the Trash the way a person does: Finder in front and ⇧⌘⌫,
+/// which brings up Finder's "Are you sure?" dialog. AppleScript's own
+/// `empty trash` skips that dialog, and a phrase overheard from across
+/// the room must never delete anything on its own.
+pub const EMPTY_TRASH: &str = "tell application \"Finder\" to activate\n\
+    tell application \"System Events\" to keystroke (ASCII character 8) \
+    using {command down, shift down}";
 
 pub const SLEEP_DISPLAY: &str = "do shell script \"/usr/bin/pmset displaysleepnow\"";
 
@@ -216,7 +218,8 @@ mod tests {
 
     #[test]
     fn empty_trash_goes_through_finder_so_its_confirmation_still_shows() {
-        assert_eq!(EMPTY_TRASH, "tell application \"Finder\" to empty trash");
+        assert!(!EMPTY_TRASH.contains("empty trash"), "AppleScript's empty skips the dialog");
+        assert!(EMPTY_TRASH.contains("command down, shift down"));
     }
 
     #[test]
