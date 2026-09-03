@@ -169,6 +169,33 @@
 # dropped; raise it if the television still gets through.
 # vad_threshold = 0.5
 
+# Ignore what the Mac itself is playing.
+#
+# Netflix, a song, the other side of a call: it all leaves the speakers and
+# comes back into the microphone. With this on, Minion opens a CoreAudio
+# process tap on the system output (macOS 14.2 and later), keeps the last
+# twelve seconds of it, and throws away any utterance whose loudness
+# contour matches what was playing at that moment. The log says so:
+#
+#   own      2.1s of the Mac's own audio (0.83)
+#
+# Off by default: it is a second audio stream running all the time, and the
+# speaker check already rejects most of this. Turn it on if you listen to
+# speech through the speakers, or if the log is full of «heard ... in
+# another voice» lines that are really the television.
+#
+# `minion loopback` records the output for five seconds and prints its
+# level, which is the quickest way to see whether the tap works here. A
+# level of zero with the sound playing means it does not.
+# ignore_own_audio = false
+
+# How alike an utterance and the Mac's own output have to be before the
+# utterance is thrown away, 0 to 1. Default 0.6, measured: the same audio
+# heard back through the room scores 0.71–0.95, unrelated speech 0.00–0.42.
+# Raise it if your own commands are being ignored while music plays; lower
+# it if the television still gets through.
+# own_audio_threshold = 0.6
+
 # Extra applications, added to the vocabulary.
 #
 # The vocabulary itself — every application, command and site Minion knows

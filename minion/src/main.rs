@@ -23,6 +23,7 @@ mod hud;
 mod icon;
 mod journal;
 mod learn;
+mod loopback;
 mod metrics;
 mod microphone;
 mod models;
@@ -692,6 +693,34 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
         listener.channels,
         commands::phrase_count()
     );
+    // The Mac's own output, so hearing Netflix back through the microphone
+    // is not mistaken for someone talking. Opened *after* the microphone
+    // on purpose: CoreAudio serialises IOProc creation across the whole
+    // client, and the microphone is the one stream that must not wait.
+    // Kept for the life of the loop — the tap is torn down when it drops.
+    let own_audio_threshold = startup
+        .audio
+        .own_audio_threshold
+        .unwrap_or(loopback::DEFAULT_THRESHOLD);
+    let own_audio = if startup.audio.ignore_own_audio.unwrap_or(false) {
+        match loopback::Loopback::start() {
+            Ok(tap) => {
+                note!(
+                    "Ignoring the Mac's own audio: output tap open at {} Hz, threshold {own_audio_threshold:.2}.",
+                    tap.source_hz
+                );
+                Some(tap)
+            }
+            Err(e) => {
+                // Said, not fatal: the microphone still works, and the
+                // speaker check still stands behind it.
+                note!("could not tap the Mac's own audio, so it is not ignored: {e:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
     // The wake word can be changed in preferences, and telling someone to
     // say «minion» when it no longer answers to that is worse than saying
     // nothing.
@@ -928,6 +957,22 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                 }
             }
             continue;
+        }
+
+        // The Mac's own output, heard back through the microphone. Asked
+        // before the speaker check because it is the cheaper of the two —
+        // an envelope correlation against a buffer already in memory,
+        // against an ECAPA embedding — and because it answers a question
+        // the speaker check cannot: a recording of the owner's own voice
+        // coming out of the speakers passes the voice check.
+        if let Some(tap) = own_audio.as_ref() {
+            let late = utterance.captured_at.elapsed();
+            if let Some(likeness) = tap.resemblance(&utterance.samples, late) {
+                if likeness >= own_audio_threshold {
+                    note!("own      {seconds:.1}s of the Mac's own audio ({likeness:.2})");
+                    continue;
+                }
+            }
         }
 
         // Whose voice this is, decided before transcribing: someone else's
@@ -2855,6 +2900,7 @@ fn main() -> Result<()> {
                  minion status               si Minion está escuchando o en pausa\n  \
                  minion packs update         descarga el vocabulario de la comunidad\n  \
                  minion mic                  qué apps usan ahora el micrófono\n  \
+                 minion loopback [seg]       mide lo que el Mac está sonando\n  \
                  minion ai \"pregunta\"        la responde con la IA configurada\n  \
                  minion ai status            qué backend de IA hay y qué agentes\n  \
                  minion ai set-key <prov>    guarda una clave en el llavero (por\n  \
@@ -2927,6 +2973,17 @@ fn main() -> Result<()> {
         }
         if argument == "status" {
             api::print_status();
+            return Ok(());
+        }
+        if argument == "loopback" {
+            let seconds = std::env::args()
+                .nth(2)
+                .and_then(|n| n.parse::<u64>().ok())
+                .unwrap_or(5);
+            if let Err(e) = loopback::probe(seconds) {
+                eprintln!("No se pudo escuchar la salida del Mac: {e:#}");
+                std::process::exit(1);
+            }
             return Ok(());
         }
         if argument == "packs" {

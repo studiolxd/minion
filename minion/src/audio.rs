@@ -7,7 +7,7 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -113,6 +113,13 @@ pub struct Utterance {
     pub speech_start: usize,
     /// Where the last block above the threshold ends.
     pub speech_end: usize,
+    /// When the segmenter closed it — which, since the samples run to the
+    /// end of the hangover, is also when the last of them was heard.
+    ///
+    /// Only [`crate::loopback`] wants it: to line an utterance up against
+    /// what the Mac was playing, it has to know *when* the utterance was,
+    /// and the wall clock is the only thing the two streams share.
+    pub captured_at: Instant,
 }
 
 impl Utterance {
@@ -629,6 +636,7 @@ impl Segmenter {
             speech_start: self.speech_start,
             speech_end: self.speech_end.max(self.speech_start),
             samples,
+            captured_at: Instant::now(),
         };
         self.reset();
 
@@ -1006,12 +1014,14 @@ mod tests {
             samples: vec![0.0; 10],
             speech_start: 8,
             speech_end: 400,
+            captured_at: Instant::now(),
         };
         assert_eq!(utterance.speech().len(), 2);
         let backwards = Utterance {
             samples: vec![0.0; 10],
             speech_start: 9,
             speech_end: 3,
+            captured_at: Instant::now(),
         };
         assert!(backwards.speech().is_empty());
     }
