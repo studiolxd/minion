@@ -19,6 +19,16 @@ pub const TARGET_HZ: u32 = 16_000;
 const BLOCK_SAMPLES: usize = TARGET_HZ as usize / 50;
 const BLOCK_MS: usize = 20;
 
+/// How much audio to keep from before speech was noticed.
+///
+/// A word is loudest in its middle, so by the time the level crosses the
+/// threshold the first consonant is already gone — and "Chrome" arrives at
+/// the recogniser as "Core". These blocks are held back and prepended, so
+/// the utterance starts where the speaker did rather than where the meter
+/// caught up.
+const PREROLL_MS: usize = 320;
+const PREROLL_BLOCKS: usize = PREROLL_MS / BLOCK_MS;
+
 /// How much audio may pile up before old samples are dropped. Guards
 /// against the queue growing without bound if the model stalls.
 const QUEUE_LIMIT_SECONDS: usize = 30;
@@ -193,6 +203,8 @@ struct Segmenter {
     silence_blocks: usize,
     speaking: bool,
     noise: NoiseFloor,
+    /// The most recent quiet blocks, kept in case speech starts.
+    preroll: std::collections::VecDeque<Vec<f32>>,
 }
 
 impl Segmenter {
@@ -204,6 +216,7 @@ impl Segmenter {
             silence_blocks: 0,
             speaking: false,
             noise: NoiseFloor::new(),
+            preroll: std::collections::VecDeque::with_capacity(PREROLL_BLOCKS + 1),
         }
     }
 
@@ -220,11 +233,23 @@ impl Segmenter {
         }
 
         if has_speech {
+            if !self.speaking {
+                // Speech is starting: put back what was held.
+                for held in self.preroll.drain(..) {
+                    self.current.extend_from_slice(&held);
+                }
+            }
             self.speaking = true;
             self.speech_blocks += 1;
             self.silence_blocks = 0;
         } else if self.speaking {
             self.silence_blocks += 1;
+        } else {
+            // Quiet, and not in an utterance: remember it briefly.
+            self.preroll.push_back(block.to_vec());
+            if self.preroll.len() > PREROLL_BLOCKS {
+                self.preroll.pop_front();
+            }
         }
 
         if self.speaking {
@@ -245,6 +270,7 @@ impl Segmenter {
         self.speaking = false;
         self.speech_blocks = 0;
         self.silence_blocks = 0;
+        self.preroll.clear();
 
         long_enough.then_some(utterance)
     }
@@ -450,6 +476,33 @@ mod tests {
         assert!(feed(&mut segmenter, blocks_of(0.2, 50)).is_empty());
         let done = feed(&mut segmenter, blocks_of(0.0, 40));
         assert_eq!(done.len(), 1, "silence should close the utterance");
+    }
+
+    #[test]
+    fn the_start_of_a_word_is_not_lost() {
+        // The level crosses the threshold partway into the first syllable,
+        // so an utterance that begins exactly where the meter noticed is
+        // already missing its opening consonant.
+        let mut segmenter = Segmenter::new(Settings::default());
+        feed(&mut segmenter, blocks_of(0.0, 40)); // quiet room
+        feed(&mut segmenter, blocks_of(0.2, 50)); // speech
+        let done = feed(&mut segmenter, blocks_of(0.0, 80));
+
+        assert_eq!(done.len(), 1);
+        let expected = (50 + PREROLL_BLOCKS) * BLOCK_SAMPLES;
+        assert!(
+            done[0].len() >= expected,
+            "the utterance should carry {PREROLL_MS} ms from before it started: \
+             got {} samples, expected at least {expected}",
+            done[0].len()
+        );
+    }
+
+    #[test]
+    fn silence_alone_never_becomes_an_utterance() {
+        // The held-back blocks must not accumulate into one.
+        let mut segmenter = Segmenter::new(Settings::default());
+        assert!(feed(&mut segmenter, blocks_of(0.0, 500)).is_empty());
     }
 
     #[test]

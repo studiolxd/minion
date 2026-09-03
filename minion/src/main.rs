@@ -394,11 +394,15 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
         let transcript = match loaded.transcribe_samples(utterance, audio::TARGET_HZ, 1, None) {
             Ok(result) => result.text.trim().to_string(),
             Err(e) => {
-                eprintln!("  transcription failed: {e}");
+                note!("error    transcription failed: {e}");
                 continue;
             }
         };
         if transcript.is_empty() {
+            // Heard, and nothing came back. Worth writing down: it looks
+            // identical to not being heard at all, and without a line here
+            // the two are impossible to tell apart afterwards.
+            note!("blank    {seconds:.1}s of audio, nothing recognised");
             continue;
         }
         let elapsed_ms = started.elapsed().as_millis();
