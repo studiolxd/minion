@@ -13,10 +13,11 @@
 //! The tap only listens; it does not consume the keystroke, so the
 //! combination still reaches whatever has focus.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
-use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
+use core_foundation::runloop::{kCFRunLoopCommonModes, kCFRunLoopDefaultMode, CFRunLoop};
 use core_graphics::event::{
     CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType,
     CallbackResult, EventField,
@@ -32,6 +33,22 @@ mod flags {
     pub const COMMAND: u64 = 0x0010_0000;
 }
 
+/// How long the tap's run loop runs before coming up for air.
+///
+/// Everything the callback is not allowed to do — writing to the log,
+/// turning the tap back on — happens between two of these, so it is short
+/// enough not to be noticed and long enough to cost nothing.
+const TICK: Duration = Duration::from_millis(500);
+
+/// What the callback saw, for the loop to write down. A number rather than
+/// a string because it is set from inside the tap, where the only safe
+/// work is an atomic store.
+mod pending {
+    pub const NOTHING: u8 = 0;
+    pub const RESUMED: u8 = 1;
+    pub const PAUSED: u8 = 2;
+}
+
 /// Starts watching for `shortcut`, flipping `active` when it arrives.
 ///
 /// Returns whether the shortcut could be read. The thread runs for the life
@@ -41,6 +58,14 @@ pub fn watch(shortcut: &str, active: Arc<AtomicBool>) -> bool {
         return false;
     };
 
+    // macOS switches a tap off when its callback takes too long, and used
+    // to do it silently: the shortcut simply stopped working until the next
+    // restart. Both flags are raised inside the tap and acted on outside it.
+    let switched_off = Arc::new(AtomicBool::new(false));
+    let tap_switched_off = Arc::clone(&switched_off);
+    let seen = Arc::new(AtomicU8::new(pending::NOTHING));
+    let tap_seen = Arc::clone(&seen);
+
     std::thread::spawn(move || {
         let tap = CGEventTap::new(
             CGEventTapLocation::Session,
@@ -48,8 +73,21 @@ pub fn watch(shortcut: &str, active: Arc<AtomicBool>) -> bool {
             // Listening only: the keystroke still reaches whatever has
             // focus, so the combination is shared rather than claimed.
             CGEventTapOptions::ListenOnly,
-            vec![CGEventType::KeyDown],
-            move |_proxy, _type, event| {
+            vec![
+                CGEventType::KeyDown,
+                // Not keys: the two ways macOS tells a tap it has been
+                // turned off. Without them there is no way to know.
+                CGEventType::TapDisabledByTimeout,
+                CGEventType::TapDisabledByUserInput,
+            ],
+            move |_proxy, kind, event| {
+                if matches!(
+                    kind,
+                    CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
+                ) {
+                    tap_switched_off.store(true, Ordering::Relaxed);
+                    return CallbackResult::Keep;
+                }
                 let pressed = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
                 if pressed != i64::from(code) || !modifiers_match(event.get_flags().bits(), mods)
                 {
@@ -57,11 +95,13 @@ pub fn watch(shortcut: &str, active: Arc<AtomicBool>) -> bool {
                 }
                 let now = !active.load(Ordering::Relaxed);
                 active.store(now, Ordering::Relaxed);
-                crate::journal::write(if now {
-                    "resumed by shortcut"
-                } else {
-                    "paused by shortcut"
-                });
+                // Nothing slower than an atomic store in here: a callback
+                // that dawdles is exactly what gets the tap turned off, and
+                // writing to the log opens a file and takes a lock.
+                tap_seen.store(
+                    if now { pending::RESUMED } else { pending::PAUSED },
+                    Ordering::Relaxed,
+                );
                 // Kept, not dropped: the combination still reaches whatever
                 // has focus, so Minion shares it rather than claiming it.
                 CallbackResult::Keep
@@ -86,7 +126,24 @@ pub fn watch(shortcut: &str, active: Arc<AtomicBool>) -> bool {
         let run_loop = CFRunLoop::get_current();
         unsafe { run_loop.add_source(&source, kCFRunLoopCommonModes) };
         tap.enable();
-        CFRunLoop::run_current();
+
+        // Run in slices rather than for ever, so there is somewhere to do
+        // the work the callback must not: turning the tap back on, and
+        // saying what happened.
+        loop {
+            CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, TICK, false);
+            if switched_off.swap(false, Ordering::Relaxed) {
+                tap.enable();
+                crate::journal::write(
+                    "macOS switched the shortcut watcher off; switched it back on.",
+                );
+            }
+            match seen.swap(pending::NOTHING, Ordering::Relaxed) {
+                pending::RESUMED => crate::journal::write("resumed by shortcut"),
+                pending::PAUSED => crate::journal::write("paused by shortcut"),
+                _ => {}
+            }
+        }
     });
 
     true
