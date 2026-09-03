@@ -18,8 +18,8 @@ use std::rc::Rc;
 use objc2::rc::Retained;
 use objc2::MainThreadMarker;
 use objc2_app_kit::{
-    NSApplication, NSBackingStoreType, NSButton, NSColor, NSFont, NSLineBreakMode, NSPopUpButton,
-    NSScrollView, NSSlider, NSTextField, NSView, NSWindow, NSWindowStyleMask,
+    NSAccessibility, NSApplication, NSBackingStoreType, NSButton, NSColor, NSFont, NSLineBreakMode,
+    NSPopUpButton, NSScrollView, NSSlider, NSTextField, NSView, NSWindow, NSWindowStyleMask,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
@@ -104,11 +104,23 @@ struct Layout {
     width: f64,
     /// Distance from the top of the canvas to the next free position.
     used: f64,
+    /// The last label written above a control, so the control that follows
+    /// can answer to the same name when read aloud.
+    last_label: Option<String>,
+    /// The last control placed, so a hint can become its description.
+    last_control: Option<Retained<NSView>>,
 }
 
 impl Layout {
     fn new(mtm: MainThreadMarker, width: f64) -> Self {
-        Self { mtm, canvas: NSView::new(mtm), width, used: spacing::TOP }
+        Self {
+            mtm,
+            canvas: NSView::new(mtm),
+            width,
+            used: spacing::TOP,
+            last_label: None,
+            last_control: None,
+        }
     }
 
     fn content_width(&self) -> f64 {
@@ -136,6 +148,22 @@ impl Layout {
         self.canvas.addSubview(view);
     }
 
+    /// Adds a control and gives it the name a screen reader will say.
+    ///
+    /// Every control carries the same words as its visible label: a
+    /// checkbox announced as "checkbox" and nothing else is unusable, and
+    /// a slider with a label beside it has no idea the label is there.
+    fn add_control(&mut self, view: &NSView, name: &str) {
+        self.add(view);
+        view.setAccessibilityLabel(Some(&NSString::from_str(name)));
+        self.last_control = Some(Retained::from(view));
+    }
+
+    /// The name for a control that follows a label of its own.
+    fn borrowed_label(&self) -> String {
+        self.last_label.clone().unwrap_or_default()
+    }
+
     /// A section heading.
     fn heading(&mut self, text: &str) {
         if self.used > spacing::TOP {
@@ -152,6 +180,7 @@ impl Layout {
         let frame = self.place(spacing::LABEL, 0.0);
         let view = plain_label(self.mtm, text, frame);
         self.add(&view);
+        self.last_label = Some(text.to_string());
         self.gap(spacing::AFTER_LABEL);
     }
 
@@ -166,6 +195,11 @@ impl Layout {
         let frame = self.place(spacing::HINT_LINE * lines, indent);
         let view = small_label(self.mtm, text, frame);
         self.add(&view);
+        // The hint explains the control above it, so that is where it
+        // belongs for anyone who cannot see the two side by side.
+        if let Some(control) = &self.last_control {
+            control.setAccessibilityHelp(Some(&NSString::from_str(text)));
+        }
         self.gap(spacing::AFTER_HINT);
     }
 
@@ -180,7 +214,7 @@ impl Layout {
             )
         };
         button.setFrame(frame);
-        self.add(&button);
+        self.add_control(&button, title);
         self.gap(spacing::SIBLING);
         let switch = Switch { control: button, last: Cell::new(on) };
         switch.show(on);
@@ -206,7 +240,8 @@ impl Layout {
             frame.origin,
             NSSize::new(frame.size.width - READOUT, frame.size.height),
         ));
-        self.add(&control);
+        let name = self.borrowed_label();
+        self.add_control(&control, &name);
 
         let readout = small_label(
             self.mtm,
@@ -245,7 +280,8 @@ impl Layout {
             .and_then(|wanted| values.iter().position(|name| *name == wanted))
             .unwrap_or(0) as isize;
         control.selectItemAtIndex(selected);
-        self.add(&control);
+        let name = self.borrowed_label();
+        self.add_control(&control, &name);
         self.gap(spacing::SIBLING);
 
         Chooser { control, values, last: Cell::new(selected) }
@@ -552,7 +588,7 @@ impl Preferences {
         let wake_word = NSTextField::new(mtm);
         wake_word.setStringValue(&NSString::from_str(&current_wake));
         wake_word.setFrame(narrow(layout.place(spacing::FIELD, 0.0), 170.0));
-        layout.add(&wake_word);
+        layout.add_control(&wake_word, "Palabra clave");
         layout.hint(
             "Toda orden empieza por ella. Elige algo que no digas por casualidad.",
             0.0,
@@ -602,7 +638,7 @@ impl Preferences {
         };
         let row = layout.place(spacing::BUTTON, 0.0);
         shortcut.setFrame(narrow(row, 170.0));
-        layout.add(&shortcut);
+        layout.add_control(&shortcut, "Atajo para pausar y reanudar");
         // Safety: no target and no action, so nothing is called back into.
         let clear = unsafe {
             NSButton::buttonWithTitle_target_action(
@@ -613,6 +649,7 @@ impl Preferences {
             )
         };
         clear.setFrame(beside(row, 170.0, 100.0));
+        clear.setAccessibilityLabel(Some(&NSString::from_str("Quitar el atajo")));
         layout.add(&clear);
         layout.hint(
             "Pulsa el botón y luego la combinación, que debe llevar ⌘, ⌥ o ⌃. \
@@ -646,7 +683,7 @@ impl Preferences {
             )
         };
         train.setFrame(narrow(layout.place(spacing::BUTTON, 0.0), 170.0));
-        layout.add(&train);
+        layout.add_control(&train, "Entrenar mi voz");
         let train_status_frame = {
             layout.gap(spacing::BEFORE_HINT);
             layout.place(spacing::HINT_LINE * 2.0, 0.0)
@@ -1018,7 +1055,10 @@ fn install_main_menu(mtm: MainThreadMarker) {
         return;
     }
 
-    let sections: [(&str, &[(&str, objc2::runtime::Sel, &str)]); 2] = [
+    /// A menu item: what it says, what it does, and its key equivalent.
+    type Item<'a> = (&'a str, objc2::runtime::Sel, &'a str);
+
+    let sections: [(&str, &[Item]); 2] = [
         (
             "Edición",
             &[
