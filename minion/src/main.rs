@@ -67,8 +67,13 @@ const BLINK_SECONDS: f64 = 0.45;
 /// what makes the preferences window feel like a window rather than a form.
 const UI_REFRESH_SECONDS: f64 = 0.05;
 
-/// How often the recognition loop wakes up to see whether it has gone idle.
-const IDLE_CHECK: Duration = Duration::from_secs(20);
+/// How often the recognition loop wakes up between utterances.
+///
+/// Short, because this is also how quickly it notices that someone has
+/// started talking while the model is unloaded: a second of loading that
+/// happens while the sentence is still being spoken is a second the
+/// speaker never waits for. The wake-up itself is one atomic read.
+const IDLE_CHECK: Duration = Duration::from_millis(250);
 
 /// Locates the speech model.
 ///
@@ -283,6 +288,23 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
         let utterance = match listener.utterances.recv_timeout(IDLE_CHECK) {
             Ok(utterance) => utterance,
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Someone has started talking. If the model was released
+                // while idle, load it now: the sentence and the silence
+                // that closes it take longer than the load, so this hides
+                // the second the user used to wait through after speaking.
+                let speech_starting = listener.speech_started.swap(false, Ordering::Relaxed);
+                if speech_starting && model.is_none() && active.load(Ordering::Relaxed) {
+                    match load_model(&model_path) {
+                        Ok(loaded) => {
+                            model = Some(loaded);
+                            // Counts as use, or the idle check below would
+                            // release it again before a word is transcribed.
+                            last_used = Instant::now();
+                            note!("Speech starting — model reloaded. {}", resident_memory());
+                        }
+                        Err(e) => eprintln!("could not reload the model: {e:#}"),
+                    }
+                }
                 if let Some(idle_for) = idle_unload {
                     if model.is_some() && last_used.elapsed() >= idle_for {
                         model = None;
@@ -298,14 +320,14 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
         if !active.load(Ordering::Relaxed) {
             continue;
         }
-        let seconds = utterance.len() as f32 / audio::TARGET_HZ as f32;
+        let seconds = utterance.samples.len() as f32 / audio::TARGET_HZ as f32;
         let started = Instant::now();
 
         if save_recordings {
             // The date, not just the time: recordings from different days
             // otherwise collide and overwrite each other past midnight.
             let name = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S").to_string();
-            match audio::save_recording(&utterance, &name) {
+            match audio::save_recording(&utterance.samples, &name) {
                 Ok(path) => note!("saved    {}", path.display()),
                 Err(e) => note!("could not save the recording: {e}"),
             }
@@ -335,7 +357,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                     }
                 }
             }
-            let embedding = voice.as_mut().and_then(|v| v.model.embed(&utterance));
+            let embedding = voice.as_mut().and_then(|v| v.model.embed(utterance.speech()));
             if let Ok(mut session) = training.lock() {
                 if let Some(active_session) = session.as_mut() {
                     if active_session.accept(embedding) {
@@ -359,19 +381,24 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
             // A model loaded for training but with no profile yet means
             // there is nothing to compare against, so anyone is obeyed.
             let known_voice = !voice.profile.is_empty();
-            if let Some(heard) = known_voice
-                .then(|| voice.model.embed(&utterance))
-                .flatten()
-            {
-                let likeness = speaker::similarity(&heard, &voice.profile);
-                if likeness < voice.threshold {
-                    note!("heard    {seconds:.1}s in another voice ({likeness:.2})");
-                    continue;
+            if known_voice {
+                match voice.model.embed(utterance.speech()) {
+                    Some(heard) => {
+                        let likeness = speaker::similarity(&heard, &voice.profile);
+                        if likeness < voice.threshold {
+                            note!("heard    {seconds:.1}s in another voice ({likeness:.2})");
+                            continue;
+                        }
+                        // Logged on the way through as well: without both
+                        // sides, there is no way to tell a threshold that
+                        // is too high from a profile that is wrong.
+                        note!("voice    matched at {likeness:.2}");
+                    }
+                    // Under the hard floor: a cough, a door, half a
+                    // syllable. Let through, but say so, because this is
+                    // the one path where the voice check does not run.
+                    None => note!("voice    {seconds:.1}s too short to check — let through"),
                 }
-                // Logged on the way through as well: without both sides,
-                // there is no way to tell a threshold that is too high
-                // from a profile that is wrong.
-                note!("voice    matched at {likeness:.2}");
             }
         }
 
@@ -393,7 +420,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
         let Some(loaded) = model.as_mut() else {
             continue;
         };
-        let transcript = match loaded.transcribe_samples(utterance, audio::TARGET_HZ, 1, None) {
+        let transcript = match loaded.transcribe_samples(utterance.samples, audio::TARGET_HZ, 1, None) {
             Ok(result) => result.text.trim().to_string(),
             Err(e) => {
                 note!("error    transcription failed: {e}");

@@ -67,20 +67,28 @@ impl FilterBank {
 
         let mut filters = Vec::with_capacity(NUM_MEL_BINS);
         for bin in 0..NUM_MEL_BINS {
-            // Triangular filter over three mel-spaced points.
-            let left = hz_from_mel(mel_low + bin as f32 * mel_step);
-            let centre = hz_from_mel(mel_low + (bin + 1) as f32 * mel_step);
-            let right = hz_from_mel(mel_low + (bin + 2) as f32 * mel_step);
+            // Triangular filter over three mel-spaced points. The triangle
+            // is straight in the mel domain, not in Hz: Kaldi interpolates
+            // between the mel values, and since the mapping is logarithmic
+            // the two differ by a few per cent across every bin — a small,
+            // systematic mismatch with the frontend the model was trained
+            // on, which is exactly the kind that hides.
+            let left_mel = mel_low + bin as f32 * mel_step;
+            let centre_mel = left_mel + mel_step;
+            let right_mel = left_mel + 2.0 * mel_step;
+            let left = hz_from_mel(left_mel);
+            let right = hz_from_mel(right_mel);
 
             let mut start = None;
             let mut weights = Vec::new();
             for k in 0..num_bins {
                 let hz = k as f32 * hz_per_bin;
                 let weight = if hz > left && hz < right {
-                    if hz <= centre {
-                        (hz - left) / (centre - left)
+                    let mel = mel_from_hz(hz);
+                    if mel <= centre_mel {
+                        (mel - left_mel) / mel_step
                     } else {
-                        (right - hz) / (right - centre)
+                        (right_mel - mel) / mel_step
                     }
                 } else {
                     0.0

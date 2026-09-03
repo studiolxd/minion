@@ -20,14 +20,22 @@ use ort::value::TensorRef;
 
 use crate::fbank::{self, FilterBank, NUM_BINS};
 
-/// Utterances shorter than this carry too little voice to identify.
+/// Below this there is no voice to identify at all.
 ///
-/// Half a second was tried and is not enough: short clips produced
-/// embeddings that scored near zero against their own speaker. Anything
-/// below this is let through unchecked rather than judged on too little
-/// evidence — a brief command from the wrong person is a smaller problem
-/// than refusing the right one.
-const MIN_SAMPLES: usize = 16_000 * 6 / 5; // 1.2 seconds
+/// A hard floor, not a quality bar: a third of a second is a syllable, and
+/// anything shorter is a cough or a door. Clips under it are let through
+/// unchecked rather than judged on nothing — a brief noise from the wrong
+/// person is a smaller problem than refusing the right one.
+const MIN_SAMPLES: usize = 16_000 * 3 / 10; // 0.3 seconds
+
+/// How much audio the model wants before it says anything reliable.
+///
+/// Short clips used to be refused outright, because their embeddings
+/// scored near zero against their own speaker — and "minion, Chrome" is
+/// barely a second, so most real commands were never verified at all.
+/// Repeating the speech until it reaches this length is wespeaker's own
+/// trick and gives the statistics pooling enough frames to settle.
+const TILE_TO_SAMPLES: usize = 16_000 * 3 / 2; // 1.5 seconds
 
 /// A voice, as the model sees it: 192 numbers, unit length.
 pub type Embedding = Vec<f32>;
@@ -41,7 +49,28 @@ impl Speaker {
     /// Loads the speaker model from the directory holding the speech model.
     pub fn load(model_dir: &str) -> Result<Self> {
         let path = std::path::Path::new(model_dir).join("speaker.onnx");
+        // Set up like the speech model in main.rs, and for the same
+        // reasons. The defaults open a thread per physical core and keep a
+        // growing arena, which for a 24 MB model asked one short question
+        // at a time is all cost and no benefit: it was most of the process's
+        // twenty-two threads and a slice of the idle memory floor.
         let session = Session::builder()
+            .map_err(|e| anyhow!("{e}"))?
+            .with_intra_threads(1)
+            .map_err(|e| anyhow!("{e}"))?
+            .with_inter_threads(1)
+            .map_err(|e| anyhow!("{e}"))?
+            // Memory patterns pre-allocate for the longest utterance seen
+            // and never give it back.
+            .with_memory_pattern(false)
+            .map_err(|e| anyhow!("{e}"))?
+            // Prepacking keeps a second, faster-to-multiply copy of every
+            // weight alongside the original.
+            .with_config_entry("session.disable_prepacking", "1")
+            .map_err(|e| anyhow!("{e}"))?
+            // Read initializers straight from the mapped file rather than
+            // copying them into the arena first.
+            .with_config_entry("session.use_device_allocator_for_initializers", "1")
             .map_err(|e| anyhow!("{e}"))?
             .commit_from_file(&path)
             .map_err(|e| anyhow!("{e}"))
@@ -51,12 +80,15 @@ impl Speaker {
 
     /// Turns an utterance into an embedding.
     ///
-    /// `None` when there is not enough audio to judge — better to admit
-    /// that than to compare against a fraction of a word.
+    /// `None` only when there is no speech worth the name: short clips are
+    /// repeated up to [`TILE_TO_SAMPLES`] and judged, rather than waved
+    /// through unverified.
     pub fn embed(&mut self, samples: &[f32]) -> Option<Embedding> {
         if samples.len() < MIN_SAMPLES {
             return None;
         }
+        let tiled = tile_to(samples, TILE_TO_SAMPLES);
+        let samples: &[f32] = tiled.as_deref().unwrap_or(samples);
         let (mut feats, frames) = self.bank.compute(samples);
         if frames == 0 {
             return None;
@@ -73,6 +105,21 @@ impl Speaker {
 
         Some(unit_length(values.to_vec()))
     }
+}
+
+/// Repeats `samples` until it is at least `wanted` long.
+///
+/// `None` when it is long enough already, so the caller can use the
+/// original slice and copy nothing.
+fn tile_to(samples: &[f32], wanted: usize) -> Option<Vec<f32>> {
+    if samples.is_empty() || samples.len() >= wanted {
+        return None;
+    }
+    let mut tiled = Vec::with_capacity(wanted + samples.len());
+    while tiled.len() < wanted {
+        tiled.extend_from_slice(samples);
+    }
+    Some(tiled)
 }
 
 /// Scales a vector to unit length, so comparing two is a plain dot product.
@@ -537,6 +584,49 @@ mod tests {
     }
 
     #[test]
+    fn tiling_lets_a_short_clip_be_recognised() {
+        // "minion, Chrome" is about a second, and a second used to be
+        // refused: the commonest commands went through unverified. Repeated
+        // up to a second and a half, a fragment must still look like the
+        // voice it came from, or tiling has bought nothing.
+        let Some(mut model) = model_if_present() else {
+            return;
+        };
+        let whole = voiced(120.0, 2.0);
+        let full = model.embed(&whole).expect("two seconds is plenty");
+        let threshold = crate::config::Config::default().voice_threshold();
+        for tenths in [4usize, 6, 8, 10] {
+            let fragment = &whole[..16_000 * tenths / 10];
+            let short = model.embed(fragment).expect("a fragment is now tiled, not refused");
+            let alike = similarity(&full, &short);
+            println!("  {}.{} s tiled vs whole: {alike:.3}", tenths / 10, tenths % 10);
+            assert!(
+                alike > threshold,
+                "a {tenths}/10 s fragment must clear the threshold, got {alike:.2}"
+            );
+            // A whole command is about a second; that is the length the
+            // change is for, and there the fragment should be all but
+            // indistinguishable from the recording it came from.
+            if tenths >= 8 {
+                assert!(
+                    alike > 0.8,
+                    "a tiled {tenths}/10 s fragment should still be the same voice, \
+                     got {alike:.2}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tiling_only_lengthens_what_is_short() {
+        assert!(tile_to(&[1.0, 2.0], 2).is_none(), "long enough is left alone");
+        assert!(tile_to(&[], 10).is_none(), "nothing to repeat");
+        let tiled = tile_to(&[1.0, 2.0, 3.0], 7).expect("should be lengthened");
+        assert!(tiled.len() >= 7);
+        assert_eq!(&tiled[..6], &[1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
+    }
+
+    #[test]
     fn a_profile_records_which_model_made_it() {
         // Embeddings only mean anything against their own model, so the
         // file has to say which one — otherwise a model change would stop
@@ -576,15 +666,15 @@ mod tests {
     }
 
     #[test]
-    fn short_clips_are_not_judged() {
-        // They produced embeddings scoring near zero against their own
-        // speaker, so letting them through unchecked is more honest than
-        // deciding on that little.
+    fn short_clips_are_judged_rather_than_skipped() {
+        // They used to be refused, which meant most real commands — none
+        // of them much longer than a second — never had their speaker
+        // checked at all. Now they are tiled and judged.
         let Some(mut model) = model_if_present() else { return };
         let brief = voiced(120.0, 1.0);
         assert!(
-            model.embed(&brief).is_none(),
-            "a second of audio is not enough to identify anyone"
+            model.embed(&brief).is_some(),
+            "a second of audio should now be verified, not waved through"
         );
     }
 

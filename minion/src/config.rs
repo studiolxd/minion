@@ -387,6 +387,13 @@ pub fn load() -> Config {
     }
 }
 
+/// The range `max_utterance_ms` is allowed to take.
+///
+/// Anything under a second cuts commands in half; anything over fifteen
+/// seconds is not a command, and the memory it costs is never returned.
+const MIN_UTTERANCE_MS: usize = 1_000;
+const MAX_UTTERANCE_MS: usize = 15_000;
+
 impl Config {
     /// Audio settings, with anything unset left at its default.
     pub fn audio_settings(&self) -> audio::Settings {
@@ -395,7 +402,15 @@ impl Config {
             speech_threshold: self.audio.speech_threshold.unwrap_or(defaults.speech_threshold),
             silence_end_ms: self.audio.silence_end_ms.unwrap_or(defaults.silence_end_ms),
             min_speech_ms: self.audio.min_speech_ms.unwrap_or(defaults.min_speech_ms),
-            max_utterance_ms: self.audio.max_utterance_ms.unwrap_or(defaults.max_utterance_ms),
+            // Clamped: the setting decides how big the encoder's arena
+            // grows, and the process never gives that memory back. A
+            // minute in the configuration file would cost a gigabyte of
+            // resident memory for the rest of the day.
+            max_utterance_ms: self
+                .audio
+                .max_utterance_ms
+                .unwrap_or(defaults.max_utterance_ms)
+                .clamp(MIN_UTTERANCE_MS, MAX_UTTERANCE_MS),
         }
     }
 
@@ -534,6 +549,23 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_longest_utterance_stays_within_reach() {
+        // The setting sizes the encoder's arena, and the process never
+        // gives that memory back: a minute in the file would cost a
+        // gigabyte of resident memory for the rest of the day.
+        let mut config = Config::default();
+        config.audio.max_utterance_ms = Some(60_000);
+        assert_eq!(config.audio_settings().max_utterance_ms, MAX_UTTERANCE_MS);
+
+        config.audio.max_utterance_ms = Some(10);
+        assert_eq!(config.audio_settings().max_utterance_ms, MIN_UTTERANCE_MS);
+
+        // Anything sensible is still honoured.
+        config.audio.max_utterance_ms = Some(6_000);
+        assert_eq!(config.audio_settings().max_utterance_ms, 6_000);
+    }
 
     #[test]
     fn setting_an_option_keeps_the_rest_of_the_file() {

@@ -46,6 +46,11 @@ pub struct Settings {
     /// Below this it is a noise, not an utterance.
     pub min_speech_ms: usize,
     /// Safety cut so a continuous noise cannot accumulate forever.
+    ///
+    /// It also sets the largest tensor the encoder ever sees, and ONNX
+    /// Runtime's arena grows to the longest utterance of a session and
+    /// stays there. Eight seconds is longer than any command anyone
+    /// speaks and keeps that ceiling well below where twelve put it.
     pub max_utterance_ms: usize,
 }
 
@@ -55,8 +60,43 @@ impl Default for Settings {
             speech_threshold: 0.015,
             silence_end_ms: 700,
             min_speech_ms: 300,
-            max_utterance_ms: 12_000,
+            max_utterance_ms: 8_000,
         }
+    }
+}
+
+/// One finished utterance, and where the speech inside it sits.
+///
+/// The samples carry the 320 ms preroll in front and the whole
+/// `silence_end_ms` hangover behind, because the recogniser needs both: cut
+/// the preroll and "Chrome" loses its consonant again. The speaker model
+/// wants the opposite — a second of room tone per phrase drags its mean
+/// towards the room rather than the voice — so the offsets say where the
+/// energy actually crossed the threshold, and [`Utterance::speech`] hands
+/// out that stretch alone.
+#[derive(Clone, Debug)]
+pub struct Utterance {
+    /// 16 kHz mono, preroll and hangover included.
+    pub samples: Vec<f32>,
+    /// Where the first block above the threshold begins.
+    pub speech_start: usize,
+    /// Where the last block above the threshold ends.
+    pub speech_end: usize,
+}
+
+impl Utterance {
+    /// The speech alone, without the preroll or the trailing silence.
+    ///
+    /// NOTE: the speaker threshold (0.32) was measured on scores computed
+    /// over the whole utterance, silence and all. Feeding only the speech
+    /// should raise same-speaker scores — it removes the room tone that was
+    /// pulling every embedding towards the same place — so the threshold
+    /// wants re-measuring on real recordings before it is trusted as tight
+    /// or as loose as it looks now.
+    pub fn speech(&self) -> &[f32] {
+        let end = self.speech_end.min(self.samples.len());
+        let start = self.speech_start.min(end);
+        &self.samples[start..end]
     }
 }
 
@@ -66,7 +106,12 @@ pub struct Listener {
     /// held rather than ignored.
     _stream: Arc<Mutex<Option<cpal::platform::Stream>>>,
     /// Completed utterances, as 16 kHz mono samples.
-    pub utterances: Receiver<Vec<f32>>,
+    pub utterances: Receiver<Utterance>,
+    /// Raised as soon as an utterance opens, and cleared by whoever reads
+    /// it. Speech takes a second or two to finish and the model takes about
+    /// a second to load, so the loop can use the news to start loading
+    /// while the sentence is still being said rather than after it.
+    pub speech_started: Arc<AtomicBool>,
     pub source_hz: u32,
     pub channels: usize,
 }
@@ -78,27 +123,161 @@ pub struct Listener {
 /// looks exactly like Minion having gone deaf, with nothing in the log.
 const DEVICE_CHECK: Duration = Duration::from_secs(3);
 
-/// Downmixes to mono and drops to 16 kHz by taking every Nth sample.
+/// Length of the anti-alias filter, in taps.
 ///
-/// This is crude resampling with no anti-alias filter. For speech in a
-/// narrow band it is good enough; if quality ever gets in the way, this is
-/// the function to replace.
-pub(crate) fn to_16k_mono(input: &[f32], channels: usize, source_hz: u32) -> Vec<f32> {
-    let channels = channels.max(1);
-    let step = (source_hz as f32 / TARGET_HZ as f32).max(1.0);
-    let frames = input.len() / channels;
-    let mut out = Vec::with_capacity((frames as f32 / step) as usize + 1);
-    let mut position = 0.0f32;
-    while (position as usize) < frames {
-        let start = position as usize * channels;
-        if start + channels > input.len() {
-            break;
-        }
-        let mixed: f32 = input[start..start + channels].iter().sum::<f32>() / channels as f32;
-        out.push(mixed);
-        position += step;
+/// Odd, so the delay is a whole number of samples. Thirty-one taps with a
+/// Hamming window give about 50 dB of stopband rejection and a transition
+/// band of roughly 5 kHz at 48 kHz — enough to bury everything above 8 kHz
+/// before it folds down, at a cost of one multiply-add per tap per sample.
+const FILTER_TAPS: usize = 31;
+
+/// Where the anti-alias filter stops passing, in Hz.
+///
+/// Below the 8 kHz Nyquist of the target rate, with room for the
+/// transition band to roll off before it. Speech lives well below this;
+/// what sits above it is what used to fold back onto the fricatives.
+const CUTOFF_HZ: f32 = 7_000.0;
+
+/// A windowed-sinc low-pass, normalised to unit gain at DC.
+fn low_pass(cutoff_hz: f32, source_hz: f32, taps: usize) -> Vec<f32> {
+    let middle = (taps - 1) as f32 / 2.0;
+    let normalised = (cutoff_hz / source_hz).clamp(0.0, 0.5);
+    let mut kernel: Vec<f32> = (0..taps)
+        .map(|i| {
+            let x = i as f32 - middle;
+            let sinc = if x.abs() < f32::EPSILON {
+                2.0 * normalised
+            } else {
+                (2.0 * std::f32::consts::PI * normalised * x).sin() / (std::f32::consts::PI * x)
+            };
+            // Hamming: the ripple it leaves is far below the noise floor of
+            // any microphone this will ever run on.
+            let window = 0.54
+                - 0.46 * (2.0 * std::f32::consts::PI * i as f32 / (taps - 1) as f32).cos();
+            sinc * window
+        })
+        .collect();
+    let sum: f32 = kernel.iter().sum();
+    if sum.abs() > f32::EPSILON {
+        kernel.iter_mut().for_each(|tap| *tap /= sum);
     }
-    out
+    kernel
+}
+
+/// Downmixes to mono and converts to 16 kHz, filtering before it decimates.
+///
+/// Taking every Nth sample without a filter folds everything between 8 and
+/// 24 kHz back into the band the model listens to. The fricatives live at
+/// the top of that band — which is why "Chrome" and "Safari" came back as
+/// "crumb" and "so fuddy" while "terminal" never failed. So: low-pass at
+/// [`CUTOFF_HZ`] first, then read the filtered signal at the fractional
+/// positions the rate ratio asks for.
+///
+/// The kernel depends only on the source rate, so it is computed once and
+/// kept; the scratch buffers are reused, because this runs inside the
+/// CoreAudio callback where an allocation is a glitch waiting to happen.
+pub(crate) struct Resampler {
+    /// Filter taps for `source_hz`, or empty when no filtering is needed.
+    kernel: Vec<f32>,
+    /// Input samples per output sample.
+    step: f32,
+    /// Where in the next block the first output sample falls.
+    position: f32,
+    /// The tail of the previous block, so the filter has no seam at the
+    /// block boundary.
+    history: Vec<f32>,
+    /// Mono input, history first: reused between calls.
+    mono: Vec<f32>,
+    /// The filtered signal, one sample per input frame.
+    filtered: Vec<f32>,
+}
+
+impl Resampler {
+    pub(crate) fn new(source_hz: u32) -> Self {
+        // Upsampling cannot alias: a signal already band-limited to the
+        // source Nyquist stays band-limited. Filtering there would only
+        // eat into the speech it is meant to protect.
+        let kernel = if source_hz > TARGET_HZ {
+            low_pass(CUTOFF_HZ, source_hz as f32, FILTER_TAPS)
+        } else {
+            Vec::new()
+        };
+        let history = vec![0.0; kernel.len().saturating_sub(1)];
+        Self {
+            kernel,
+            step: source_hz as f32 / TARGET_HZ as f32,
+            position: 0.0,
+            history,
+            mono: Vec::new(),
+            filtered: Vec::new(),
+        }
+    }
+
+    /// Resamples one block into the reusable scratch buffer, and returns it.
+    pub(crate) fn process(&mut self, input: &[f32], channels: usize) -> &[f32] {
+        let channels = channels.max(1);
+        let frames = input.len() / channels;
+
+        // Mono, with the previous block's tail in front of it so the first
+        // filtered samples see the same history as the rest.
+        self.mono.clear();
+        self.mono.extend_from_slice(&self.history);
+        let offset = self.history.len();
+        for frame in 0..frames {
+            let start = frame * channels;
+            let sum: f32 = input[start..start + channels].iter().sum();
+            self.mono.push(sum / channels as f32);
+        }
+
+        self.filtered.clear();
+        if self.kernel.is_empty() {
+            self.filtered.extend_from_slice(&self.mono[offset..]);
+        } else {
+            for frame in 0..frames {
+                let window = &self.mono[frame..frame + offset + 1];
+                let value: f32 = self
+                    .kernel
+                    .iter()
+                    .zip(window.iter().rev())
+                    .map(|(tap, sample)| tap * sample)
+                    .sum();
+                self.filtered.push(value);
+            }
+        }
+
+        // Keep the tail for the next block.
+        if offset > 0 {
+            let start = self.mono.len() - offset;
+            self.history.clear();
+            self.history.extend_from_slice(&self.mono[start..]);
+        }
+
+        // Read the filtered signal where the rate ratio asks, interpolating
+        // between neighbours: a device at 44 100 Hz lands between samples
+        // two times out of three.
+        self.mono.clear(); // reused as the output scratch
+        while self.position < frames as f32 {
+            let index = self.position as usize;
+            let fraction = self.position - index as f32;
+            let here = self.filtered[index];
+            let next = *self.filtered.get(index + 1).unwrap_or(&here);
+            self.mono.push(here + (next - here) * fraction);
+            self.position += self.step;
+        }
+        self.position -= frames as f32;
+        &self.mono
+    }
+}
+
+/// Downmixes to mono and converts to 16 kHz.
+///
+/// A one-shot wrapper around [`Resampler`] for callers holding a whole
+/// recording. The live path keeps a resampler instead, so the kernel is
+/// built once rather than per block — which leaves this used only by the
+/// tests, here and in `speaker`.
+#[cfg(test)]
+pub(crate) fn to_16k_mono(input: &[f32], channels: usize, source_hz: u32) -> Vec<f32> {
+    Resampler::new(source_hz).process(input, channels).to_vec()
 }
 
 fn rms(block: &[f32]) -> f32 {
@@ -202,6 +381,9 @@ struct Segmenter {
     speech_blocks: usize,
     silence_blocks: usize,
     speaking: bool,
+    /// Where the speech starts and ends inside `current`.
+    speech_start: usize,
+    speech_end: usize,
     noise: NoiseFloor,
     /// The most recent quiet blocks, kept in case speech starts.
     preroll: std::collections::VecDeque<Vec<f32>>,
@@ -215,13 +397,15 @@ impl Segmenter {
             speech_blocks: 0,
             silence_blocks: 0,
             speaking: false,
+            speech_start: 0,
+            speech_end: 0,
             noise: NoiseFloor::new(),
             preroll: std::collections::VecDeque::with_capacity(PREROLL_BLOCKS + 1),
         }
     }
 
     /// Feeds one block. Returns a finished utterance when there is one.
-    fn push(&mut self, block: &[f32]) -> Option<Vec<f32>> {
+    fn push(&mut self, block: &[f32]) -> Option<Utterance> {
         let level = rms(block);
         let threshold = self.noise.threshold(self.settings.speech_threshold);
         let has_speech = level > threshold;
@@ -238,6 +422,9 @@ impl Segmenter {
                 for held in self.preroll.drain(..) {
                     self.current.extend_from_slice(&held);
                 }
+                // Everything replaced above is room tone: the speech proper
+                // starts here.
+                self.speech_start = self.current.len();
             }
             self.speaking = true;
             self.speech_blocks += 1;
@@ -254,6 +441,11 @@ impl Segmenter {
 
         if self.speaking {
             self.current.extend_from_slice(block);
+            if has_speech {
+                // The last block with energy in it: everything after this
+                // is the hangover that closes the utterance.
+                self.speech_end = self.current.len();
+            }
         }
 
         let max_samples = self.settings.max_utterance_ms * TARGET_HZ as usize / 1000;
@@ -266,10 +458,17 @@ impl Segmenter {
         }
 
         let long_enough = self.speech_blocks >= self.settings.min_speech_ms / BLOCK_MS;
-        let utterance = std::mem::take(&mut self.current);
+        let samples = std::mem::take(&mut self.current);
+        let utterance = Utterance {
+            speech_start: self.speech_start,
+            speech_end: self.speech_end.max(self.speech_start),
+            samples,
+        };
         self.speaking = false;
         self.speech_blocks = 0;
         self.silence_blocks = 0;
+        self.speech_start = 0;
+        self.speech_end = 0;
         self.preroll.clear();
 
         long_enough.then_some(utterance)
@@ -334,6 +533,9 @@ fn open_default(
 
     let capture_queue = Arc::clone(queue);
     let capture_active = Arc::clone(active);
+    // Built once per stream: the filter kernel and the scratch buffers are
+    // kept between callbacks so nothing allocates in the hot path.
+    let mut resampler = Resampler::new(source_hz);
 
     let stream = device.build_input_stream(
         config.into(),
@@ -343,9 +545,9 @@ fn open_default(
             if !capture_active.load(Ordering::Relaxed) {
                 return;
             }
-            let resampled = to_16k_mono(input, channels, source_hz);
+            let resampled = resampler.process(input, channels);
             if let Ok(mut queued) = capture_queue.lock() {
-                queued.extend_from_slice(&resampled);
+                queued.extend_from_slice(resampled);
                 let limit = TARGET_HZ as usize * QUEUE_LIMIT_SECONDS;
                 if queued.len() > limit {
                     let excess = queued.len() - limit;
@@ -416,6 +618,8 @@ pub fn start(
 
     let (send, utterances) = mpsc::channel();
     let segment_queue = Arc::clone(&queue);
+    let speech_started = Arc::new(AtomicBool::new(false));
+    let segment_started = Arc::clone(&speech_started);
 
     std::thread::spawn(move || {
         let mut segmenter = Segmenter::new(settings);
@@ -437,7 +641,13 @@ pub fn start(
             }
 
             for block in pending.chunks(BLOCK_SAMPLES) {
-                if let Some(utterance) = segmenter.push(block) {
+                let utterance = segmenter.push(block);
+                // Announced while it is still being spoken, not when it
+                // ends: whoever is waiting has work it can start now.
+                if segmenter.speaking {
+                    segment_started.store(true, Ordering::Relaxed);
+                }
+                if let Some(utterance) = utterance {
                     if send.send(utterance).is_err() {
                         return; // nobody is listening any more
                     }
@@ -449,6 +659,7 @@ pub fn start(
     Ok(Listener {
         _stream: stream,
         utterances,
+        speech_started,
         source_hz,
         channels,
     })
@@ -462,7 +673,7 @@ mod tests {
         vec![vec![level; BLOCK_SAMPLES]; count]
     }
 
-    fn feed(segmenter: &mut Segmenter, blocks: Vec<Vec<f32>>) -> Vec<Vec<f32>> {
+    fn feed(segmenter: &mut Segmenter, blocks: Vec<Vec<f32>>) -> Vec<Utterance> {
         blocks
             .iter()
             .filter_map(|b| segmenter.push(b))
@@ -491,11 +702,60 @@ mod tests {
         assert_eq!(done.len(), 1);
         let expected = (50 + PREROLL_BLOCKS) * BLOCK_SAMPLES;
         assert!(
-            done[0].len() >= expected,
+            done[0].samples.len() >= expected,
             "the utterance should carry {PREROLL_MS} ms from before it started: \
              got {} samples, expected at least {expected}",
-            done[0].len()
+            done[0].samples.len()
         );
+    }
+
+    #[test]
+    fn the_speech_slice_leaves_the_silence_behind() {
+        // The recogniser wants the preroll and the hangover; the speaker
+        // model does not — a second of room tone per phrase drags its mean
+        // away from the voice.
+        let mut segmenter = Segmenter::new(Settings::default());
+        feed(&mut segmenter, blocks_of(0.0, 40)); // quiet room
+        feed(&mut segmenter, blocks_of(0.2, 50)); // 1 s of speech
+        let done = feed(&mut segmenter, blocks_of(0.0, 80));
+        assert_eq!(done.len(), 1);
+        let utterance = &done[0];
+
+        assert_eq!(
+            utterance.speech_start,
+            PREROLL_BLOCKS * BLOCK_SAMPLES,
+            "the speech should start where the preroll ends"
+        );
+        assert_eq!(
+            utterance.speech().len(),
+            50 * BLOCK_SAMPLES,
+            "the speech slice should be the speech and nothing else"
+        );
+        assert!(
+            utterance.samples.len() > utterance.speech().len(),
+            "while the samples themselves keep both margins"
+        );
+        assert!(
+            utterance.speech().iter().all(|s| *s > 0.1),
+            "no silence should have survived the trim"
+        );
+    }
+
+    #[test]
+    fn a_speech_slice_is_always_inside_its_samples() {
+        // Whatever the offsets say, slicing must not panic.
+        let utterance = Utterance {
+            samples: vec![0.0; 10],
+            speech_start: 8,
+            speech_end: 400,
+        };
+        assert_eq!(utterance.speech().len(), 2);
+        let backwards = Utterance {
+            samples: vec![0.0; 10],
+            speech_start: 9,
+            speech_end: 3,
+        };
+        assert!(backwards.speech().is_empty());
     }
 
     #[test]
@@ -533,7 +793,7 @@ mod tests {
         let done = feed(&mut segmenter, blocks_of(0.2, 200));
         assert!(!done.is_empty(), "continuous noise must still be cut");
         assert!(
-            done[0].len() <= 600 * TARGET_HZ as usize / 1000 + BLOCK_SAMPLES,
+            done[0].samples.len() <= 600 * TARGET_HZ as usize / 1000 + BLOCK_SAMPLES,
             "the cut should respect max_utterance_ms"
         );
     }
@@ -597,6 +857,93 @@ mod tests {
         let input: Vec<f32> = vec![1.0; 480 * 2];
         let out = to_16k_mono(&input, 2, 48_000);
         assert_eq!(out.len(), 160);
-        assert!(out.iter().all(|s| (*s - 1.0).abs() < f32::EPSILON));
+        // A constant is DC: a unit-gain low-pass leaves it alone, once the
+        // filter's own history has filled with it.
+        assert!(out[60..].iter().all(|s| (*s - 1.0).abs() < 1e-3));
+    }
+
+    /// A tone of `hz`, `seconds` long, sampled at `rate`.
+    fn tone(hz: f32, rate: f32, seconds: f32) -> Vec<f32> {
+        let count = (rate * seconds) as usize;
+        (0..count)
+            .map(|i| (2.0 * std::f32::consts::PI * hz * i as f32 / rate).sin())
+            .collect()
+    }
+
+    fn rms_of(samples: &[f32]) -> f32 {
+        rms(samples)
+    }
+
+    #[test]
+    fn resampling_kills_what_would_fold_back() {
+        // 12 kHz at 48 kHz has nowhere to go at 16 kHz: without a filter it
+        // reappears at 4 kHz, at full strength, right on top of the
+        // fricatives. This is the whole reason the filter exists.
+        let input = tone(12_000.0, 48_000.0, 1.0);
+        let out = to_16k_mono(&input, 1, 48_000);
+        // Skip the start, where the filter is still filling up.
+        let level = rms_of(&out[200..]);
+        let attenuation = 20.0 * (level / 0.707).log10();
+        assert!(
+            attenuation < -30.0,
+            "12 kHz should be buried, got {attenuation:.1} dB"
+        );
+    }
+
+    #[test]
+    fn resampling_leaves_speech_alone() {
+        // 1 kHz is squarely in the band the model listens to; the filter
+        // must not touch it.
+        let input = tone(1_000.0, 48_000.0, 1.0);
+        let out = to_16k_mono(&input, 1, 48_000);
+        let level = rms_of(&out[200..]);
+        let change = 20.0 * (level / 0.707).log10();
+        assert!(
+            change.abs() < 1.0,
+            "1 kHz should come through unchanged, got {change:.2} dB"
+        );
+    }
+
+    #[test]
+    fn every_source_rate_gives_the_right_number_of_samples() {
+        // Including rates below the target: those must be stretched, not
+        // passed through at the wrong speed and played back as chipmunks.
+        for (rate, seconds) in [(48_000u32, 1.0f32), (44_100, 1.0), (16_000, 1.0), (8_000, 1.0)] {
+            let input = tone(440.0, rate as f32, seconds);
+            let out = to_16k_mono(&input, 1, rate);
+            let expected = (TARGET_HZ as f32 * seconds) as usize;
+            let slack = 2;
+            assert!(
+                out.len().abs_diff(expected) <= slack,
+                "{rate} Hz should give about {expected} samples, got {}",
+                out.len()
+            );
+        }
+    }
+
+    #[test]
+    fn block_by_block_matches_one_long_call() {
+        // The live path feeds the resampler in 10 ms blocks; the tests feed
+        // it whole recordings. The two must agree, or the filter has a seam
+        // at every block boundary.
+        let input = tone(1_000.0, 48_000.0, 0.5);
+        let whole = to_16k_mono(&input, 1, 48_000);
+
+        let mut piecewise = Vec::new();
+        let mut resampler = Resampler::new(48_000);
+        for block in input.chunks(480) {
+            piecewise.extend_from_slice(resampler.process(block, 1));
+        }
+
+        assert!(whole.len().abs_diff(piecewise.len()) <= 1);
+        let shared = whole.len().min(piecewise.len());
+        for i in 0..shared {
+            assert!(
+                (whole[i] - piecewise[i]).abs() < 1e-4,
+                "sample {i} differs: {} vs {}",
+                whole[i],
+                piecewise[i]
+            );
+        }
     }
 }
