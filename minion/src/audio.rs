@@ -393,10 +393,14 @@ impl NoiseFloor {
 /// forward is to listen to what actually arrived.
 pub fn save_recording(samples: &[f32], name: &str) -> std::io::Result<std::path::PathBuf> {
     use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
     let home = std::env::var("HOME").unwrap_or_default();
     let directory = std::path::PathBuf::from(home).join("Library/Application Support/Minion/recordings");
     std::fs::create_dir_all(&directory)?;
+    // Raw audio of whatever was said near the machine: the directory and
+    // the files in it should not be readable by other accounts.
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
     let path = directory.join(format!("{name}.wav"));
 
     let data: Vec<u8> = samples
@@ -404,7 +408,12 @@ pub fn save_recording(samples: &[f32], name: &str) -> std::io::Result<std::path:
         .flat_map(|s| ((s.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes())
         .collect();
 
-    let mut file = std::fs::File::create(&path)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)?;
     let rate = TARGET_HZ;
     file.write_all(b"RIFF")?;
     file.write_all(&(36 + data.len() as u32).to_le_bytes())?;
