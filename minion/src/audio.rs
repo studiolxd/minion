@@ -497,6 +497,8 @@ struct Segmenter {
     /// Silero's verdict on the most recent frame it completed, or `None`
     /// when it has not heard a whole frame of this burst yet.
     score: Option<f32>,
+    /// The best Silero score seen in the utterance so far, for the log.
+    best_score: f32,
     /// Blocks left of the window in which Silero may still veto an
     /// utterance that energy opened. `None` once it has spoken up.
     probation: Option<usize>,
@@ -530,6 +532,7 @@ impl Segmenter {
             score: None,
             probation: None,
             approved: false,
+            best_score: 0.0,
         }
     }
 
@@ -549,6 +552,7 @@ impl Segmenter {
         }
         if let Some(score) = model.push(block) {
             self.score = Some(score);
+            self.best_score = self.best_score.max(score);
         }
         // Before the first whole frame there is no verdict yet, and the
         // benefit of the doubt goes to the speaker: the 200 ms window
@@ -614,12 +618,27 @@ impl Segmenter {
         // speech is the dishwasher, not an order. Dropped here rather
         // than after the recogniser has been woken to transcribe it.
         if let Some(left) = self.probation {
-            if self.score.is_some_and(|score| score >= self.settings.vad_threshold) {
+            if let Some(score) = self.score.filter(|s| *s >= self.settings.vad_threshold) {
                 self.approved = true;
+                // Written down so the threshold can be tuned on what the
+                // room actually produces: a cough or a system sound that
+                // gets through shows up here with its score.
+                if !cfg!(test) {
+                    crate::journal::write(&format!(
+                        "vad      voice {score:.2} after {} ms",
+                        (PROBATION_BLOCKS.saturating_sub(left) + 1) * BLOCK_MS
+                    ));
+                }
             }
             self.probation = match (self.approved, left - 1) {
                 (true, _) => None,
                 (false, 0) => {
+                    if !cfg!(test) {
+                        crate::journal::write(&format!(
+                            "vad      not voice, best {:.2} — dropped",
+                            self.best_score
+                        ));
+                    }
                     self.reset();
                     return None;
                 }
@@ -660,6 +679,7 @@ impl Segmenter {
         self.preroll.clear();
         self.probation = None;
         self.approved = false;
+        self.best_score = 0.0;
         self.score = None;
         // The next utterance is not a continuation of this one.
         if let Some(model) = self.voice.as_mut() {

@@ -291,6 +291,9 @@ fn face_image(svg: &str) -> Option<Retained<NSImage>> {
     let image = NSImage::initWithData(NSImage::alloc(), &data)?;
     // Points, not pixels: the PNG was rendered at 2x for Retina.
     image.setSize(NSSize::new(FACE_POINTS, FACE_POINTS));
+    // A template, like the menu bar icon: black strokes on transparent
+    // vanished against the dark HUD material. Tinted by the view below.
+    image.setTemplate(true);
     Some(image)
 }
 
@@ -374,6 +377,7 @@ impl Hud {
         let face_view = NSImageView::new(mtm);
         face_view.setFrame(face_frame);
         face_view.setImageScaling(NSImageScaling::ScaleProportionallyUpOrDown);
+        face_view.setContentTintColor(Some(&NSColor::labelColor()));
         face_view.setAccessibilityElement(false);
 
         let text_x = PAD + FACE_POINTS + 10.0;
