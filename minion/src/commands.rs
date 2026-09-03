@@ -147,11 +147,15 @@ pub struct App {
 
 pub const APPS: &[App] = &[
     App { name: "Chrome", bundle_id: "com.google.Chrome",
-          aliases: &["chrome", "crome", "cromo", "el navegador", "navegador"] },
+          // "grum", "crum", "crumb", "so fuddy": what the recogniser makes of
+          // a Spanish mouth saying two English names. Listed as heard, since
+          // no tolerance short of reckless would reach them from the real word.
+          aliases: &["chrome", "crome", "cromo", "grum", "crum", "crumb",
+                     "el navegador", "navegador"] },
     // "shafari", "safaris", "safaria": what the recogniser writes when the
     // word is said quickly. Cheaper and safer than loosening the matcher.
     App { name: "Safari", bundle_id: "com.apple.Safari",
-          aliases: &["safari", "shafari", "safaris", "safaria", "el safari"] },
+          aliases: &["safari", "shafari", "safaris", "safaria", "so fuddy", "el safari"] },
     App { name: "Terminal", bundle_id: "com.apple.Terminal",
           aliases: &["terminal", "la terminal", "consola"] },
     App { name: "Orca", bundle_id: "com.stablyai.orca",
@@ -1127,6 +1131,8 @@ mod tests {
         assert_eq!(decision("Minion cierra la pestaña."), Decision::Run("cerrar pestaña"));
         assert_eq!(decision("Minion cierra la ventana."), Decision::Run("cerrar ventana"));
         assert_eq!(decision("Minion minimiza la ventana."), Decision::Run("minimizar"));
+        // The recogniser drifts into English halfway through the phrase.
+        assert_eq!(decision("Minion minimized the ventana."), Decision::Run("minimizar"));
     }
 
     #[test]

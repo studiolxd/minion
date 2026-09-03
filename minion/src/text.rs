@@ -129,7 +129,28 @@ fn words_match(a: &str, b: &str, strict: bool) -> bool {
         return false;
     }
     let _ = strict;
-    edit_distance(a, b) <= 1
+    if edit_distance(a, b) <= 1 {
+        return true;
+    }
+    shares_stem(a, b)
+}
+
+/// Whether two long words are the same word in different clothes.
+///
+/// The recogniser drifts into English halfway through a Spanish phrase and
+/// writes "minimized" for "minimiza": two edits, so a different word by
+/// the rule above, yet the first seven letters agree. A shared opening
+/// that long, covering nearly all of the shorter word, is one stem with
+/// two endings. Short openings do not count — "copiar" and "cortar" share
+/// two letters and "maximiza" and "minimiza" share one.
+fn shares_stem(a: &str, b: &str) -> bool {
+    const MIN_STEM: usize = 6;
+    let shorter = a.chars().count().min(b.chars().count());
+    if shorter < MIN_STEM {
+        return false;
+    }
+    let shared = a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count();
+    shared >= MIN_STEM && shared * 4 >= shorter * 3
 }
 
 /// How many single-character edits separate two words.
@@ -160,6 +181,17 @@ fn edit_distance(a: &str, b: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_shared_stem_survives_a_foreign_ending() {
+        assert!(words_match("minimized", "minimiza", false));
+        assert!(words_match("seleccionado", "seleccionar", false));
+        // Different words that merely start alike stay apart.
+        assert!(!words_match("maximiza", "minimiza", false));
+        assert!(!words_match("cortar", "copiar", false));
+        assert!(!words_match("pestana", "ventana", false));
+        assert!(!words_match("marcar", "marcadores", false));
+    }
 
     #[test]
     fn normalises_recogniser_output() {
