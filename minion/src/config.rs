@@ -165,14 +165,16 @@ pub struct Config {
     /// word while it is.
     pub listen_mode: Option<String>,
 
-    /// Bundle IDs of applications that pause listening while in front —
+    /// Pause listening while another process is capturing the microphone —
     /// a video call is the one time an always-on microphone is unwelcome.
     ///
-    /// `None` uses the built-in list (Zoom, Teams, FaceTime). Google Meet
-    /// in a browser tab has no bundle ID of its own to check — it is
-    /// Chrome, like every other tab — so it cannot be detected this way
-    /// and is not on the list.
-    pub pause_during: Option<Vec<String>>,
+    /// On by default. The signal is CoreAudio's own: which processes are
+    /// running an input stream right now, not which application happens to
+    /// be in front, so a call in a background window pauses Minion and
+    /// Teams in front with no call does not. Needs macOS 14; on 13 the
+    /// property does not exist and the setting does nothing.
+    #[serde(default = "yes")]
+    pub pause_when_microphone_busy: bool,
 
     /// Named sequences of phrases, run one after another. Only read from
     /// here — a downloaded vocabulary pack cannot define one, since a
@@ -309,7 +311,7 @@ impl Default for Config {
             dictation_words: Vec::new(),
             conversation_seconds: None,
             listen_mode: None,
-            pause_during: None,
+            pause_when_microphone_busy: true,
             macros: Vec::new(),
             search_engine: None,
             ask_before_learning: true,
@@ -317,10 +319,6 @@ impl Default for Config {
         }
     }
 }
-
-/// Bundle IDs paused for when the file says nothing.
-const DEFAULT_PAUSE_DURING: &[&str] =
-    &["us.zoom.xos", "com.microsoft.teams2", "com.apple.FaceTime"];
 
 /// Where the configuration file lives.
 pub fn path() -> Option<PathBuf> {
@@ -718,13 +716,6 @@ impl Config {
         }
     }
 
-    /// Bundle IDs that pause listening while in front.
-    pub fn pause_during(&self) -> Vec<String> {
-        self.pause_during
-            .clone()
-            .unwrap_or_else(|| DEFAULT_PAUSE_DURING.iter().map(|id| id.to_string()).collect())
-    }
-
     /// Commands defined in the file, as `'static` entries.
     ///
     /// Anything whose shortcut cannot be read is reported and skipped: one
@@ -1036,16 +1027,13 @@ mod tests {
     }
 
     #[test]
-    fn pause_during_defaults_to_the_built_in_conferencing_apps() {
+    fn pausing_for_a_busy_microphone_is_on_unless_turned_off() {
         let default: Config = toml::from_str("").expect("empty config should parse");
-        assert_eq!(
-            default.pause_during(),
-            vec!["us.zoom.xos", "com.microsoft.teams2", "com.apple.FaceTime"]
-        );
+        assert!(default.pause_when_microphone_busy);
 
-        let custom: Config =
-            toml::from_str(r#"pause_during = ["com.example.calls"]"#).expect("should parse");
-        assert_eq!(custom.pause_during(), vec!["com.example.calls"]);
+        let off: Config =
+            toml::from_str("pause_when_microphone_busy = false").expect("should parse");
+        assert!(!off.pause_when_microphone_busy);
     }
 
     #[test]

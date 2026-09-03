@@ -16,6 +16,10 @@ hmac-sha256 = "1.1.14"
 libc = "0.2.189"
 objc2 = "0.6.4"
 objc2-app-kit = { version = "0.3.2", features = ["NSAlert", "NSWindow", "NSButton", "NSSlider", "NSTextField", "NSControl", "NSView", "NSResponder", "NSApplication", "NSGraphics", "NSText", "NSFont", "NSColor", "NSCell", "NSActionCell", "NSStringDrawing", "NSWorkspace", "NSRunningApplication", "NSImage", "NSPanel", "NSEvent", "NSParagraphStyle", "NSScrollView", "NSClipView", "NSPopUpButton", "NSMenu", "NSMenuItem", "NSTextView", "NSTextContainer", "NSAccessibilityProtocols"] }
+# The CoreAudio process objects (macOS 14+) that say which processes are
+# recording right now. Already in the tree via cpal at this exact version;
+# taken directly rather than writing extern "C" blocks by hand.
+objc2-core-audio = { version = "0.3.2", default-features = false, features = ["std", "AudioHardware"] }
 objc2-foundation = { version = "0.3.2", features = ["NSTimer", "NSDate", "NSRunLoop", "NSOperation", "block2"] }
 ort = "2.0.0-rc.13"
 parakeet-rs = "0.3.7"
