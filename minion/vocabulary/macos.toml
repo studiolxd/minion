@@ -180,13 +180,92 @@ keys = "cmd-delete"
 
 [[commands]]
 name = "cancelar"
-phrases = ["cancela esto", "cancela"]
+# Bare "cancela" is claimed by Minion's own cancel word (see
+# commands::decide_in's cancel check) — always stops speech, a running
+# macro, a pending question and the conversation window, wherever it is
+# said. "cancela esto" still means escape, since it names something.
+phrases = ["cancela esto"]
 keys = "escape"
 
 [[commands]]
 name = "buscar"
 phrases = ["busca en la página", "busca aquí"]
 keys = "cmd-f"
+
+# ── Keys ────────────────────────────────────────────────────────────────
+#
+# From the log: named keys, said on their own. "pulsa" is optional —
+# "tabulador" alone works too — since a bare key name is unambiguous.
+
+[[commands]]
+name = "tecla enter"
+phrases = ["pulsa enter", "intro", "enter"]
+keys = "enter"
+
+[[commands]]
+name = "tecla tabulador"
+phrases = ["pulsa tabulador", "tab", "tabulador"]
+keys = "tab"
+
+[[commands]]
+name = "tecla escape"
+phrases = ["escape"]
+keys = "escape"
+
+[[commands]]
+name = "tecla retroceso"
+phrases = ["pulsa retroceso", "retroceso", "borra un caracter"]
+keys = "delete"
+
+[[commands]]
+name = "tecla suprimir"
+phrases = ["suprime", "pulsa suprimir"]
+keys = "forwarddelete"
+
+[[commands]]
+name = "tecla espacio"
+phrases = ["pulsa espacio", "espacio"]
+keys = "space"
+
+[[commands]]
+name = "flecha arriba"
+phrases = ["flecha arriba"]
+keys = "up"
+
+[[commands]]
+name = "flecha abajo"
+phrases = ["flecha abajo"]
+keys = "down"
+
+[[commands]]
+name = "flecha izquierda"
+phrases = ["flecha izquierda"]
+keys = "left"
+
+[[commands]]
+name = "flecha derecha"
+phrases = ["flecha derecha"]
+keys = "right"
+
+[[commands]]
+name = "tecla inicio"
+phrases = ["inicio"]
+keys = "home"
+
+[[commands]]
+name = "tecla fin"
+phrases = ["fin"]
+keys = "end"
+
+[[commands]]
+name = "pagina arriba"
+phrases = ["pagina arriba"]
+keys = "pageup"
+
+[[commands]]
+name = "pagina abajo"
+phrases = ["pagina abajo"]
+keys = "pagedown"
 
 # ── Tabs ────────────────────────────────────────────────────────────────
 

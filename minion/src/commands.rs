@@ -150,6 +150,31 @@ pub fn threshold() -> f32 {
     *USER_THRESHOLD.get().unwrap_or(&DEFAULT_THRESHOLD)
 }
 
+/// Scores this close count as a tie, broken by which phrase said more.
+const SCORE_TIE: f32 = 1e-4;
+
+/// Whether a candidate match beats the current best, in the table and
+/// macro races of [`decide_in`].
+///
+/// A phrase that names more of the sentence is more specific, and wins a
+/// tie: "borra la palabra" reaches "borrar palabra" as well as it reaches
+/// the single-word "borrar", but "borrar palabra" is the one that was
+/// actually asked for. Only a near-exact tie in score is broken this way —
+/// a real difference in how well something was said still decides it, the
+/// same way it always has.
+fn beats(score: f32, words: usize, current: Option<f32>, current_words: usize) -> bool {
+    match current {
+        None => true,
+        Some(best) => {
+            if (score - best).abs() > SCORE_TIE {
+                score > best
+            } else {
+                words > current_words
+            }
+        }
+    }
+}
+
 /// Every application, from every layer of the vocabulary.
 fn all_apps() -> impl Iterator<Item = &'static App> {
     vocabulary().apps.iter()
@@ -1368,19 +1393,30 @@ pub fn decide_in(transcript: &str, context: Option<&str>) -> (Decision, f32) {
     // macros — a macro is just as much the user's own as a `[[commands]]`
     // entry, so it races the same way for the same phrase.
     let mut best: Option<(TableHit, f32)> = None;
+    let mut best_words = 0usize;
     for command in &vocabulary().commands {
         for phrase in command.phrases {
             let score = similarity(rest, phrase);
-            if score >= threshold() && best.is_none_or(|(_, b)| score > b) {
+            if score < threshold() {
+                continue;
+            }
+            let words = keywords(phrase).len();
+            if beats(score, words, best.as_ref().map(|(_, b)| *b), best_words) {
                 best = Some((TableHit::Command(command), score));
+                best_words = words;
             }
         }
     }
     for macro_ in macros() {
         for phrase in macro_.phrases {
             let score = similarity(rest, phrase);
-            if score >= threshold() && best.is_none_or(|(_, b)| score > b) {
+            if score < threshold() {
+                continue;
+            }
+            let words = keywords(phrase).len();
+            if beats(score, words, best.as_ref().map(|(_, b)| *b), best_words) {
                 best = Some((TableHit::Macro(macro_), score));
+                best_words = words;
             }
         }
     }
@@ -2158,6 +2194,41 @@ mod tests {
         decide(phrase).0
     }
 
+    #[test]
+    fn a_command_that_matches_more_of_the_phrase_beats_a_subset() {
+        // "borra la palabra" names "borrar palabra" outright; "borrar" on
+        // its own only reaches it with a word left over, so it must not
+        // win even if the two were ever tied on raw score.
+        assert_eq!(decision("minion borra la palabra"), Decision::Run("borrar palabra"));
+    }
+
+    #[test]
+    fn named_keys_press_the_right_key() {
+        assert_eq!(decision("minion intro"), Decision::Run("tecla enter"));
+        assert_eq!(decision("minion pulsa tabulador"), Decision::Run("tecla tabulador"));
+        assert_eq!(decision("minion escape"), Decision::Run("tecla escape"));
+        assert_eq!(decision("minion retroceso"), Decision::Run("tecla retroceso"));
+        assert_eq!(decision("minion borra un caracter"), Decision::Run("tecla retroceso"));
+        assert_eq!(decision("minion suprime"), Decision::Run("tecla suprimir"));
+        assert_eq!(decision("minion pulsa espacio"), Decision::Run("tecla espacio"));
+        assert_eq!(decision("minion flecha arriba"), Decision::Run("flecha arriba"));
+        assert_eq!(decision("minion flecha abajo"), Decision::Run("flecha abajo"));
+        assert_eq!(decision("minion flecha izquierda"), Decision::Run("flecha izquierda"));
+        assert_eq!(decision("minion flecha derecha"), Decision::Run("flecha derecha"));
+        assert_eq!(decision("minion inicio"), Decision::Run("tecla inicio"));
+        assert_eq!(decision("minion fin"), Decision::Run("tecla fin"));
+        assert_eq!(decision("minion pagina arriba"), Decision::Run("pagina arriba"));
+        assert_eq!(decision("minion pagina abajo"), Decision::Run("pagina abajo"));
+    }
+
+    #[test]
+    fn observed_recogniser_forms_open_the_right_app() {
+        launches("minion abre so fuddi", "Safari");
+        launches("minion abre cron", "Chrome");
+        launches("minion abre u s code", "VS Code");
+        launches("minion abre uve ese code", "VS Code");
+    }
+
     fn launches(phrase: &str, expected: &str) {
         match decision(phrase) {
             Decision::Launch { name, .. } => assert_eq!(name, expected, "for «{phrase}»"),
@@ -2451,13 +2522,20 @@ mod tests {
 
     #[test]
     fn guessing_splits_a_run_together_word_to_find_the_app() {
-        // The real case: "Minion abrecron" glued "abre" and "cron", and
-        // "cron" is one phonetic edit from Chrome's "crom". The strict path
-        // must not act on it — only the guess used for questions and
-        // Aprender does.
-        assert_eq!(decision("minion abrecron"), Decision::Unrecognised);
-        let guess = closest_app("minion abrecron").expect("should guess Chrome");
+        // The real case: "Minion abrechron" glues "abre" and "chron", and
+        // "chron" is one phonetic edit from Chrome's "crom" ("cron" itself
+        // is now a listed alias — see browsers.toml — since the log showed
+        // it often enough to stop being a guess). The strict path must not
+        // act on "chron" — only the guess used for questions and Aprender
+        // does.
+        assert_eq!(decision("minion abrechron"), Decision::Unrecognised);
+        let guess = closest_app("minion abrechron").expect("should guess Chrome");
         assert_eq!(guess.app, "Chrome");
+        // "cron" itself, being a listed alias, is acted on outright.
+        assert_eq!(
+            decision("minion abrecron"),
+            Decision::Launch { name: "Chrome", bundle_id: "com.google.Chrome" }
+        );
 
         // "cromo" spelled right phonetically, and "avrechrome" where the
         // verb itself is misheard ("avre" for "abre", a b/v slip) but the

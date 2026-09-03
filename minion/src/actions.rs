@@ -65,6 +65,11 @@ pub mod key {
     /// ⌘+ even though the menu shows a plus sign.
     pub const EQUALS: u16 = 24;
     pub const MINUS: u16 = 27;
+    pub const FORWARD_DELETE: u16 = 117;
+    pub const HOME: u16 = 115;
+    pub const END: u16 = 119;
+    pub const PAGE_UP: u16 = 116;
+    pub const PAGE_DOWN: u16 = 121;
 }
 
 /// Parses a shortcut such as "cmd-shift-b" into a key and its modifiers.
@@ -144,6 +149,9 @@ const NAMED: &[(&str, u16)] = &[
         ("f6", 97), ("f7", 98), ("f8", 100), ("f9", 101), ("f10", 109),
     ("f11", 103), ("f12", 111),
     ("equals", key::EQUALS), ("minus", key::MINUS),
+    ("forwarddelete", key::FORWARD_DELETE), ("supr", key::FORWARD_DELETE),
+    ("home", key::HOME), ("end", key::END),
+    ("pageup", key::PAGE_UP), ("pagedown", key::PAGE_DOWN),
 ];
 
 /// Modifier keys held during a keystroke.

@@ -75,7 +75,7 @@ const ASKED: &[(Question, &[&str])] = &[
     (Question::Time, &["que hora es", "dime la hora", "que hora"]),
     (Question::Date, &["que dia es hoy", "dime la fecha", "que fecha es"]),
     (Question::Battery, &["cuanta bateria queda", "cuanta bateria", "como va la bateria"]),
-    (Question::Volume, &["que volumen tengo", "como esta el volumen"]),
+    (Question::Volume, &["que volumen tengo", "como esta el volumen", "a cuanto esta el volumen"]),
     (Question::Listening, &["me oyes", "me escuchas", "estas ahi"]),
     (Question::Activity, &["que he dicho hoy", "cuantas ordenes llevo"]),
     (Question::WhoAmI, &["quien soy", "sabes quien soy", "quien te esta hablando"]),
@@ -590,6 +590,7 @@ mod tests {
         assert_eq!(asked("dime la hora", 0.7), Some(Question::Time));
         assert_eq!(asked("cuanta bateria queda", 0.7), Some(Question::Battery));
         assert_eq!(asked("me oyes", 0.7), Some(Question::Listening));
+        assert_eq!(asked("a cuanto esta el volumen", 0.7), Some(Question::Volume));
     }
 
     #[test]
