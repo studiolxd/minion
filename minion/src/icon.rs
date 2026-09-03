@@ -22,6 +22,7 @@ const ACTING: &str = include_str!("../assets/acting.svg");
 const DICTATING: &str = include_str!("../assets/dictating.svg");
 const THINKING: &str = include_str!("../assets/thinking.svg");
 const SPEAKING: &str = include_str!("../assets/speaking.svg");
+const SPEAKING_CLOSED: &str = include_str!("../assets/speaking-closed.svg");
 
 /// Height in pixels: twice the menu bar's usable height, for Retina.
 ///
@@ -107,6 +108,14 @@ pub fn thinking() -> Result<Icon> {
 pub fn speaking() -> Result<Icon> {
     static SPEAKING_ICON: OnceLock<Option<Icon>> = OnceLock::new();
     cached(&SPEAKING_ICON, SPEAKING)
+}
+
+/// The other frame of talking: mouth nearly shut. The menu bar alternates
+/// it with [`speaking`] while a reply is spoken, which reads as talking
+/// rather than as a face frozen mid-word.
+pub fn speaking_closed() -> Result<Icon> {
+    static SPEAKING_CLOSED_ICON: OnceLock<Option<Icon>> = OnceLock::new();
+    cached(&SPEAKING_CLOSED_ICON, SPEAKING_CLOSED)
 }
 
 pub fn export_iconset(directory: &str) -> Result<()> {
@@ -222,6 +231,13 @@ mod tests {
         assert_eq!(width, sw);
         // The closed-mouth smile line is gone; the open mouth is filled in.
         assert!(alpha_at(&speaking, width, 12.0, 17.6) > 200, "the mouth is open");
+        // The second frame keeps the mouth's centre but not its height.
+        let (closed, cw) = pixels(SPEAKING_CLOSED);
+        assert_eq!(width, cw);
+        assert!(alpha_at(&closed, width, 12.0, 17.6) > 200, "the closing mouth is there");
+        assert!(alpha_at(&closed, width, 12.0, 19.6) < 40, "but it is not open wide");
+        assert!(alpha_at(&speaking, width, 12.0, 19.6) > 200, "unlike the open one");
+        assert!(speaking_closed().is_ok());
     }
 
     fn draw(svg: &str) -> Vec<u8> {

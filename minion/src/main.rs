@@ -189,6 +189,10 @@ const UI_REFRESH_SECONDS: f64 = 0.05;
 /// full repaint eighteen times a second for no one.
 const UI_THROTTLE_TICKS: u32 = 5;
 
+/// Ticks of the 50 ms timer between the two talking frames: 150 ms, about
+/// the pace of syllables, which is what makes the mouth read as talking.
+const SPEAKING_FRAME_TICKS: u32 = 3;
+
 /// How often the recognition loop wakes up between utterances.
 ///
 /// Short, because this is also how quickly it notices that someone has
@@ -2067,6 +2071,8 @@ fn run_menu_bar(
     let toggle_for_timer = toggle.clone();
     let active_for_timer = Arc::clone(&active);
     let shown_face = Cell::new(if busy { Face::Asleep } else { Face::Awake });
+    // Which of the two talking frames is up, while a reply is spoken.
+    let speaking_frame: Cell<u32> = Cell::new(0);
     let dictating_for_timer = Arc::clone(&dictating);
     let thinking_for_timer = Arc::clone(&thinking);
     let speaking_for_timer = Arc::clone(&speaking);
@@ -2234,7 +2240,8 @@ fn run_menu_bar(
         let watched = panel_for_timer.is_visible()
             || onboarding_for_timer.is_visible()
             || vocabulary_editor_for_timer.is_visible()
-            || blink_until.get().is_some();
+            || blink_until.get().is_some()
+            || speaking_for_timer.load(Ordering::Relaxed);
         if !watched && !on_schedule(throttle_tick, UI_THROTTLE_TICKS) {
             return;
         }
@@ -2614,6 +2621,18 @@ fn run_menu_bar(
             (true, false, false, false, false) => Face::Awake,
         };
         if wanted == shown_face.get() {
+            // Talking is the one resting face that moves: two frames,
+            // swapped every SPEAKING_FRAME_TICKS ticks of 50 ms.
+            if wanted == Face::Speaking {
+                let frame = (throttle_tick / SPEAKING_FRAME_TICKS) % 2;
+                if frame != speaking_frame.get() {
+                    speaking_frame.set(frame);
+                    let face = if frame == 0 { icon::speaking() } else { icon::speaking_closed() };
+                    if let Ok(face) = face {
+                        let _ = tray_for_timer.set_icon_with_as_template(Some(face), true);
+                    }
+                }
+            }
             return;
         }
         let was_awake = shown_face.get() != Face::Asleep;
