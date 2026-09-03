@@ -87,7 +87,23 @@
 # Safety cut, so continuous noise cannot buffer forever. Default 12000.
 # max_utterance_ms = 12000
 
-# Extra applications, added to the built-in list.
+# Extra applications, added to the vocabulary.
+#
+# The vocabulary itself — every application, command and site Minion knows
+# — lives in TOML files: the ones built into the app (macos.toml,
+# browsers.toml, office.toml, media.toml, dev.toml, apps.toml, sites.toml)
+# and then anything you drop in
+#
+#   ~/Library/Application Support/Minion/vocabulary/
+#
+# The [[apps]] and [[commands]] blocks below are read last, so they have
+# the final word: an entry here with the same `name` replaces the one that
+# came before it. For anything more than a couple of entries — a whole
+# group of commands, or something you want to share — write a vocabulary
+# file instead; the schema is documented at the top of
+# `vocabulary/macos.toml` and it can do things this file cannot, such as
+# commands that only exist inside one application (`bundles = [...]`) and
+# named sites (`[[sites]]`).
 #
 # Find a bundle id with:
 #   defaults read "/Applications/Whatever.app/Contents/Info" CFBundleIdentifier
@@ -115,7 +131,10 @@
 # phrase = "abre cromo"
 
 # Entirely new commands, bound to a keyboard shortcut. Keys are written as
-# on a menu: "cmd-shift-b", "ctrl+alt+left".
+# on a menu: "cmd-shift-b", "ctrl+alt+left". A command declared here
+# replaces a built-in one of the same `name`; a phrase claimed by two
+# different commands is reported in the log at startup, and the one read
+# last keeps it.
 
 # [[commands]]
 # name = "compilar"

@@ -117,9 +117,22 @@ was considered and rejected on that data.
   (without it "Chrome" lost its first consonant), segmenter. Emits
   `Utterance { samples, speech_start, speech_end }` so downstream code can
   isolate the speech from the preroll/silence around it.
-- `commands.rs` — vocabulary: `DEFAULT_WAKE_WORDS`, `APPS` (with aliases),
-  `COMMANDS`, `CONTEXTUAL_COMMANDS`, `NUMBERED`; `decide_in()` order:
-  dictation → mode/undo → contextual → COMMANDS → questions → numbered →
+- `vocabulary.rs` — the vocabulary is TOML, not Rust: one file per subject
+  in `minion/vocabulary/` (`macos`, `browsers`, `office`, `media`, `dev`,
+  `apps`, `sites`), embedded with `include_str!` so Minion works with
+  nothing else on disk, then every `*.toml` in
+  `~/Library/Application Support/Minion/vocabulary/`, then `config.toml` —
+  later wins, matched by `name`. A `[[commands]]` entry says what it does
+  with exactly one of `keys`, `action` (a **closed** list of named Rust
+  actions), `text` or `url`; `bundles = [...]` makes it contextual. No
+  scripts from a file on purpose: a pack may have been downloaded.
+  `local.example.toml` holds the three machine-specific apps (Orca, Teams,
+  ChatGPT) and is documented, not loaded. Not done: a community repo and an
+  «Actualizar vocabulario» menu item.
+- `commands.rs` — deciding, and everything that is a code path rather than
+  a table: `DEFAULT_WAKE_WORDS`, `NUMBERED`, `BROWSERS`, dictation, undo,
+  repeat, chain splitting, questions; `decide_in()` order:
+  dictation → mode/undo → contextual → global commands → questions → numbered →
   music → user aliases → websites → apps. Wake word is matched fuzzily
   (≤1 edit, 4 shared leading letters; 2 edits let "minuto" and "mínimo"
   through, so listed two-edit forms as explicit aliases instead) and a
