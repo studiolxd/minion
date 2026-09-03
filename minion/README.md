@@ -45,7 +45,15 @@ point and there is nowhere else to put it.
 «minion, ¿cuánto espacio queda?»   → «212.4 GB libres»
 «minion, ¿estoy conectado?»
 «minion, ¿qué día de la semana es el 12?»
+«minion, lee la última notificación»
+«minion, ¿qué ha llegado?»         → the last three, app, title and body
 ```
+
+**Notificaciones** — read out of the database Notification Center keeps,
+which sits behind **Acceso total al disco**. Without that permission
+Minion says so and offers to open the right pane of Ajustes rather than
+answering nothing; add Minion there once and the question works from
+then on.
 
 **Temporizadores y alarmas** — «pon un temporizador de cinco minutos»,
 «avísame en diez minutos», «pon una alarma a las ocho y media». Numbers as
@@ -508,12 +516,20 @@ Only «dictar» — never «escribe» — also opens a destination first:
 «minion, dicta un correo a Ana»         → Mail, a new message addressed to Ana
 «minion, dicta un mensaje a Ana»        → Messages, a new message to Ana
 «minion, dicta en el documento»         → dictates into whatever is already in front
+«minion, dicta en el campo de texto»    → puts the focus in a text field first
 ```
 
 *correo* and *mensaje* take a recipient — everything after "a" — and move
 the cursor into the body once the app is ready (Mail: subject, then body;
 Messages: the suggestion is accepted, then the body). *documento* opens
 nothing; it is for an app already in front with a cursor waiting.
+
+*campo* (also *aquí*) opens nothing either, and goes one step further: if
+what has the focus is not somewhere text can go, Minion looks through the
+front window for the first text field and puts the focus there before
+dictation starts. The log says what got it — `focus    AXTextField in
+Notas`. Best effort: an application that will not answer the
+Accessibility API leaves the focus exactly where it was.
 
 ### Dictado
 
@@ -612,6 +628,35 @@ the Web API and an OAuth token, which is a different project.
 
 A known command always wins over a title, so "pon la canción anterior"
 goes back one rather than searching for a song called "anterior".
+
+### Carpetas, archivos y ventanas por su nombre
+
+The commands above are fixed phrases. These take a name that only exists
+on this machine, so they are looked up rather than listed:
+
+```
+«minion, abre la carpeta Dev»           → Finder, on the best match
+«minion, ve a la carpeta Descargas»     → the standard folders answer outright
+«minion, abre el archivo informe septiembre»
+«minion, abre el documento presupuesto»
+«minion, ve a la ventana del correo»    → raises that window and switches to it
+«minion, cambia a la ventana de Marca»
+```
+
+Files and folders are found with Spotlight, scoped to your home folder,
+one search term per word — so «informe septiembre» reaches "Informe de
+septiembre 2026.pdf". An exact name beats one that starts with what you
+said, which beats one that merely contains it; a folder wins when you
+said *carpeta*; and the copy nearer home wins a tie. Caches, `Library`,
+`node_modules` and the insides of application bundles are never answers.
+When two things of the same name sit equally deep, the nearer-to-hand one
+is opened *and named out loud* — «Abro Dev en Desarrollo» — so a wrong
+guess is obvious straight away. Nothing found: «No encuentro Dev».
+
+Windows are matched on their titles, then on the application's own name,
+through the Accessibility API — the frontmost application first, then
+everything else that is running. A title heard the way it sounds still
+reaches its window, the same phonetic path application names use.
 
 ## The log
 

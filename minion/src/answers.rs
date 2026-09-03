@@ -68,6 +68,20 @@ pub enum Question {
     CalendarTomorrow,
     /// "¿cuál es mi próxima reunión?"
     NextMeeting,
+    /// "lee la última notificación", "¿qué ha llegado?" — how many of
+    /// them to read back. See `notifications.rs`.
+    Notifications(usize),
+    /// "ve a la ventana de Marca" — the name of the window to be taken
+    /// to. Acts and then says where it went, the same way a reminder is
+    /// created and then read back: there is nothing to answer otherwise.
+    Window(String),
+    /// "abre la carpeta Dev" when more than one thing on the machine
+    /// answers to that name: the path of the best of them. Opened and
+    /// named out loud, since the choice cannot be put to the user from
+    /// here — see `targets::decide`.
+    OpenTarget(String),
+    /// Nothing on this machine answers to the name that was said.
+    NotFound(String),
 }
 
 /// Ways of asking each one.
@@ -91,6 +105,10 @@ const ASKED: &[(Question, &[&str])] = &[
     (Question::CalendarToday, &["que tengo hoy"]),
     (Question::CalendarTomorrow, &["que tengo manana"]),
     (Question::NextMeeting, &["cual es mi proxima reunion", "cual es mi siguiente reunion"]),
+    (Question::Notifications(1), &["lee la ultima notificacion", "cual es la ultima notificacion",
+                                  "lee la notificacion"]),
+    (Question::Notifications(3), &["que ha llegado", "que notificaciones tengo",
+                                   "lee las notificaciones", "que me he perdido"]),
     (Question::Help, &["que puedes hacer", "que te puedo decir", "ayuda",
                        "que ordenes hay", "que se decir"]),
 ];
@@ -121,6 +139,15 @@ fn parse_variable(rest: &str) -> Option<Question> {
     if rest.contains("recuerda") {
         if let Some((text, due, when)) = reminders::parse_reminder(rest, Local::now()) {
             return Some(Question::Reminder(text, due, when));
+        }
+    }
+    // "ve a la ventana de Marca": the window is named, not listed, so it
+    // is parsed the same way a duration is. Gated on the word itself, so
+    // every other sentence about a window — closing one, minimising one —
+    // reaches this file no differently than before.
+    if rest.contains("ventana") {
+        if let Some(question) = crate::targets::asked_about_a_window(rest) {
+            return Some(question);
         }
     }
     if rest.contains("evento") {
@@ -236,6 +263,10 @@ pub fn answer(question: Question, listening: bool) -> String {
         Question::CalendarTomorrow => {
             calendar_answer(reminders::events_tomorrow(Local::now()), "No tienes nada mañana.")
         }
+        Question::Notifications(count) => crate::notifications::spoken(count),
+        Question::Window(name) => crate::targets::go_to_window(&name),
+        Question::OpenTarget(path) => crate::targets::open_target(&path),
+        Question::NotFound(name) => format!("No encuentro {name}."),
         Question::NextMeeting => match reminders::next_meeting(Local::now()) {
             Ok(Some((when, title))) => format!("Tu próxima reunión es a {}, {title}.", spoken_clock(when.time())),
             Ok(None) => "No tienes ninguna reunión próxima.".into(),
