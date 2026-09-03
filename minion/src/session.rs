@@ -11,6 +11,8 @@
 //! branch that changes the state is here; everything that touches the
 //! outside world is there.
 
+use std::time::{Duration, Instant};
+
 use crate::answers;
 use crate::commands::{self, Decision};
 
@@ -62,11 +64,76 @@ pub struct Session {
     undoable: Option<Undoable>,
     /// What "otra vez" refers to.
     last_command: Option<Decision>,
+    /// When the conversation window opened, kept only to log how long ago.
+    window_opened_at: Option<Instant>,
+    /// When it closes. `None` means it is not open.
+    window_deadline: Option<Instant>,
+}
+
+/// What to run a decision through, once the conversation window has had a
+/// say in it.
+pub struct Resolved {
+    pub decision: Decision,
+    pub confidence: f32,
+    /// Set when the wake word was missing but the window was open and the
+    /// prefixed phrase made sense: seconds since the window opened.
+    pub window_after: Option<f32>,
 }
 
 impl Session {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Whether the conversation window is open right now.
+    pub fn window_open(&self, now: Instant) -> bool {
+        self.window_deadline.is_some_and(|deadline| now < deadline)
+    }
+
+    /// Opens (or extends) the window, following a command that actually ran
+    /// or a question that was answered. Zero duration is a no-op, so a
+    /// caller configured with `conversation_seconds = 0` never opens one.
+    pub fn open_window(&mut self, now: Instant, duration: Duration) {
+        if duration.is_zero() {
+            return;
+        }
+        self.window_opened_at = Some(now);
+        self.window_deadline = Some(now + duration);
+    }
+
+    /// Closes the window early, before its time is up.
+    pub fn close_window(&mut self) {
+        self.window_opened_at = None;
+        self.window_deadline = None;
+    }
+
+    /// Decides what a heard phrase means, consulting the conversation
+    /// window when it was not addressed to Minion outright.
+    ///
+    /// While dictating everything is text regardless, so the window is left
+    /// alone: it is only ever consulted for the wake word itself.
+    ///
+    /// A phrase that still makes no sense once the wake word is assumed
+    /// closes the window — the "conversation" was over, whether or not the
+    /// caller had anything more to say to it.
+    pub fn resolve(&mut self, part: &str, now: Instant, context: Option<&str>) -> Resolved {
+        let (decision, confidence) = commands::decide_in(part, context);
+        if self.dictating || decision != Decision::Ignored || !self.window_open(now) {
+            return Resolved { decision, confidence, window_after: None };
+        }
+
+        let wake = commands::wake_words().first().copied().unwrap_or("minion");
+        let prefixed = format!("{wake} {part}");
+        let (retried, retried_confidence) = commands::decide_in(&prefixed, context);
+        if matches!(retried, Decision::Ignored | Decision::Unrecognised) {
+            self.close_window();
+            return Resolved { decision, confidence, window_after: None };
+        }
+
+        let after = self
+            .window_opened_at
+            .map(|opened| now.saturating_duration_since(opened).as_secs_f32());
+        Resolved { decision: retried, confidence: retried_confidence, window_after: after }
     }
 
     /// Decides what one part of an utterance means, and remembers it.
@@ -372,6 +439,83 @@ mod tests {
             say(&mut session, "minion otra vez"),
             vec![Outcome::Perform { decision: chrome, repeats: 1 }]
         );
+    }
+
+    #[test]
+    fn a_command_opens_the_window_and_the_next_utterance_needs_no_wake_word() {
+        let mut session = Session::new();
+        let now = Instant::now();
+        session.open_window(now, Duration::from_secs(5));
+
+        let resolved = session.resolve("abre Chrome", now + Duration::from_millis(500), None);
+        assert!(!matches!(resolved.decision, Decision::Ignored | Decision::Unrecognised));
+        assert_eq!(resolved.window_after, Some(0.5));
+    }
+
+    #[test]
+    fn a_phrase_that_already_starts_with_the_wake_word_is_unaffected_by_the_window() {
+        let mut session = Session::new();
+        let now = Instant::now();
+        session.open_window(now, Duration::from_secs(5));
+
+        let resolved = session.resolve("minion abre Chrome", now, None);
+        assert_eq!(resolved.window_after, None, "the wake word was already there");
+    }
+
+    #[test]
+    fn the_window_closes_after_its_time_is_up() {
+        let mut session = Session::new();
+        let now = Instant::now();
+        session.open_window(now, Duration::from_secs(5));
+
+        let later = now + Duration::from_secs(6);
+        assert!(!session.window_open(later));
+        let resolved = session.resolve("abre Chrome", later, None);
+        assert_eq!(resolved.decision, Decision::Ignored, "the window had already closed");
+    }
+
+    #[test]
+    fn a_zero_second_window_never_opens() {
+        let mut session = Session::new();
+        let now = Instant::now();
+        session.open_window(now, Duration::ZERO);
+        assert!(!session.window_open(now));
+    }
+
+    #[test]
+    fn an_utterance_that_still_makes_no_sense_closes_the_window() {
+        let mut session = Session::new();
+        let now = Instant::now();
+        session.open_window(now, Duration::from_secs(5));
+
+        let resolved = session.resolve("so fuddy", now, None);
+        assert_eq!(resolved.decision, Decision::Ignored);
+        assert_eq!(resolved.window_after, None);
+        assert!(!session.window_open(now), "an unrecognised phrase closes it");
+    }
+
+    #[test]
+    fn a_refused_command_is_never_the_caller_s_reason_to_open_the_window() {
+        // The window only opens when the caller — main.rs, once a command
+        // has actually run — calls `open_window`. A refused command simply
+        // never calls it, so nothing here needs to model "refused" at all:
+        // the window stays exactly as closed as it started.
+        let session = Session::new();
+        assert!(!session.window_open(Instant::now()));
+    }
+
+    #[test]
+    fn dictating_leaves_the_window_alone() {
+        let mut session = Session::new();
+        let now = Instant::now();
+        session.open_window(now, Duration::from_secs(5));
+        say(&mut session, "minion empieza a dictar");
+
+        // Even with the window open, dictation never consults it: whatever
+        // is heard is typed, wake word or not.
+        let resolved = session.resolve("abre Chrome", now, None);
+        assert_eq!(resolved.window_after, None);
+        assert!(session.window_open(now), "dictating must not have closed it either");
     }
 
     #[test]

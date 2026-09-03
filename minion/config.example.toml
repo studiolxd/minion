@@ -64,6 +64,11 @@
 # Words per minute, clamped between 120 and 320. Default 190.
 # speech_rate = 190
 
+# Seconds after a command runs (or a question is answered) during which
+# the next thing you say is obeyed without saying "minion" again. Zero
+# disables the window, so every sentence needs the wake word. Default 5.
+# conversation_seconds = 5
+
 # Keyboard shortcut that pauses and resumes from anywhere, written as it
 # appears on the menu: "ctrl-alt-m", "ctrl+shift+m". Empty disables it.
 # Default "ctrl-alt-m". (Not "alt-space": that collides with the remaps

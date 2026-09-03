@@ -320,6 +320,12 @@ struct Listening {
     log_ignored_speech: Arc<AtomicBool>,
     play_sounds: Arc<AtomicBool>,
     idle_unload: Option<Duration>,
+    /// How long the conversation window stays open after a command or an
+    /// answer. Zero disables it.
+    conversation_window: Duration,
+    /// Set while the conversation window is open, so the menu bar can show
+    /// the attentive face.
+    window_open: Arc<AtomicBool>,
     voice: Option<Voice>,
     training: Training,
     active: Arc<AtomicBool>,
@@ -358,6 +364,8 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
         log_ignored_speech,
         play_sounds,
         idle_unload,
+        conversation_window,
+        window_open,
         mut voice,
         training,
         active,
@@ -412,6 +420,10 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
         let utterance = match listener.utterances.recv_timeout(IDLE_CHECK) {
             Ok(utterance) => utterance,
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                // The window has no timer of its own — it just stops being
+                // open once `Instant::now()` passes its deadline — so this
+                // is where that becomes visible to the menu bar.
+                window_open.store(session.window_open(Instant::now()), Ordering::Relaxed);
                 // Someone has started talking. If the model was released
                 // while idle, load it now: the sentence and the silence
                 // that closes it take longer than the load, so this hides
@@ -584,9 +596,15 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
             // and it is read per instruction: the first of a chain may well
             // have changed which application that is.
             let context = actions::frontmost_app();
-            let (decision, confidence) = commands::decide_in(&part, context.as_deref());
+            let now = Instant::now();
+            let resolved = session.resolve(&part, now, context.as_deref());
+            if let Some(after) = resolved.window_after {
+                note!("window   «{part}»  (no wake word, {after:.1} s after the last command)");
+            }
+            window_open.store(session.window_open(now), Ordering::Relaxed);
+            let confidence = resolved.confidence;
 
-            match session.interpret(&part, decision, context.as_deref()) {
+            match session.interpret(&part, resolved.decision, context.as_deref()) {
                 Outcome::EnterDictation => {
                     note!("dictation started — say «deja de dictar» to stop");
                     dictating.store(true, Ordering::Relaxed);
@@ -635,6 +653,8 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                         }
                         None => actions::show_message(&reply),
                     }
+                    session.open_window(now, conversation_window);
+                    window_open.store(session.window_open(now), Ordering::Relaxed);
                 }
                 Outcome::Undo(taken) => match taken {
                     Some(Undoable::Typed(length)) => {
@@ -675,7 +695,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                     note!("unknown  «{part}»  ->  nothing to repeat yet");
                 }
                 Outcome::Perform { decision, repeats } => {
-                    let refused = report(
+                    let ran = report(
                         &part,
                         &decision,
                         confidence,
@@ -689,9 +709,16 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                             status: &status,
                         },
                     );
-                    if refused {
-                        // Nothing happened, so there is nothing to undo.
-                        session.forget_undo();
+                    match ran {
+                        Ran::Blocked => {
+                            // Nothing happened, so there is nothing to undo.
+                            session.forget_undo();
+                        }
+                        Ran::Yes => {
+                            session.open_window(now, conversation_window);
+                            window_open.store(session.window_open(now), Ordering::Relaxed);
+                        }
+                        Ran::Nothing => {}
                     }
 
                     if commands::is_sleep(&decision) {
@@ -720,6 +747,21 @@ struct Reporting<'a> {
     status: &'a Status,
 }
 
+/// What actually happened to a decision, once it was carried out.
+///
+/// A plain `bool` used to say only whether it was refused; the conversation
+/// window needs the third case too, since neither "not addressed to me" nor
+/// "not understood" is a command that ran and is worth extending it for.
+#[derive(PartialEq, Eq)]
+enum Ran {
+    /// `Ignored` or `Unrecognised`: nothing was carried out.
+    Nothing,
+    /// Understood and carried out.
+    Yes,
+    /// Understood, but macOS refused it.
+    Blocked,
+}
+
 /// Carries out a decision and writes down what happened.
 fn report(
     transcript: &str,
@@ -727,9 +769,9 @@ fn report(
     confidence: f32,
     repeats: usize,
     at: &Reporting,
-) -> bool {
+) -> Ran {
     let seconds = at.seconds;
-    let mut refused = false;
+    let mut ran = Ran::Nothing;
     match decision {
         Decision::Ignored => {
             // Speech that was not for us. The wording is only written
@@ -754,7 +796,7 @@ fn report(
                 outcome = commands::perform(decision);
             }
             if let Some(done) = outcome {
-                refused = done.outcome.is_err();
+                ran = if done.outcome.is_err() { Ran::Blocked } else { Ran::Yes };
                 if let Err(reason) = &done.outcome {
                     // Understood perfectly and refused by the system.
                     // Almost always the Accessibility permission.
@@ -792,7 +834,7 @@ fn report(
             }
         }
     }
-    refused
+    ran
 }
 
 /// Builds the menu bar item and hands control to AppKit. Never returns.
@@ -812,6 +854,9 @@ enum Face {
     Thinking,
     /// While `speech::say` is talking back.
     Speaking,
+    /// The conversation window is open: the next utterance needs no wake
+    /// word. Reuses the "acting" drawing — attentive rather than idle.
+    Listening,
     /// The blink after a command; never the resting state.
     Acting,
 }
@@ -829,6 +874,8 @@ struct Bar {
     thinking: Arc<AtomicBool>,
     /// Set while speaking a reply aloud: a different face.
     speaking: Arc<AtomicBool>,
+    /// Set while the conversation window is open: a different face.
+    window_open: Arc<AtomicBool>,
 }
 
 fn run_menu_bar(
@@ -841,7 +888,7 @@ fn run_menu_bar(
     // Raised when someone asks aloud what they can say.
     catalogue_asked: Arc<AtomicBool>,
 ) -> Result<()> {
-    let Bar { model_path, downloading, status, dictating, thinking, speaking } = bar;
+    let Bar { model_path, downloading, status, dictating, thinking, speaking, window_open } = bar;
     let mtm = MainThreadMarker::new()
         .ok_or_else(|| anyhow!("the menu bar must be built on the main thread"))?;
     let app = NSApplication::sharedApplication(mtm);
@@ -965,6 +1012,7 @@ fn run_menu_bar(
     let dictating_for_timer = Arc::clone(&dictating);
     let thinking_for_timer = Arc::clone(&thinking);
     let speaking_for_timer = Arc::clone(&speaking);
+    let window_open_for_timer = Arc::clone(&window_open);
     let shown_tooltip = std::cell::RefCell::new(opening_tooltip);
     let status_for_timer = Arc::clone(&status);
     let downloading_for_timer = Arc::clone(&downloading);
@@ -1141,12 +1189,14 @@ fn run_menu_bar(
             speaking_for_timer.load(Ordering::Relaxed),
             thinking_for_timer.load(Ordering::Relaxed),
             dictating_for_timer.load(Ordering::Relaxed),
+            window_open_for_timer.load(Ordering::Relaxed),
         ) {
-            (false, _, _, _) => Face::Asleep,
-            (true, true, _, _) => Face::Speaking,
-            (true, false, true, _) => Face::Thinking,
-            (true, false, false, true) => Face::Dictating,
-            (true, false, false, false) => Face::Awake,
+            (false, _, _, _, _) => Face::Asleep,
+            (true, true, _, _, _) => Face::Speaking,
+            (true, false, true, _, _) => Face::Thinking,
+            (true, false, false, true, _) => Face::Dictating,
+            (true, false, false, false, true) => Face::Listening,
+            (true, false, false, false, false) => Face::Awake,
         };
         if wanted == shown_face.get() {
             return;
@@ -1167,6 +1217,7 @@ fn run_menu_bar(
             Face::Dictating => icon::dictating(),
             Face::Thinking => icon::thinking(),
             Face::Speaking => icon::speaking(),
+            Face::Listening => icon::acting(),
         };
         if let Ok(face) = face {
             let _ = tray_for_timer.set_icon_with_as_template(Some(face), true);
@@ -1622,6 +1673,9 @@ fn main() -> Result<()> {
     let worker_thinking = Arc::clone(&thinking);
     let speaking = Arc::new(AtomicBool::new(false));
     let worker_speaking = Arc::clone(&speaking);
+    let window_open = Arc::new(AtomicBool::new(false));
+    let worker_window_open = Arc::clone(&window_open);
+    let conversation_window = config.conversation_window();
 
     let worker_active = Arc::clone(&active);
     let worker_log_ignored = Arc::clone(&log_ignored);
@@ -1645,6 +1699,7 @@ fn main() -> Result<()> {
         dictating: Arc::clone(&dictating),
         thinking: Arc::clone(&thinking),
         speaking: Arc::clone(&speaking),
+        window_open: Arc::clone(&window_open),
     };
     std::thread::spawn(move || {
         // First run: 670 MB before anything can be heard. Reported through
@@ -1679,6 +1734,8 @@ fn main() -> Result<()> {
             dictating: worker_dictating,
             thinking: worker_thinking,
             speaking: worker_speaking,
+            conversation_window,
+            window_open: worker_window_open,
             voice_reply,
             microphone,
             show_catalogue: worker_catalogue,

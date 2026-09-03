@@ -14,6 +14,9 @@ use serde::Deserialize;
 /// Idle minutes before the model is released, when the file says nothing.
 const DEFAULT_UNLOAD_MINUTES: u64 = 5;
 
+/// Seconds the conversation window stays open when the file says nothing.
+const DEFAULT_CONVERSATION_SECONDS: u64 = 5;
+
 /// Shortcut that pauses and resumes when nothing is set.
 pub const DEFAULT_RESUME_SHORTCUT: &str = "ctrl-alt-m";
 
@@ -134,6 +137,13 @@ pub struct Config {
     /// Entirely new commands, bound to a keyboard shortcut.
     #[serde(default)]
     pub commands: Vec<CommandConfig>,
+
+    /// Seconds after a command (or an answer) during which the next
+    /// utterance is obeyed without the wake word.
+    ///
+    /// `None` means the default of 5; zero disables the window entirely,
+    /// for someone who would rather every sentence start with «minion».
+    pub conversation_seconds: Option<u64>,
 }
 
 /// A command of your own: what to say, and which keys to press.
@@ -196,6 +206,7 @@ impl Default for Config {
             voice: None,
             speech_rate: None,
             unload_after_minutes: None,
+            conversation_seconds: None,
         }
     }
 }
@@ -486,6 +497,12 @@ impl Config {
             0 => None,
             minutes => Some(Duration::from_secs(minutes * 60)),
         }
+    }
+
+    /// How long the conversation window stays open after a command or an
+    /// answer. `None` (zero seconds configured) disables it.
+    pub fn conversation_window(&self) -> Duration {
+        Duration::from_secs(self.conversation_seconds.unwrap_or(DEFAULT_CONVERSATION_SECONDS))
     }
 
     /// Commands defined in the file, as `'static` entries.
