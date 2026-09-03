@@ -37,6 +37,7 @@ mod speaker;
 mod system;
 mod text;
 mod vocabulary;
+mod vocabulary_editor;
 mod timers;
 
 use std::cell::Cell;
@@ -1469,6 +1470,7 @@ fn run_menu_bar(
     let update_packs = MenuItem::new("Actualizar vocabulario…", true, None);
     let commands_item = MenuItem::new("Ayuda", true, None);
     let preferences = MenuItem::new("Ajustes…", true, None);
+    let vocabulary_item = MenuItem::new("Vocabulario…", true, None);
 
     // The two things you do with the log, together. Kept in scope for the
     // life of the menu, like every other item.
@@ -1511,6 +1513,7 @@ fn run_menu_bar(
     menu.append(&history_menu)?;
     menu.append(&log_menu)?;
     menu.append(&preferences)?;
+    menu.append(&vocabulary_item)?;
     menu.append(&PredefinedMenuItem::separator())?;
     // Help sits with Quit rather than among the working items: it is where
     // you look when you do not know what to do, not part of the routine.
@@ -1522,6 +1525,7 @@ fn run_menu_bar(
     let toggle_id = toggle.id().clone();
     let learn_id = learn.id().clone();
     let preferences_id = preferences.id().clone();
+    let vocabulary_id = vocabulary_item.id().clone();
     let commands_id = commands_item.id().clone();
     let show_log_id = show_log.id().clone();
     let stats_id = stats_item.id().clone();
@@ -1532,6 +1536,7 @@ fn run_menu_bar(
     // Built once and reused: reopening should bring back the same window,
     // not stack another one behind it.
     let panel = Rc::new(preferences::Preferences::new(mtm));
+    let vocabulary_editor = vocabulary_editor::VocabularyEditor::new(mtm);
 
     // The "what did it hear" HUD — see hud.rs. Starts pinned exactly as
     // the settings window already read `show_hud` at construction.
@@ -1575,6 +1580,7 @@ fn run_menu_bar(
     });
     // Requests from the menu thread, which must not touch AppKit itself.
     let open_requested = Arc::new(AtomicBool::new(false));
+    let open_vocabulary_requested = Arc::new(AtomicBool::new(false));
     let learn_requested = Arc::new(AtomicBool::new(false));
     let catalogue_requested = Arc::new(AtomicBool::new(false));
     let stats_requested = Arc::new(AtomicBool::new(false));
@@ -1634,8 +1640,10 @@ fn run_menu_bar(
     let acted_for_timer = Arc::clone(&acted);
     let blink_until: Cell<Option<std::time::Instant>> = Cell::new(None);
     let panel_for_timer = Rc::clone(&panel);
+    let vocabulary_editor_for_timer = Rc::clone(&vocabulary_editor);
     let hud_for_timer = Rc::clone(&hud);
     let open_for_timer = Arc::clone(&open_requested);
+    let open_vocabulary_for_timer = Arc::clone(&open_vocabulary_requested);
     let learn_for_timer = Arc::clone(&learn_requested);
     let training_for_timer = Arc::clone(&training);
     let catalogue_for_timer = Arc::clone(&catalogue_requested);
@@ -1742,7 +1750,9 @@ fn run_menu_bar(
         // still repaints promptly.
         let throttle_tick = throttle_ticks.get().wrapping_add(1);
         throttle_ticks.set(throttle_tick);
-        let watched = panel_for_timer.is_visible() || blink_until.get().is_some();
+        let watched = panel_for_timer.is_visible()
+            || vocabulary_editor_for_timer.is_visible()
+            || blink_until.get().is_some();
         if !watched && !on_schedule(throttle_tick, UI_THROTTLE_TICKS) {
             return;
         }
@@ -1772,6 +1782,9 @@ fn run_menu_bar(
 
         if open_for_timer.swap(false, Ordering::Relaxed) {
             panel_for_timer.show();
+        }
+        if open_vocabulary_for_timer.swap(false, Ordering::Relaxed) {
+            vocabulary_editor_for_timer.show();
         }
         // Leaving, by restart or quit: let the settings window save what
         // it still holds (a wake word typed but not yet committed) first.
@@ -1958,6 +1971,13 @@ fn run_menu_bar(
             // Picked up on the next tick, after the window has saved.
             restart_for_timer.store(true, Ordering::Relaxed);
         }
+        if panel_for_timer.take_edit_vocabulary_request() {
+            vocabulary_editor_for_timer.show();
+        }
+        vocabulary_editor_for_timer.poll();
+        if vocabulary_editor_for_timer.take_restart_request() {
+            restart_for_timer.store(true, Ordering::Relaxed);
+        }
 
         // A command just ran: acknowledge it for a moment. Silent, which
         // matters once the sounds are turned off.
@@ -2076,6 +2096,7 @@ fn run_menu_bar(
     // serviced from another thread while AppKit owns the main one. The icon
     // and the item's text are repainted by the timer above, not from here.
     let open_from_menu = Arc::clone(&open_requested);
+    let open_vocabulary_from_menu = Arc::clone(&open_vocabulary_requested);
     let learn_from_menu = Arc::clone(&learn_requested);
     let restart_from_menu = Arc::clone(&restart_requested);
     let quit_from_menu = Arc::clone(&quit_requested);
@@ -2101,6 +2122,8 @@ fn run_menu_bar(
             } else if event.id == preferences_id {
                 // Windows belong to the main thread; the timer opens it.
                 open_from_menu.store(true, Ordering::Relaxed);
+            } else if event.id == vocabulary_id {
+                open_vocabulary_from_menu.store(true, Ordering::Relaxed);
             } else if event.id == stats_id {
                 stats_from_menu.store(true, Ordering::Relaxed);
             } else if event.id == show_log_id {

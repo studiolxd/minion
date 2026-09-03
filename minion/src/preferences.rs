@@ -65,7 +65,7 @@ impl Dial {
 /// necessary: a hint too close to the next control, a section heading too
 /// far from its first item, and no way to fix one without checking all the
 /// others.
-mod spacing {
+pub(crate) mod spacing {
     /// Margin at the edges of the window.
     pub const EDGE: f64 = 22.0;
     /// From the top of the canvas to the first thing on it.
@@ -99,7 +99,7 @@ mod spacing {
 /// Nothing outside this struct decides how far apart two things go, and
 /// the canvas grows to whatever the contents need instead of being a
 /// constant that has to be corrected every time something is added.
-struct Layout {
+pub(crate) struct Layout {
     mtm: MainThreadMarker,
     canvas: Retained<NSView>,
     width: f64,
@@ -113,7 +113,7 @@ struct Layout {
 }
 
 impl Layout {
-    fn new(mtm: MainThreadMarker, width: f64) -> Self {
+    pub(crate) fn new(mtm: MainThreadMarker, width: f64) -> Self {
         Self {
             mtm,
             canvas: NSView::new(mtm),
@@ -124,7 +124,7 @@ impl Layout {
         }
     }
 
-    fn content_width(&self) -> f64 {
+    pub(crate) fn content_width(&self) -> f64 {
         self.width - spacing::EDGE * 2.0
     }
 
@@ -132,7 +132,7 @@ impl Layout {
     ///
     /// Positions are measured downwards while laying out and flipped at the
     /// end, so adding something never moves what came before it.
-    fn place(&mut self, height: f64, indent: f64) -> NSRect {
+    pub(crate) fn place(&mut self, height: f64, indent: f64) -> NSRect {
         let frame = NSRect::new(
             NSPoint::new(spacing::EDGE + indent, -(self.used + height)),
             NSSize::new(self.content_width() - indent, height),
@@ -141,11 +141,11 @@ impl Layout {
         frame
     }
 
-    fn gap(&mut self, amount: f64) {
+    pub(crate) fn gap(&mut self, amount: f64) {
         self.used += amount;
     }
 
-    fn add(&self, view: &NSView) {
+    pub(crate) fn add(&self, view: &NSView) {
         self.canvas.addSubview(view);
     }
 
@@ -154,7 +154,7 @@ impl Layout {
     /// Every control carries the same words as its visible label: a
     /// checkbox announced as "checkbox" and nothing else is unusable, and
     /// a slider with a label beside it has no idea the label is there.
-    fn add_control(&mut self, view: &NSView, name: &str) {
+    pub(crate) fn add_control(&mut self, view: &NSView, name: &str) {
         self.add(view);
         view.setAccessibilityLabel(Some(&NSString::from_str(name)));
         self.last_control = Some(Retained::from(view));
@@ -166,7 +166,7 @@ impl Layout {
     }
 
     /// A section heading.
-    fn heading(&mut self, text: &str) {
+    pub(crate) fn heading(&mut self, text: &str) {
         if self.used > spacing::TOP {
             self.gap(spacing::GROUP);
         }
@@ -177,7 +177,7 @@ impl Layout {
     }
 
     /// A label naming the control that follows it.
-    fn field_label(&mut self, text: &str) {
+    pub(crate) fn field_label(&mut self, text: &str) {
         let frame = self.place(spacing::LABEL, 0.0);
         let view = plain_label(self.mtm, text, frame);
         self.add(&view);
@@ -189,7 +189,7 @@ impl Layout {
     ///
     /// Its height follows the text, so a long one is not clipped — which is
     /// what a fixed height did to half of these.
-    fn hint(&mut self, text: &str, indent: f64) {
+    pub(crate) fn hint(&mut self, text: &str, indent: f64) {
         self.gap(spacing::BEFORE_HINT);
         let width = self.content_width() - indent;
         let blank = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, 0.0));
@@ -312,7 +312,7 @@ impl Layout {
     }
 
     /// Turns downward positions into the coordinates AppKit wants.
-    fn finish(self) -> (Retained<NSView>, f64) {
+    pub(crate) fn finish(self) -> (Retained<NSView>, f64) {
         let height = self.used + spacing::EDGE;
         self.canvas.setFrame(NSRect::new(
             NSPoint::new(0.0, 0.0),
@@ -334,12 +334,12 @@ impl Layout {
 /// Narrows a frame to a fixed width, keeping its position.
 ///
 /// For fields and buttons, which look wrong stretched across the window.
-fn narrow(frame: NSRect, width: f64) -> NSRect {
+pub(crate) fn narrow(frame: NSRect, width: f64) -> NSRect {
     NSRect::new(frame.origin, NSSize::new(width, frame.size.height))
 }
 
 /// A frame for a second control on the same row, after one `width` wide.
-fn beside(frame: NSRect, width: f64, own_width: f64) -> NSRect {
+pub(crate) fn beside(frame: NSRect, width: f64, own_width: f64) -> NSRect {
     NSRect::new(
         NSPoint::new(frame.origin.x + width + spacing::SIBLING, frame.origin.y),
         NSSize::new(own_width, frame.size.height),
@@ -483,18 +483,18 @@ impl Switch {
 /// AppKit only counts clicks for a button with a target, and this window
 /// deliberately has none — see the note at the top. A click shows up
 /// instead as a change in the button's state between two polls.
-struct Press {
+pub(crate) struct Press {
     control: Retained<NSButton>,
     last: Cell<isize>,
 }
 
 impl Press {
-    fn new(control: Retained<NSButton>) -> Self {
+    pub(crate) fn new(control: Retained<NSButton>) -> Self {
         let last = Cell::new(control.state());
         Self { control, last }
     }
 
-    fn clicked(&self) -> bool {
+    pub(crate) fn clicked(&self) -> bool {
         let now = self.control.state();
         now != self.last.replace(now) && now != 0
     }
@@ -550,6 +550,10 @@ pub struct Preferences {
     /// The button's state last time it was read, to notice a click without
     /// an Objective-C target — see the note at the top of this file.
     button_clicks: Cell<isize>,
+    /// Opens the vocabulary editor window — see `vocabulary_editor.rs`.
+    /// `main.rs` owns that window, so this only records the click.
+    edit_vocabulary: Press,
+    edit_vocabulary_requested: Cell<bool>,
 }
 
 /// A shortcut written the way macOS shows it: ⌥Space, ⇧⌘B.
@@ -586,11 +590,11 @@ fn pretty(shortcut: &str) -> String {
     out
 }
 
-fn small_label(mtm: MainThreadMarker, text: &str, frame: NSRect) -> Retained<NSTextField> {
+pub(crate) fn small_label(mtm: MainThreadMarker, text: &str, frame: NSRect) -> Retained<NSTextField> {
     label(mtm, text, frame, true)
 }
 
-fn plain_label(mtm: MainThreadMarker, text: &str, frame: NSRect) -> Retained<NSTextField> {
+pub(crate) fn plain_label(mtm: MainThreadMarker, text: &str, frame: NSRect) -> Retained<NSTextField> {
     label(mtm, text, frame, false)
 }
 
@@ -872,6 +876,24 @@ impl Preferences {
             settings.search_engine().as_deref().unwrap_or("google"),
         );
 
+        layout.heading("Vocabulario");
+        // Safety: no target and no action, so nothing is called back into.
+        let edit_vocabulary = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str("Editar vocabulario…"),
+                None,
+                None,
+                mtm,
+            )
+        };
+        edit_vocabulary.setFrame(narrow(layout.place(spacing::BUTTON, 0.0), 200.0));
+        layout.add_control(&edit_vocabulary, "Editar vocabulario…");
+        layout.hint(
+            "Añade tus propias aplicaciones, órdenes y alias, y olvida los \
+             que ya no quieras.",
+            0.0,
+        );
+
         layout.heading("Atajo para pausar y reanudar");
         let current_shortcut = settings
             .resume_shortcut()
@@ -1002,6 +1024,8 @@ impl Preferences {
             cancel_requested: Cell::new(false),
             restart_requested: Cell::new(false),
             forget: Press::new(forget),
+            edit_vocabulary: Press::new(edit_vocabulary),
+            edit_vocabulary_requested: Cell::new(false),
         };
         preferences.update_readouts();
         preferences
@@ -1237,6 +1261,9 @@ impl Preferences {
             self.forget_voice();
             changed = true;
         }
+        if self.edit_vocabulary.clicked() {
+            self.edit_vocabulary_requested.set(true);
+        }
 
         if self.clear_shortcut.clicked() {
             self.end_capture();
@@ -1264,6 +1291,14 @@ impl Preferences {
     /// Whether «Reiniciar ahora» was chosen since the last call.
     pub fn take_restart_request(&self) -> bool {
         self.restart_requested.replace(false)
+    }
+
+    /// Whether «Editar vocabulario…» was clicked since the last call.
+    ///
+    /// `main.rs` owns the vocabulary editor window, not this one — see the
+    /// note at `edit_vocabulary` — so this only hands the request over.
+    pub fn take_edit_vocabulary_request(&self) -> bool {
+        self.edit_vocabulary_requested.replace(false)
     }
 
     /// Whether the person just asked to train their voice.
@@ -1424,7 +1459,7 @@ impl Preferences {
 /// AppKit routes a key equivalent by looking for it in `mainMenu` first.
 /// The result was a text field that could not be pasted into. The items
 /// are the standard responder actions, so whatever has focus answers them.
-fn install_main_menu(mtm: MainThreadMarker) {
+pub(crate) fn install_main_menu(mtm: MainThreadMarker) {
     use objc2::sel;
     use objc2_app_kit::{NSMenu, NSMenuItem};
 
