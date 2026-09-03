@@ -152,6 +152,12 @@ enum UpdateResult {
 /// question is asked, kept well away from once a second.
 const UPDATE_CHECK_SECONDS: f64 = 300.0;
 
+/// How often the re-enrolment check looks at its own timestamp file — same
+/// idea as `UPDATE_CHECK_SECONDS`. The rule is once a day
+/// (`metrics::reenrolment_check_due`); this is only how often that
+/// question is asked.
+const REENROLMENT_CHECK_SECONDS: f64 = 900.0;
+
 /// Where to send someone whose microphone Minion cannot use.
 const MICROPHONE_SETTINGS: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone";
@@ -2427,6 +2433,9 @@ fn run_menu_bar(
     let update_ticks: Cell<u32> = Cell::new(0);
     let update_check_period =
         ticks_per_second(UI_REFRESH_SECONDS).saturating_mul(UPDATE_CHECK_SECONDS as u32);
+    let reenrolment_ticks: Cell<u32> = Cell::new(0);
+    let reenrolment_check_period =
+        ticks_per_second(UI_REFRESH_SECONDS).saturating_mul(REENROLMENT_CHECK_SECONDS as u32);
     // How many times the timer has fired since it started, kept apart from
     // the UI throttle's own counter so the two gates — "once a second" and
     // whatever the throttle needs — can be reasoned about, and changed,
@@ -2510,6 +2519,25 @@ fn run_menu_bar(
             updater::record_check();
             update_asked_for_timer.store(false, Ordering::Relaxed);
             update_check_for_timer.store(true, Ordering::Relaxed);
+        }
+
+        // Same shape as the update check above: the rule itself is a day
+        // (`metrics::reenrolment_check_due`), asked only every few
+        // minutes so a whole log is not re-parsed on every tick.
+        let reenrolment_tick = reenrolment_ticks.get().wrapping_add(1);
+        reenrolment_ticks.set(reenrolment_tick);
+        if on_schedule(reenrolment_tick, reenrolment_check_period)
+            && metrics::reenrolment_check_due()
+        {
+            let drift = metrics::current_drift();
+            if drift.should_suggest {
+                metrics::record_reenrolment_suggested();
+                notify::post(
+                    "Minion",
+                    "Tu voz está puntuando más bajo que cuando la registraste. \
+                     ¿Volver a entrenar?",
+                );
+            }
         }
 
         // The rest of this closure is the expensive part: reading every
