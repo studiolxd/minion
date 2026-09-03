@@ -366,6 +366,10 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                     note!("heard    {seconds:.1}s in another voice ({likeness:.2})");
                     continue;
                 }
+                // Logged on the way through as well: without both sides,
+                // there is no way to tell a threshold that is too high
+                // from a profile that is wrong.
+                note!("voice    matched at {likeness:.2}");
             }
         }
 

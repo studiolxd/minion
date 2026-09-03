@@ -20,7 +20,13 @@ use ort::value::TensorRef;
 use crate::fbank::{self, FilterBank, NUM_BINS};
 
 /// Utterances shorter than this carry too little voice to identify.
-const MIN_SAMPLES: usize = 16_000 / 2; // half a second
+///
+/// Half a second was tried and is not enough: short clips produced
+/// embeddings that scored near zero against their own speaker. Anything
+/// below this is let through unchecked rather than judged on too little
+/// evidence — a brief command from the wrong person is a smaller problem
+/// than refusing the right one.
+const MIN_SAMPLES: usize = 16_000 * 6 / 5; // 1.2 seconds
 
 /// A voice, as the model sees it: 192 numbers, unit length.
 pub type Embedding = Vec<f32>;
@@ -363,6 +369,119 @@ mod tests {
         }
     }
 
+    /// Compares real recordings against each other and against the stored
+    /// profile. A diagnostic, run only when recordings have been kept.
+    #[test]
+    fn inspect_real_recordings() {
+        let Some(home) = std::env::var("HOME").ok() else { return };
+        let directory = format!("{home}/Library/Application Support/Minion/recordings");
+        let Ok(entries) = std::fs::read_dir(&directory) else { return };
+        let Some(mut model) = model_if_present() else { return };
+
+        // Only the recordings the log ties to a command: the rest are
+        // whatever else was said nearby, and comparing those to each other
+        // says nothing about whether one speaker is recognised.
+        let mine: Vec<String> = std::fs::read_to_string(
+            crate::journal::path().unwrap_or_default(),
+        )
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| {
+            line.contains("  ran ") || line.contains("  asked ") || line.contains("  unknown ")
+        })
+        .filter_map(|line| line.split_whitespace().nth(1).map(|t| t.replace(':', "-")))
+        .collect();
+
+        let mut files: Vec<String> = entries
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path().to_string_lossy().into_owned())
+            .filter(|path| path.ends_with(".wav"))
+            .filter(|path| {
+                mine.iter().any(|stamp| path.contains(stamp.as_str()))
+            })
+            .collect();
+        files.sort();
+        if files.len() < 2 {
+            return;
+        }
+
+        let mut voices = Vec::new();
+        for file in &files {
+            let Some(samples) = read_wav(file) else { continue };
+            let seconds = samples.len() as f32 / 16_000.0;
+            match model.embed(&samples) {
+                Some(embedding) => voices.push((file.clone(), seconds, embedding)),
+                None => println!("  {file}: too short ({seconds:.1}s)"),
+            }
+        }
+        println!("  usable recordings: {}", voices.len());
+        if voices.len() < 2 {
+            return;
+        }
+
+        // How alike are two recordings of the same person?
+        let mut total = 0.0;
+        let mut pairs = 0;
+        let mut worst: f32 = 1.0;
+        for i in 0..voices.len() {
+            for j in (i + 1)..voices.len() {
+                let alike = similarity(&voices[i].2, &voices[j].2);
+                total += alike;
+                worst = worst.min(alike);
+                pairs += 1;
+            }
+        }
+        println!("  same speaker, average: {:.3}", total / pairs as f32);
+        println!("  same speaker, worst:   {worst:.3}");
+
+        // And against the profile that was rejecting them.
+        let stored = format!("{home}/Library/Application Support/Minion/voice.txt.roto");
+        if let Ok(contents) = std::fs::read_to_string(&stored) {
+            let profile: Vec<f32> = contents
+                .lines()
+                .last()
+                .unwrap_or("")
+                .split_whitespace()
+                .filter_map(|n| n.parse().ok())
+                .collect();
+            if profile.len() == 192 {
+                let scores: Vec<f32> = voices
+                    .iter()
+                    .map(|(_, _, embedding)| similarity(&profile, embedding))
+                    .collect();
+                let average = scores.iter().sum::<f32>() / scores.len() as f32;
+                let lowest = scores.iter().copied().fold(f32::MAX, f32::min);
+                println!("  against the saved profile: {average:.3} (worst {lowest:.3})");
+
+                // And the recordings that were not commands: other voices,
+                // the television, whatever was in the room. The gap
+                // between these and the ones above is the margin the
+                // threshold has to sit in.
+                let Ok(all) = std::fs::read_dir(&directory) else { return };
+                let mut others = Vec::new();
+                for entry in all.filter_map(|e| e.ok()) {
+                    let path = entry.path().to_string_lossy().into_owned();
+                    if !path.ends_with(".wav") || files.contains(&path) {
+                        continue;
+                    }
+                    if let Some(samples) = read_wav(&path) {
+                        if let Some(embedding) = model.embed(&samples) {
+                            others.push(similarity(&profile, &embedding));
+                        }
+                    }
+                }
+                if !others.is_empty() {
+                    let average = others.iter().sum::<f32>() / others.len() as f32;
+                    let highest = others.iter().copied().fold(f32::MIN, f32::max);
+                    println!(
+                        "  everything else:           {average:.3} (highest {highest:.3}, {} clips)",
+                        others.len()
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn the_model_produces_an_embedding() {
         let Some(mut model) = model_if_present() else {
@@ -433,6 +552,33 @@ mod tests {
         assert!(first.strip_prefix("# model ").is_none());
         let values: Vec<f32> = first.split_whitespace().filter_map(|n| n.parse().ok()).collect();
         assert_eq!(values.len(), 3);
+    }
+
+    #[test]
+    fn the_threshold_sits_below_real_speech() {
+        // Measured on this machine: the owner's own commands scored 0.38
+        // at worst through a laptop microphone. A threshold above that
+        // refuses its owner, which is what 0.45 did.
+        const WORST_MEASURED: f32 = 0.38;
+        let threshold = crate::config::Config::default().voice_threshold();
+        assert!(
+            threshold < WORST_MEASURED,
+            "the threshold ({threshold}) must sit below the worst real \
+             score ({WORST_MEASURED}) or it rejects its owner"
+        );
+    }
+
+    #[test]
+    fn short_clips_are_not_judged() {
+        // They produced embeddings scoring near zero against their own
+        // speaker, so letting them through unchecked is more honest than
+        // deciding on that little.
+        let Some(mut model) = model_if_present() else { return };
+        let brief = voiced(120.0, 1.0);
+        assert!(
+            model.embed(&brief).is_none(),
+            "a second of audio is not enough to identify anyone"
+        );
     }
 
     #[test]

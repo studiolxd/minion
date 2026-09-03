@@ -19,11 +19,16 @@ pub const DEFAULT_RESUME_SHORTCUT: &str = "alt-space";
 
 /// Cosine similarity a voice must reach to be treated as yours.
 ///
-/// ECAPA embeddings of the same person typically score well above this and
-/// different people well below, but rooms and microphones move both. It
-/// errs low: refusing to hear you is worse than hearing someone else say
-/// the wake word, which the vocabulary then has to accept anyway.
-const DEFAULT_VOICE_THRESHOLD: f32 = 0.45;
+/// Measured rather than guessed. Against a profile trained on this
+/// machine, the owner's own commands scored 0.57 on average and 0.38 at
+/// worst — through a laptop microphone across a desk, which is nothing
+/// like the clean audio every synthetic test used. The first value tried
+/// here was 0.45, and it refused its owner regularly.
+///
+/// It errs low on purpose. Someone else saying the wake word still has to
+/// say something in the vocabulary, and being unable to talk to your own
+/// computer is worse than that.
+const DEFAULT_VOICE_THRESHOLD: f32 = 0.32;
 
 use crate::audio;
 use crate::commands::App;
