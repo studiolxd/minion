@@ -3132,6 +3132,7 @@ fn main() -> Result<()> {
                  minion loopback [seg]       mide lo que el Mac está sonando\n  \
                  minion ai \"pregunta\"        la responde con la IA configurada\n  \
                  minion ai status            qué backend de IA hay y qué agentes\n  \
+                 minion ai models            lista los modelos del backend configurado\n  \
                  minion ai set-key <prov>    guarda una clave en el llavero (por\n  \
                  la entrada estándar)\n  \
                  minion stats [--days N]     informe de reconocimiento (todo el \
@@ -3258,6 +3259,24 @@ fn main() -> Result<()> {
                         std::process::exit(1);
                     }
                     println!("Clave guardada en el llavero para «{provider}».");
+                }
+                Some("models") => {
+                    let settings = ai::Settings::from_config(&config::load().ai);
+                    if !settings.enabled() {
+                        eprintln!("La IA no está configurada: falta «backend» en [ai].");
+                        std::process::exit(1);
+                    }
+                    match ai::list_models(&settings.backend) {
+                        Ok(models) => {
+                            for option in ai::model_popup_options(&settings.backend, &models) {
+                                println!("{}", option.label);
+                            }
+                        }
+                        Err(why) => {
+                            eprintln!("No se pudo listar los modelos: {why}");
+                            std::process::exit(1);
+                        }
+                    }
                 }
                 Some(text) => ai::run_from_terminal(text),
             }

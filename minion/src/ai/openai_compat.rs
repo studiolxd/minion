@@ -17,6 +17,31 @@ use serde::{Deserialize, Serialize};
 
 use super::{post_json, AiError, Backend, Message, HTTP_TIMEOUT};
 
+#[derive(Debug, Deserialize)]
+struct ModelsResponse {
+    #[serde(default)]
+    data: Vec<ModelEntry>,
+    #[serde(default)]
+    error: Option<ApiError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelEntry {
+    id: String,
+}
+
+/// Reads `GET {base_url}/models`'s `data[].id` — every provider here
+/// answers the same shape, whatever it actually offers by way of a
+/// friendlier name.
+pub fn parse_models_response(body: &str) -> Result<Vec<String>, AiError> {
+    let response: ModelsResponse =
+        serde_json::from_str(body).map_err(|e| AiError::Parse(format!("{e}: {body}")))?;
+    if let Some(error) = response.error {
+        return Err(AiError::Backend(error.message));
+    }
+    Ok(response.data.into_iter().map(|entry| entry.id).collect())
+}
+
 /// A provider that speaks Chat Completions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Preset {
@@ -356,5 +381,38 @@ mod tests {
     #[test]
     fn html_from_a_proxy_is_a_parse_error_not_a_panic() {
         assert!(matches!(parse_response("<html>502</html>"), Err(AiError::Parse(_))));
+    }
+
+    /// A real `/v1/models` answer, trimmed of the fields Minion does not
+    /// read.
+    const MODELS: &str = r#"{
+      "object": "list",
+      "data": [
+        {"id": "gpt-4o", "object": "model", "created": 1715367049, "owned_by": "system"},
+        {"id": "gpt-4o-mini", "object": "model", "created": 1721172741, "owned_by": "system"},
+        {"id": "o4-mini", "object": "model", "created": 1740000000, "owned_by": "system"}
+      ]
+    }"#;
+
+    #[test]
+    fn model_ids_are_read_from_the_list() {
+        assert_eq!(
+            parse_models_response(MODELS).unwrap(),
+            vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string(), "o4-mini".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_models_error_is_reported_with_its_message() {
+        let body = r#"{"error": {"message": "Incorrect API key provided", "type": "invalid_request_error"}}"#;
+        assert_eq!(
+            parse_models_response(body),
+            Err(AiError::Backend("Incorrect API key provided".into()))
+        );
+    }
+
+    #[test]
+    fn an_empty_models_list_is_not_an_error() {
+        assert_eq!(parse_models_response(r#"{"data":[]}"#).unwrap(), Vec::<String>::new());
     }
 }

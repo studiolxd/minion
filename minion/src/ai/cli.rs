@@ -93,6 +93,55 @@ pub const AGENTS: &[Agent] = &[
     Agent { backend: "gemini-cli", label: "Gemini CLI", program: "gemini" },
 ];
 
+/// The aliases `claude --model` accepts (`claude --help`), paired with
+/// what the popup calls them.
+pub const CLAUDE_CODE_MODELS: &[(&str, &str)] =
+    &[("opus", "Opus"), ("sonnet", "Sonnet"), ("haiku", "Haiku")];
+
+/// Gemini CLI's `-o json`/`--model` flag only takes these two.
+pub const GEMINI_MODELS: &[&str] = &["gemini-2.5-pro", "gemini-2.5-flash"];
+
+/// The `model` key of the user's own `~/.codex/config.toml`, read fresh
+/// each time.
+///
+/// Codex has no closed list of model ids — `codex --help` documents
+/// `-m/--model <MODEL>` as free text, and no subcommand enumerates what a
+/// ChatGPT plan actually allows (the module documentation above shows one
+/// getting refused at request time instead). So rather than guess a fixed
+/// list, the popup is offered exactly the one id this Mac's own config
+/// already names, labelled as such.
+pub fn codex_configured_model() -> Option<String> {
+    codex_configured_model_at(&codex_config_path()?)
+}
+
+fn codex_config_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(std::path::Path::new(&home).join(".codex/config.toml"))
+}
+
+/// Reads `model` out of a Codex config file at `path`. Split from
+/// [`codex_configured_model`] so a test can hand it a temp file instead of
+/// this machine's real `~/.codex/config.toml`.
+pub fn codex_configured_model_at(path: &std::path::Path) -> Option<String> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    codex_configured_model_from(&contents)
+}
+
+/// Parses the `model` key out of Codex config TOML. Pure, and public
+/// mainly so a fixture string can be checked without touching a file at
+/// all.
+pub fn codex_configured_model_from(contents: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Partial {
+        #[serde(default)]
+        model: String,
+    }
+    toml::from_str::<Partial>(contents)
+        .ok()
+        .map(|partial| partial.model)
+        .filter(|model| !model.is_empty())
+}
+
 /// Where these tools install themselves, for when `PATH` is no help.
 ///
 /// Minion is normally started by launchd, whose `PATH` is
@@ -906,6 +955,32 @@ mod tests {
     #[test]
     fn plain_text_from_gemini_is_taken_as_the_answer() {
         assert_eq!(parse_gemini_output("  OK  ").unwrap(), "OK");
+    }
+
+    #[test]
+    fn the_model_is_read_out_of_a_temp_codex_config() {
+        let path = std::env::temp_dir()
+            .join(format!("minion-codex-config-test-{}.toml", std::process::id()));
+        std::fs::write(&path, "model = \"gpt-5.6-sol\"\npersonality = \"pragmatic\"\n").unwrap();
+        assert_eq!(codex_configured_model_at(&path).as_deref(), Some("gpt-5.6-sol"));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_config_without_a_model_key_has_none() {
+        let path = std::env::temp_dir()
+            .join(format!("minion-codex-config-empty-test-{}.toml", std::process::id()));
+        std::fs::write(&path, "personality = \"pragmatic\"\n").unwrap();
+        assert_eq!(codex_configured_model_at(&path), None);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_missing_config_file_has_none() {
+        assert_eq!(
+            codex_configured_model_at(std::path::Path::new("/nonexistent/config.toml")),
+            None
+        );
     }
 
     #[test]
