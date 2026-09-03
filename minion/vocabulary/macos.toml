@@ -498,3 +498,10 @@ keys_after_recipient = ["enter"]
 name = "documento"
 trigger = ["documento"]
 # No bundle_id: dictates into whatever is already in front.
+
+[[destinations]]
+name = "teams"
+trigger = ["teams"]
+bundle_id = "com.microsoft.teams2"
+# "Go to compose box" on Microsoft's own shortcuts page for the Mac.
+keys_before_typing = ["cmd-r"]
