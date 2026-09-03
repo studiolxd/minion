@@ -105,6 +105,91 @@ const SEARCH_FRAMES: isize = 20;
 /// check.
 pub const DEFAULT_THRESHOLD: f32 = 0.6;
 
+/// Below this the output is quiet — roughly −46 dBFS, well under a spoken
+/// notification but well above the tap's own noise floor.
+pub const QUIET_RMS: f32 = 0.005;
+
+/// At or above this the output is loud enough to be a chime, a word, or
+/// music — not room tone bleeding into the tap.
+pub const LOUD_RMS: f32 = 0.02;
+
+/// How long the output must stay quiet before a return to loud counts as an
+/// onset, rather than the ordinary rise and fall inside one sound.
+const QUIET_HOLD: Duration = Duration::from_millis(300);
+
+/// Tells a notification chime apart from music playing through the Mac's own
+/// speakers: a chime is a quiet-to-loud *onset*, at the same instant a
+/// microphone utterance opens; music is steady loud output throughout.
+///
+/// Silero cannot make this distinction — a chime scores as speech as often
+/// as the owner's own voice does — but timing against the Mac's own output
+/// can, since only the microphone's utterance and the output's onset need to
+/// line up, not their content.
+struct OnsetTracker {
+    /// When the output became continuously quiet, if it has been for at
+    /// least [`QUIET_HOLD`]. `None` while loud, or not yet quiet long
+    /// enough for a later loud block to count as an onset.
+    quiet_since: Option<Instant>,
+    /// Whether the last block observed was loud, so a loud block right
+    /// after another loud block is not mistaken for a fresh onset.
+    was_loud: bool,
+    /// The instant of the most recent onset, if there has been one.
+    last_onset: Option<Instant>,
+}
+
+impl OnsetTracker {
+    fn new() -> Self {
+        Self { quiet_since: None, was_loud: false, last_onset: None }
+    }
+
+    /// Feeds one output block's loudness.
+    ///
+    /// A block between [`QUIET_RMS`] and [`LOUD_RMS`] is neither quiet nor
+    /// loud: it breaks a quiet streak in progress (a blip too soft to be an
+    /// onset should not let a shorter gap than [`QUIET_HOLD`] still count),
+    /// but is not loud enough to raise an onset on its own.
+    fn observe(&mut self, rms: f32, now: Instant) {
+        if rms < QUIET_RMS {
+            if self.quiet_since.is_none() {
+                self.quiet_since = Some(now);
+            }
+            self.was_loud = false;
+            return;
+        }
+
+        if rms >= LOUD_RMS {
+            let quiet_long_enough = self
+                .quiet_since
+                .is_some_and(|since| now.saturating_duration_since(since) >= QUIET_HOLD);
+            if quiet_long_enough && !self.was_loud {
+                self.last_onset = Some(now);
+            }
+            self.was_loud = true;
+        }
+        self.quiet_since = None;
+    }
+
+    /// Whether an onset happened within `window` of `now`.
+    fn onset_within(&self, window: Duration, now: Instant) -> bool {
+        self.last_onset
+            .is_some_and(|at| now.saturating_duration_since(at) <= window)
+    }
+}
+
+/// The tracker for whichever [`Loopback`] tap is currently running, or
+/// `None` when there is none — in which case [`output_onset_within`]
+/// answers `false` rather than blocking anything on a tap that is not there.
+static ONSET: Mutex<Option<OnsetTracker>> = Mutex::new(None);
+
+/// Whether the Mac's output had a quiet-to-loud onset within `window` of
+/// now — a chime, most likely, arriving at the same instant a microphone
+/// utterance opened. `false` when the tap is not running.
+pub fn output_onset_within(window: Duration) -> bool {
+    ONSET
+        .lock()
+        .is_ok_and(|tracker| tracker.as_ref().is_some_and(|t| t.onset_within(window, Instant::now())))
+}
+
 /// A live process tap on the system output, and the recent history it fills.
 ///
 /// Dropping it tears down the IOProc, the aggregate device and the tap, in
@@ -355,6 +440,13 @@ unsafe extern "C-unwind" fn io_proc(
     capture.ring.catch_up(now, resampled.len());
     let block: Vec<f32> = resampled.to_vec();
     capture.ring.write(&block);
+
+    let level = (block.iter().map(|s| s * s).sum::<f32>() / block.len().max(1) as f32).sqrt();
+    if let Ok(mut tracker) = ONSET.lock() {
+        if let Some(tracker) = tracker.as_mut() {
+            tracker.observe(level, now);
+        }
+    }
     0
 }
 
@@ -441,6 +533,10 @@ impl Loopback {
             return Err(status_error("AudioDeviceStart", status));
         }
 
+        if let Ok(mut tracker) = ONSET.lock() {
+            *tracker = Some(OnsetTracker::new());
+        }
+
         Ok(Self {
             tap,
             aggregate,
@@ -470,6 +566,9 @@ impl Loopback {
 
 impl Drop for Loopback {
     fn drop(&mut self) {
+        if let Ok(mut tracker) = ONSET.lock() {
+            *tracker = None;
+        }
         unsafe {
             AudioDeviceStop(self.aggregate, self.io_proc);
             AudioDeviceDestroyIOProcID(self.aggregate, self.io_proc);
@@ -583,7 +682,8 @@ pub fn probe(seconds: u64) -> Result<()> {
         let last_second = &recent[tail..];
         let level = (last_second.iter().map(|s| s * s).sum::<f32>() / last_second.len() as f32).sqrt();
         let peak = last_second.iter().fold(0.0_f32, |max, s| max.max(s.abs()));
-        println!("{second} s: RMS {level:.5}  pico {peak:.5}");
+        let onset = if output_onset_within(Duration::from_millis(400)) { "yes" } else { "no" };
+        println!("{second} s: RMS {level:.5}  pico {peak:.5}  onset: {onset}");
     }
     println!("Listo. Un RMS de 0.00000 con el sonido puesto significa que el grifo no recibe nada.");
     Ok(())
@@ -682,6 +782,79 @@ mod tests {
         // ago: within the 400 ms the search covers, so still found.
         let score = resemblance_in(&output, &heard, Duration::from_millis(2_250)).unwrap();
         assert!(score > 0.9, "a 250 ms error cost the match: {score}");
+    }
+
+    #[test]
+    fn silence_then_loud_is_an_onset() {
+        let mut tracker = OnsetTracker::new();
+        let start = Instant::now();
+        tracker.observe(0.0, start);
+        tracker.observe(0.0, start + Duration::from_millis(300));
+        tracker.observe(0.03, start + Duration::from_millis(320));
+        assert!(tracker.onset_within(Duration::from_millis(400), start + Duration::from_millis(320)));
+    }
+
+    #[test]
+    fn steady_loud_output_is_not_an_onset() {
+        let mut tracker = OnsetTracker::new();
+        let start = Instant::now();
+        for ms in (0..1_000).step_by(20) {
+            tracker.observe(0.05, start + Duration::from_millis(ms));
+        }
+        assert!(!tracker.onset_within(Duration::from_millis(400), start + Duration::from_millis(1_000)));
+    }
+
+    #[test]
+    fn steady_quiet_is_not_an_onset() {
+        let mut tracker = OnsetTracker::new();
+        let start = Instant::now();
+        for ms in (0..1_000).step_by(20) {
+            tracker.observe(0.0, start + Duration::from_millis(ms));
+        }
+        assert!(!tracker.onset_within(Duration::from_millis(400), start + Duration::from_millis(1_000)));
+    }
+
+    #[test]
+    fn a_quiet_gap_after_loud_output_is_an_onset_again() {
+        let mut tracker = OnsetTracker::new();
+        let start = Instant::now();
+        tracker.observe(0.05, start);
+        tracker.observe(0.0, start + Duration::from_millis(20));
+        tracker.observe(0.0, start + Duration::from_millis(320));
+        tracker.observe(0.05, start + Duration::from_millis(340));
+        assert!(tracker.onset_within(Duration::from_millis(400), start + Duration::from_millis(340)));
+    }
+
+    #[test]
+    fn a_short_blip_below_loud_does_not_shorten_the_quiet_hold() {
+        // A stretch that would otherwise satisfy the 300 ms quiet hold, but
+        // is interrupted partway by a blip that never reaches LOUD_RMS: the
+        // hold must restart, so the loud block right after is not an onset.
+        let mut tracker = OnsetTracker::new();
+        let start = Instant::now();
+        tracker.observe(0.0, start);
+        tracker.observe(0.0, start + Duration::from_millis(200));
+        tracker.observe(0.01, start + Duration::from_millis(220)); // blip, below LOUD_RMS
+        tracker.observe(0.03, start + Duration::from_millis(240));
+        assert!(
+            !tracker.onset_within(Duration::from_millis(400), start + Duration::from_millis(240)),
+            "the blip should have reset the quiet streak"
+        );
+    }
+
+    #[test]
+    fn an_onset_expires_outside_the_window() {
+        let mut tracker = OnsetTracker::new();
+        let start = Instant::now();
+        tracker.observe(0.0, start);
+        tracker.observe(0.0, start + Duration::from_millis(300));
+        tracker.observe(0.03, start + Duration::from_millis(320));
+        assert!(!tracker.onset_within(Duration::from_millis(400), start + Duration::from_millis(1_000)));
+    }
+
+    #[test]
+    fn no_running_tap_has_no_onset() {
+        assert!(!output_onset_within(Duration::from_millis(400)));
     }
 
     #[test]

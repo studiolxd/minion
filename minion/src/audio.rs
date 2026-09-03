@@ -503,11 +503,22 @@ struct Segmenter {
     /// over the threshold is what a click or a system chime produces; a
     /// voice produces them back to back.
     voice_streak: u8,
-    /// Blocks left of the window in which Silero may still veto an
-    /// utterance that energy opened. `None` once it has spoken up.
+    /// Blocks left of the window in which an utterance may still be
+    /// vetoed — by Silero disagreeing, or by [`Self::onset`] saying the Mac
+    /// just made a sound. `None` once it has closed.
     probation: Option<usize>,
-    /// Whether Silero has agreed that this utterance is speech.
+    /// Whether Silero has agreed that this utterance is speech. Starts
+    /// `true` when there is no Silero to ask, so energy alone still decides
+    /// exactly as it always did.
     approved: bool,
+    /// Whether the Mac's own output had a quiet-to-loud onset — a
+    /// notification chime, most likely — at the moment this utterance
+    /// opened or during its probation window. A latch: once true, stays
+    /// true for the rest of the utterance.
+    own_sound: bool,
+    /// Tells a real onset (a chime) apart from silence. Production reads
+    /// [`crate::loopback::output_onset_within`]; tests inject a closure.
+    onset: Box<dyn Fn() -> bool + Send>,
 }
 
 /// How long Silero gets to disagree with the energy gate.
@@ -525,7 +536,7 @@ const PROBATION_BLOCKS: usize = PROBATION_MS / BLOCK_MS;
 const VOICE_STREAK_BLOCKS: u8 = 2;
 
 impl Segmenter {
-    fn new(settings: Settings, voice: Option<Silero>) -> Self {
+    fn new(settings: Settings, voice: Option<Silero>, onset: Box<dyn Fn() -> bool + Send>) -> Self {
         Self {
             settings,
             current: Vec::new(),
@@ -542,6 +553,8 @@ impl Segmenter {
             approved: false,
             best_score: 0.0,
             voice_streak: 0,
+            own_sound: false,
+            onset,
         }
     }
 
@@ -597,9 +610,12 @@ impl Segmenter {
                 // Everything replaced above is room tone: the speech proper
                 // starts here.
                 self.speech_start = self.current.len();
-                // Silero now has 200 ms to say this was not a voice.
-                self.probation = self.voice.is_some().then_some(PROBATION_BLOCKS);
+                // 200 ms in which Silero may still say this was not a voice,
+                // and in which an output onset may veto it regardless of
+                // what Silero or energy alone would have said.
+                self.probation = Some(PROBATION_BLOCKS);
                 self.approved = self.voice.is_none();
+                self.own_sound = (self.onset)();
             }
             self.speaking = true;
             self.speech_blocks += 1;
@@ -623,37 +639,61 @@ impl Segmenter {
             }
         }
 
-        // Silero's veto: an utterance whose first 200 ms never scored as
-        // speech is the dishwasher, not an order. Dropped here rather
-        // than after the recogniser has been woken to transcribe it.
+        // Two vetoes share this 200 ms window: Silero saying an utterance
+        // whose first 200 ms never scored as speech is the dishwasher, not
+        // an order, and an output onset saying it is a notification chime
+        // rather than either. Both are dropped here rather than after the
+        // recogniser has been woken to transcribe them.
         if let Some(left) = self.probation {
-            let voiced = self.score.filter(|s| *s >= self.settings.vad_threshold);
-            self.voice_streak = if voiced.is_some() { self.voice_streak + 1 } else { 0 };
-            if let Some(score) = voiced.filter(|_| self.voice_streak >= VOICE_STREAK_BLOCKS) {
-                self.approved = true;
-                // Written down so the threshold can be tuned on what the
-                // room actually produces: a cough or a system sound that
-                // gets through shows up here with its score.
-                if !cfg!(test) {
-                    crate::journal::write(&format!(
-                        "vad      voice {score:.2} after {} ms",
-                        (PROBATION_BLOCKS.saturating_sub(left) + 1) * BLOCK_MS
-                    ));
-                }
+            if (self.onset)() {
+                self.own_sound = true;
             }
-            self.probation = match (self.approved, left - 1) {
-                (true, _) => None,
-                (false, 0) => {
+            let silero_active = self.voice.is_some();
+            if silero_active {
+                let voiced = self.score.filter(|s| *s >= self.settings.vad_threshold);
+                self.voice_streak = if voiced.is_some() { self.voice_streak + 1 } else { 0 };
+                if let Some(score) =
+                    voiced.filter(|_| self.voice_streak >= VOICE_STREAK_BLOCKS && !self.own_sound)
+                {
+                    self.approved = true;
+                    // Written down so the threshold can be tuned on what the
+                    // room actually produces: a cough or a system sound
+                    // that gets through shows up here with its score.
                     if !cfg!(test) {
                         crate::journal::write(&format!(
-                            "vad      not voice, best {:.2} — dropped",
-                            self.best_score
+                            "vad      voice {score:.2} after {} ms",
+                            (PROBATION_BLOCKS.saturating_sub(left) + 1) * BLOCK_MS
                         ));
                     }
-                    self.reset();
-                    return None;
                 }
-                (false, left) => Some(left),
+            }
+
+            let after = left - 1;
+            self.probation = if silero_active && self.approved && !self.own_sound {
+                None
+            } else if self.own_sound && after == 0 {
+                if !cfg!(test) {
+                    crate::journal::write(
+                        "vad      not voice — the Mac just made a sound (output onset)",
+                    );
+                }
+                self.reset();
+                return None;
+            } else if silero_active && !self.approved && after == 0 {
+                if !cfg!(test) {
+                    crate::journal::write(&format!(
+                        "vad      not voice, best {:.2} — dropped",
+                        self.best_score
+                    ));
+                }
+                self.reset();
+                return None;
+            } else if !silero_active && after == 0 {
+                // Energy alone already approved this at open; the window
+                // ran its course with no onset, so there is nothing to say.
+                None
+            } else {
+                Some(after)
             };
         }
 
@@ -693,6 +733,7 @@ impl Segmenter {
         self.voice_streak = 0;
         self.best_score = 0.0;
         self.score = None;
+        self.own_sound = false;
         // The next utterance is not a continuation of this one.
         if let Some(model) = self.voice.as_mut() {
             model.reset();
@@ -920,7 +961,11 @@ pub fn start(
         // callback must never touch it, and this is the only thread that
         // ever will.
         let voice = open_voice(settings, model_dir.as_deref());
-        let mut segmenter = Segmenter::new(settings, voice);
+        let mut segmenter = Segmenter::new(
+            settings,
+            voice,
+            Box::new(|| crate::loopback::output_onset_within(Duration::from_millis(400))),
+        );
         loop {
             let pending: Vec<f32> = {
                 let Ok(mut queued) = segment_queue.lock() else {
@@ -983,7 +1028,7 @@ mod tests {
     /// A segmenter with no neural detector: the energy path, which is
     /// what almost every test below is about.
     fn plain(settings: Settings) -> Segmenter {
-        Segmenter::new(settings, None)
+        Segmenter::new(settings, None, Box::new(|| false))
     }
 
     fn blocks_of(level: f32, count: usize) -> Vec<Vec<f32>> {
@@ -1226,7 +1271,7 @@ mod tests {
         // speaker model and Parakeet are woken up to decide it was the
         // kitchen.
         let Some(voice) = voice_if_present() else { return };
-        let mut segmenter = Segmenter::new(Settings::default(), Some(voice));
+        let mut segmenter = Segmenter::new(Settings::default(), Some(voice), Box::new(|| false));
         assert!(feed(&mut segmenter, hiss(0.3, 2.0)).is_empty(), "noise is not an order");
         assert!(feed(&mut segmenter, blocks_of(0.0, 40)).is_empty());
     }
@@ -1236,20 +1281,50 @@ mod tests {
         // And the other half: what Silero rejects must not include speech.
         let Some(voice) = voice_if_present() else { return };
         let Some(speech) = silero::sounds::spoken("Minion, abre Chrome.") else { return };
-        let mut segmenter = Segmenter::new(Settings::default(), Some(voice));
+        let mut segmenter = Segmenter::new(Settings::default(), Some(voice), Box::new(|| false));
         feed(&mut segmenter, as_blocks(&speech));
         let done = feed(&mut segmenter, blocks_of(0.0, 60));
         assert_eq!(done.len(), 1, "a spoken order must still be heard");
     }
 
     #[test]
+    fn an_output_onset_vetoes_speech_silero_would_approve() {
+        // The evidence this whole feature exists for: Silero cannot tell a
+        // chime from a voice, but an onset lines up with the microphone
+        // opening at the same instant a chime plays and speech does not.
+        let Some(voice) = voice_if_present() else { return };
+        let Some(speech) = silero::sounds::spoken("Minion, abre Chrome.") else { return };
+        let mut segmenter = Segmenter::new(Settings::default(), Some(voice), Box::new(|| true));
+        feed(&mut segmenter, as_blocks(&speech));
+        let done = feed(&mut segmenter, blocks_of(0.0, 60));
+        assert!(done.is_empty(), "an output onset must veto even speech Silero would approve");
+    }
+
+    #[test]
     fn without_the_model_the_energy_detector_decides_alone() {
         // The fallback has to behave exactly as it did before, or a
         // missing 2 MB file changes what Minion hears.
-        let mut segmenter = Segmenter::new(Settings::default(), None);
+        let mut segmenter = Segmenter::new(Settings::default(), None, Box::new(|| false));
         feed(&mut segmenter, hiss(0.3, 1.0));
         let done = feed(&mut segmenter, blocks_of(0.0, 40));
         assert_eq!(done.len(), 1, "energy alone still opens on noise");
+    }
+
+    #[test]
+    fn an_output_onset_vetoes_a_plain_energy_utterance() {
+        // The veto must apply in both VAD modes, not just Silero's.
+        let mut segmenter = Segmenter::new(Settings::default(), None, Box::new(|| true));
+        feed(&mut segmenter, blocks_of(0.2, 50));
+        let done = feed(&mut segmenter, blocks_of(0.0, 80));
+        assert!(done.is_empty(), "an output onset must veto plain energy detection too");
+    }
+
+    #[test]
+    fn without_an_onset_energy_detection_is_unchanged() {
+        let mut segmenter = Segmenter::new(Settings::default(), None, Box::new(|| false));
+        assert!(feed(&mut segmenter, blocks_of(0.2, 50)).is_empty());
+        let done = feed(&mut segmenter, blocks_of(0.0, 80));
+        assert_eq!(done.len(), 1, "no onset should leave energy detection exactly as before");
     }
 
     #[test]

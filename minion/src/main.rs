@@ -706,7 +706,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
         .audio
         .own_audio_threshold
         .unwrap_or(loopback::DEFAULT_THRESHOLD);
-    let own_audio = if startup.audio.ignore_own_audio.unwrap_or(false) {
+    let own_audio = if startup.audio.ignore_own_audio.unwrap_or(true) {
         match loopback::Loopback::start() {
             Ok(tap) => {
                 note!(
@@ -718,7 +718,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
             Err(e) => {
                 // Said, not fatal: the microphone still works, and the
                 // speaker check still stands behind it.
-                note!("could not tap the Mac's own audio, so it is not ignored: {e:#}");
+                note!("own-audio tap unavailable: {e:#}");
                 None
             }
         }

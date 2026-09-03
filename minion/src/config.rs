@@ -468,9 +468,9 @@ pub struct AudioConfig {
     /// Silero's score above which a frame counts as speech, 0 to 1.
     pub vad_threshold: Option<f32>,
     /// Discard what the Mac itself is playing, heard back through the
-    /// microphone: Netflix, music, the other side of a call. Off by
-    /// default — it opens a CoreAudio process tap on the system output,
-    /// which is a second audio stream running all the time.
+    /// microphone: Netflix, music, a notification chime, the other side of
+    /// a call. On by default; the tap is fail-open — if it cannot start,
+    /// Minion says so once and behaves as if this were off.
     pub ignore_own_audio: Option<bool>,
     /// How alike an utterance and the Mac's own output have to be before
     /// the utterance is thrown away, 0 to 1. See
