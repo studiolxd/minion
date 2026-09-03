@@ -18,6 +18,34 @@ The icon is a template image drawn once as SVG, rendered for the menu bar
 at run time and for the app at build time, so the two cannot drift apart.
 macOS tints it from its alpha, black on a light bar and white on a dark one.
 
+## Questions
+
+Everything else in the vocabulary *does* something; these *return*
+something, which is the whole reason for speaking aloud — the answer is the
+point and there is nowhere else to put it.
+
+```
+«minion, ¿qué hora es?»            → «Las dos y veinte»
+«minion, ¿qué día es hoy?»
+«minion, ¿cuánta batería queda?»   → «68% y cargando»
+«minion, ¿qué volumen tengo?»
+«minion, ¿me oyes?»                → «Sí, te escucho»
+«minion, ¿qué he dicho hoy?»       → «40 órdenes hoy, y 3 que no entendí»
+```
+
+It stays quiet for commands. Opening Chrome is something you can see, and
+announcing it would be noise arriving after the fact — the icon's blink
+already says it was heard. Answers are short and plain: a reply heard forty
+times a day should not be trying to entertain.
+
+While speaking, Minion stops acting on what it hears and discards whatever
+arrived meanwhile. It listens continuously, so its own voice comes straight
+back in through the microphone.
+
+Uses the system synthesiser and whichever Spanish voice macOS has, which
+costs nothing to ship and is good enough to settle the harder question of
+*when* to speak. Turn it off in preferences, or set `speak = false`.
+
 ## Preferences
 
 A native window, opened from the menu. It covers what is worth changing

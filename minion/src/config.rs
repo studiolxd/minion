@@ -89,6 +89,19 @@ pub struct Config {
     /// one, default 0.45.
     pub voice_threshold: Option<f32>,
 
+    /// Whether Minion answers questions out loud.
+    ///
+    /// Only questions: it stays quiet for commands, since opening Chrome is
+    /// something you can see and saying so would be noise arriving late.
+    #[serde(default = "yes")]
+    pub speak: bool,
+
+    /// Which system voice to use. Empty picks a Spanish one.
+    pub voice: Option<String>,
+
+    /// Words per minute.
+    pub speech_rate: Option<u32>,
+
     /// Keyboard shortcut that pauses and resumes from anywhere.
     ///
     /// Pausing by voice is easy; getting attention back is not, since a
@@ -154,6 +167,9 @@ impl Default for Config {
             commands: Vec::new(),
             voice_threshold: None,
             resume_shortcut: None,
+            speak: true,
+            voice: None,
+            speech_rate: None,
             unload_after_minutes: None,
         }
     }
@@ -305,6 +321,19 @@ impl Config {
                 ),
             })
             .collect()
+    }
+
+    /// The voice to speak with, or none to stay with the system default.
+    pub fn voice(&self) -> Option<String> {
+        self.voice
+            .clone()
+            .filter(|v| !v.trim().is_empty())
+            .or_else(crate::speech::default_voice)
+    }
+
+    /// How fast to speak.
+    pub fn speech_rate(&self) -> u32 {
+        self.speech_rate.unwrap_or(crate::speech::DEFAULT_RATE).clamp(120, 320)
     }
 
     /// The shortcut that pauses and resumes, or none.

@@ -458,6 +458,8 @@ pub enum Decision {
     StopDictation,
     /// Undo whatever Minion last did.
     UndoLast,
+    /// A question, to be answered aloud.
+    Answer(crate::answers::Question),
     /// Run a command from the table, identified by name.
     Run(&'static str),
     /// Started with the wake word, but nothing was recognised.
@@ -746,6 +748,15 @@ pub fn decide_in(transcript: &str, context: Option<&str>) -> (Decision, f32) {
     // Safari" would launch Safari, because the name alone used to be enough.
     let spoken_words = keywords(rest);
 
+    // Questions, once nothing in the table fits. After, not before: "deja
+    // de escuchar" is an instruction and "¿me escuchas?" is a question,
+    // and asking first let the question take both.
+    if best.is_none() {
+        if let Some(question) = crate::answers::asked(rest, threshold()) {
+            return (Decision::Answer(question), 1.0);
+        }
+    }
+
     // A number in the sentence: "pestaña 7". After the plain table, so a
     // command that matches outright still wins, and before applications,
     // which would otherwise see only a stray digit.
@@ -838,7 +849,10 @@ pub fn perform(decision: &Decision) -> Option<Done> {
             succeeded: actions::open_url(url, *in_browser),
         }),
         // Answered by the caller, which holds the state they need.
-        Decision::StartDictation | Decision::StopDictation | Decision::UndoLast => None,
+        Decision::StartDictation
+        | Decision::StopDictation
+        | Decision::UndoLast
+        | Decision::Answer(_) => None,
         Decision::Numbered { name, number, key } => Some(Done {
             description: format!("{name} {number}"),
             succeeded: actions::press(key.0, key.1),
@@ -981,7 +995,11 @@ pub fn catalogue() -> String {
            encadenar             «{wake}, cierra la pestaña y luego recarga»\n\
            dictado seguido       «{wake}, empieza a dictar» … «{wake}, deja de dictar»\n\
            deshacer lo suyo      «{wake}, deshaz lo que has hecho»\n\
-           una pestaña concreta  «{wake}, pestaña 7»"
+           una pestaña concreta  «{wake}, pestaña 7»\n\
+\n\
+           Y preguntas, que responde en voz alta:\n\
+           «{wake}, ¿qué hora es?» · «¿qué día es hoy?» · «¿cuánta batería queda?»\n\
+           «{wake}, ¿qué volumen tengo?» · «¿me oyes?» · «¿qué he dicho hoy?»"
     );
     out
 }
@@ -1074,7 +1092,7 @@ mod tests {
     fn admits_when_it_does_not_understand() {
         // Better to do nothing than to guess.
         assert_eq!(decision("Minion, haz un pino."), Decision::Unrecognised);
-        assert_eq!(decision("Minion, qué hora es."), Decision::Unrecognised);
+        assert_eq!(decision("Minion, ponme un café."), Decision::Unrecognised);
     }
 
     #[test]
@@ -1388,6 +1406,28 @@ mod tests {
         // These mention tabs without a number and must not be swallowed.
         assert_eq!(decide("minion cierra la pestaña").0, Decision::Run("cerrar pestaña"));
         assert_eq!(decide("minion última pestaña").0, Decision::Run("última pestaña"));
+    }
+
+    #[test]
+    fn questions_do_not_swallow_commands() {
+        // "deja de escuchar" is an instruction; "¿me escuchas?" is a
+        // question. Asking first let the question take both.
+        assert_eq!(decide("minion deja de escuchar").0, Decision::Run("dormir"));
+        assert_eq!(
+            decide("minion me escuchas").0,
+            Decision::Answer(crate::answers::Question::Listening)
+        );
+    }
+
+    #[test]
+    fn answers_questions() {
+        use crate::answers::Question;
+        assert_eq!(decide("minion qué hora es").0, Decision::Answer(Question::Time));
+        assert_eq!(decide("minion qué día es hoy").0, Decision::Answer(Question::Date));
+        assert_eq!(
+            decide("minion cuánta batería queda").0,
+            Decision::Answer(Question::Battery)
+        );
     }
 
     #[test]

@@ -33,7 +33,7 @@ const WIDTH: f64 = 380.0;
 /// Tall enough for everything plus a bottom margin matching the top one.
 /// `everything_fits_in_the_window` checks it, since a control that lands
 /// below the edge does not look like a bug — it simply is not there.
-const HEIGHT: f64 = 644.0;
+const HEIGHT: f64 = 686.0;
 const MARGIN: f64 = 22.0;
 
 /// A slider's range and the setting behind it.
@@ -85,6 +85,7 @@ pub struct Preferences {
     sounds: Switch,
     log_voices: Switch,
     at_login: Switch,
+    speak: Switch,
     sensitivity: Dial,
     pause: Dial,
     memory: Dial,
@@ -296,7 +297,21 @@ impl Preferences {
 
         let at_login = checkbox(mtm, "Abrir al iniciar sesión", y, startup::enabled());
         add(&at_login.control);
-        y -= 40.0;
+        y -= 26.0;
+
+        let speak = checkbox(mtm, "Responder en voz alta", y, settings.speak);
+        add(&speak.control);
+        y -= 20.0;
+        add(&label(
+            mtm,
+            "Solo a preguntas: «¿qué hora es?», «¿cuánta batería queda?».",
+            NSRect::new(
+                NSPoint::new(MARGIN + 20.0, y - 14.0),
+                NSSize::new(WIDTH - MARGIN * 2.0 - 20.0, 16.0),
+            ),
+            true,
+        ));
+        y -= 34.0;
 
         add(&label(
             mtm,
@@ -451,6 +466,7 @@ impl Preferences {
             sounds,
             log_voices,
             at_login,
+            speak,
             sensitivity,
             pause,
             memory,
@@ -525,6 +541,10 @@ impl Preferences {
             if let Err(e) = startup::set(on) {
                 crate::journal::write(&format!("start at login: {e}"));
             }
+            changed = true;
+        }
+        if let Some(on) = self.speak.toggled() {
+            save("speak", if on { "true" } else { "false" });
             changed = true;
         }
         if let Some(step) = self.sensitivity.moved() {
@@ -764,7 +784,7 @@ mod tests {
     #[test]
     fn everything_fits_in_the_window() {
         const STEPS: &[f64] = &[
-            26.0, 26.0, 30.0, 26.0, 40.0, // behaviour
+            26.0, 26.0, 30.0, 26.0, 26.0, 20.0, 34.0, // behaviour
             28.0, 26.0, 22.0, 34.0, // sensitivity
             26.0, 22.0, 34.0, // pause
             26.0, 40.0, // memory

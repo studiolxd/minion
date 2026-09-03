@@ -8,6 +8,7 @@
 //! on its own.
 
 mod actions;
+mod answers;
 mod audio;
 mod commands;
 mod config;
@@ -20,6 +21,7 @@ mod learn;
 mod models;
 mod preferences;
 mod spanish;
+mod speech;
 mod startup;
 mod speaker;
 mod text;
@@ -213,6 +215,14 @@ struct Listening {
     active: Arc<AtomicBool>,
     /// Raised when something runs, so the menu bar can acknowledge it.
     acted: Arc<AtomicBool>,
+    /// How to answer questions aloud.
+    voice_reply: Option<VoiceReply>,
+}
+
+/// Settings for speaking back.
+struct VoiceReply {
+    voice: Option<String>,
+    rate: u32,
 }
 
 fn listen_and_obey(setup: Listening) -> Result<()> {
@@ -226,7 +236,12 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
         training,
         active,
         acted,
+        voice_reply,
     } = setup;
+
+    // While Minion is speaking it must not act on what it hears: it listens
+    // continuously, so its own voice comes straight back in.
+    let deaf = Arc::new(AtomicBool::new(false));
     // Held in an Option so it can be dropped while idle. It is loaded now
     // rather than on first use, so the first thing said after starting is
     // as quick as the rest.
@@ -405,6 +420,28 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                 }
                 commands::Decision::StopDictation => {
                     note!("not dictating");
+                    continue;
+                }
+                commands::Decision::Answer(question) => {
+                    let listening = active.load(Ordering::Relaxed);
+                    let reply = answers::answer(question, listening);
+                    note!("asked    «{part}»  ->  {reply}");
+                    acted.store(true, Ordering::Relaxed);
+                    match &voice_reply {
+                        Some(settings) => {
+                            speech::say(
+                                &reply,
+                                settings.voice.as_deref(),
+                                settings.rate,
+                                &deaf,
+                            );
+                            // Whatever arrived while it was talking is its
+                            // own voice, or was said over it. Either way it
+                            // was not meant as an instruction.
+                            while listener.utterances.try_recv().is_ok() {}
+                        }
+                        None => actions::show_message(&reply),
+                    }
                     continue;
                 }
                 commands::Decision::UndoLast => {
@@ -954,6 +991,10 @@ fn main() -> Result<()> {
     let worker_log_ignored = Arc::clone(&log_ignored);
     let worker_sounds = Arc::clone(&play_sounds);
     let worker_acted = Arc::clone(&acted);
+    let voice_reply = config.speak.then(|| VoiceReply {
+        voice: config.voice(),
+        rate: config.speech_rate(),
+    });
     std::thread::spawn(move || {
         if let Err(e) = listen_and_obey(Listening {
             model_path,
@@ -965,6 +1006,7 @@ fn main() -> Result<()> {
             training: worker_training,
             active: worker_active,
             acted: worker_acted,
+            voice_reply,
         }) {
             eprintln!("Error: {e:#}");
             std::process::exit(1);
