@@ -46,6 +46,9 @@ use tray_icon::TrayIconBuilder;
 
 use commands::Decision;
 
+/// What the tooltip says when there is nothing more particular to report.
+const TOOLTIP_IDLE: &str = "Minion — control por voz";
+
 /// Where to send someone whose microphone Minion cannot use.
 const MICROPHONE_SETTINGS: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone";
@@ -79,17 +82,21 @@ const UI_REFRESH_SECONDS: f64 = 0.05;
 /// speaker never waits for. The wake-up itself is one atomic read.
 const IDLE_CHECK: Duration = Duration::from_millis(250);
 
-/// Locates the speech model.
+/// Locates the speech model, without fetching anything.
 ///
 /// Order: explicit argument, `OYENTE_MODEL`, the app bundle's Resources,
 /// then the working directory. The bundle case is what makes double-click
 /// launching work, since a bundled app starts with `/` as its directory.
-fn locate_model(argument: Option<String>) -> Result<String> {
+///
+/// Separate from downloading it because the two belong to different
+/// moments: this answers "is it here?" in microseconds, while fetching it
+/// takes minutes and must happen where its progress can be shown.
+fn find_model(argument: Option<String>) -> Option<String> {
     if let Some(path) = argument {
-        return Ok(path);
+        return Some(path);
     }
     if let Ok(path) = std::env::var("OYENTE_MODEL") {
-        return Ok(path);
+        return Some(path);
     }
 
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
@@ -112,10 +119,21 @@ fn locate_model(argument: Option<String>) -> Result<String> {
 
     for candidate in candidates {
         if models::present(&candidate) {
-            return Ok(candidate.to_string_lossy().into_owned());
+            return Some(candidate.to_string_lossy().into_owned());
         }
     }
-    // Nowhere yet: fetch it. First run, or someone deleted it.
+    None
+}
+
+/// Finds the model, downloading it if it is not there yet.
+///
+/// The command line — `minion enroll` — has a terminal to print to, so
+/// this is where the old behaviour lives on. The menu bar app cannot use
+/// it: it has to have an icon before a 670 MB download starts.
+fn locate_model(argument: Option<String>) -> Result<String> {
+    if let Some(found) = find_model(argument) {
+        return Ok(found);
+    }
     let target = models::directory()
         .ok_or_else(|| anyhow!("no home directory to download the model into"))?;
     println!("Descargando el modelo de reconocimiento (una sola vez, ~670 MB)…");
@@ -203,6 +221,20 @@ enum Undoable {
     Typed(usize),
     /// An application that was brought forward: go back to the previous.
     Launched { previous: Option<String> },
+}
+
+/// What the tooltip should say, written by whoever knows and applied by
+/// the run loop. The menu bar belongs to the main thread; the download and
+/// the recognition loop do not.
+type Status = Arc<Mutex<String>>;
+
+/// Sets the tooltip text, if anyone can still read it.
+fn set_status(status: &Status, text: &str) {
+    if let Ok(mut current) = status.lock() {
+        if *current != text {
+            *current = text.to_string();
+        }
+    }
 }
 
 /// Voice training, shared between the window and the listening loop.
@@ -678,7 +710,18 @@ fn config_voice_threshold() -> f32 {
     config::load().voice_threshold()
 }
 
+/// What the menu bar needs to know that is not a switch.
+struct Bar {
+    /// Where the model is, or will be once it has been downloaded.
+    model_path: String,
+    /// Set while the first download is running.
+    downloading: Arc<AtomicBool>,
+    /// The tooltip, as the rest of the program would like it.
+    status: Status,
+}
+
 fn run_menu_bar(
+    bar: Bar,
     active: Arc<AtomicBool>,
     sounds_on: Arc<AtomicBool>,
     log_voices_on: Arc<AtomicBool>,
@@ -687,6 +730,7 @@ fn run_menu_bar(
     // Raised when someone asks aloud what they can say.
     catalogue_asked: Arc<AtomicBool>,
 ) -> Result<()> {
+    let Bar { model_path, downloading, status } = bar;
     let mtm = MainThreadMarker::new()
         .ok_or_else(|| anyhow!("the menu bar must be built on the main thread"))?;
     let app = NSApplication::sharedApplication(mtm);
@@ -769,15 +813,27 @@ fn run_menu_bar(
     let learn_requested = Arc::new(AtomicBool::new(false));
     let catalogue_requested = Arc::new(AtomicBool::new(false));
 
+    // Built before anything slow happens. On a first run the model has yet
+    // to be downloaded — 670 MB, several minutes — and the icon used to
+    // appear only afterwards: for all that time the menu bar showed
+    // nothing at all and the progress went to a stdout nobody sees.
+    let busy = downloading.load(Ordering::Relaxed);
+    let opening_face = if busy { icon::asleep()? } else { icon::awake()? };
+    let opening_tooltip = status
+        .lock()
+        .ok()
+        .filter(|text| !text.is_empty())
+        .map_or_else(|| TOOLTIP_IDLE.to_string(), |text| text.clone());
+
     // Held for the lifetime of the process: dropping it removes the icon.
     let tray = Rc::new(
         TrayIconBuilder::new()
             .with_menu(Box::new(menu))
-            .with_icon(icon::awake()?)
+            .with_icon(opening_face)
             // A template image: macOS tints it to match the menu bar, so it
             // is black on a light one and white on a dark one.
             .with_icon_as_template(true)
-            .with_tooltip("Minion — control por voz")
+            .with_tooltip(&opening_tooltip)
             .build()?,
     );
 
@@ -788,7 +844,10 @@ fn run_menu_bar(
     let tray_for_timer = Rc::clone(&tray);
     let toggle_for_timer = toggle.clone();
     let active_for_timer = Arc::clone(&active);
-    let shown_as_listening = Cell::new(true);
+    let shown_as_listening = Cell::new(!busy);
+    let shown_tooltip = std::cell::RefCell::new(opening_tooltip);
+    let status_for_timer = Arc::clone(&status);
+    let downloading_for_timer = Arc::clone(&downloading);
     let acted_for_timer = Arc::clone(&acted);
     let blink_until: Cell<Option<std::time::Instant>> = Cell::new(None);
     let panel_for_timer = Rc::clone(&panel);
@@ -798,7 +857,7 @@ fn run_menu_bar(
     let catalogue_for_timer = Arc::clone(&catalogue_requested);
     let catalogue_window = Rc::clone(&catalogue);
     let catalogue_asked_aloud = Arc::clone(&catalogue_asked);
-    let training_model_path = locate_model(None).unwrap_or_else(|_| "model".into());
+    let training_model_path = model_path;
     let report_for_timer = Rc::clone(&report);
     let sounds_for_timer = Arc::clone(&sounds_on);
     let voices_for_timer = Arc::clone(&log_voices_on);
@@ -882,12 +941,23 @@ fn run_menu_bar(
             }
         }
 
+        // The tooltip is the only place a background app can say what it
+        // is doing without interrupting anyone.
+        if let Ok(wanted) = status_for_timer.lock() {
+            if !wanted.is_empty() && *wanted != *shown_tooltip.borrow() {
+                let _ = tray_for_timer.set_tooltip(Some(&*wanted));
+                shown_tooltip.replace(wanted.clone());
+            }
+        }
+
         let listening = active_for_timer.load(Ordering::Relaxed);
-        if listening == shown_as_listening.get() {
+        // Downloading is not listening, whatever the switch says.
+        let awake = listening && !downloading_for_timer.load(Ordering::Relaxed);
+        if awake == shown_as_listening.get() {
             return;
         }
-        shown_as_listening.set(listening);
-        let face = if listening { icon::awake() } else { icon::asleep() };
+        shown_as_listening.set(awake);
+        let face = if awake { icon::awake() } else { icon::asleep() };
         if let Ok(face) = face {
             let _ = tray_for_timer.set_icon_with_as_template(Some(face), true);
         }
@@ -1134,12 +1204,19 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let model_path = match locate_model(first_argument) {
-        Ok(path) => path,
-        Err(e) => fatal(&format!(
-            "Minion no encuentra el modelo de reconocimiento y no ha podido \
-             descargarlo.\n\n{e:#}"
-        )),
+    // Where the model is — or, on a first run, where it is about to be.
+    // The download itself happens on the worker thread, once the icon
+    // exists to report it.
+    let found = find_model(first_argument);
+    let downloading = Arc::new(AtomicBool::new(found.is_none()));
+    let status: Status = Arc::new(Mutex::new(String::new()));
+    let Some(model_path) = found.or_else(|| {
+        models::directory().map(|path| path.to_string_lossy().into_owned())
+    }) else {
+        fatal(
+            "Minion no encuentra el modelo de reconocimiento y no sabe dónde \
+             descargarlo: no hay carpeta personal.",
+        );
     };
 
     let config = config::load();
@@ -1194,7 +1271,33 @@ fn main() -> Result<()> {
         rate: config.speech_rate(),
         device: config.speaker(),
     });
+    let worker_downloading = Arc::clone(&downloading);
+    let worker_status = Arc::clone(&status);
+    let menu_bar = Bar {
+        model_path: model_path.clone(),
+        downloading: Arc::clone(&downloading),
+        status: Arc::clone(&status),
+    };
     std::thread::spawn(move || {
+        // First run: 670 MB before anything can be heard. Reported through
+        // the tooltip, which is where a menu bar app can say what it is
+        // doing without a window and without interrupting anyone.
+        if worker_downloading.load(Ordering::Relaxed) {
+            note!("Downloading the recognition model (about 670 MB, once).");
+            set_status(&worker_status, "Minion — descargando el modelo… 0 %");
+            let target = std::path::PathBuf::from(&model_path);
+            if let Err(e) = models::fetch(&target, |progress| {
+                set_status(&worker_status, &format!("Minion — {progress}"));
+            }) {
+                fatal(&format!(
+                    "Minion no ha podido descargar el modelo de reconocimiento.\n\n{e}\n\n\
+                     Comprueba la conexión y vuelve a abrir Minion."
+                ));
+            }
+            note!("Model downloaded.");
+            worker_downloading.store(false, Ordering::Relaxed);
+            set_status(&worker_status, TOOLTIP_IDLE);
+        }
         if let Err(e) = listen_and_obey(Listening {
             model_path,
             audio: audio_settings,
@@ -1227,7 +1330,15 @@ fn main() -> Result<()> {
         }
     }
 
-    run_menu_bar(active, play_sounds, log_ignored, training, acted, catalogue_asked)
+    run_menu_bar(
+        menu_bar,
+        active,
+        play_sounds,
+        log_ignored,
+        training,
+        acted,
+        catalogue_asked,
+    )
 }
 
 #[cfg(test)]
