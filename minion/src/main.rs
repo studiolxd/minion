@@ -1489,7 +1489,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                         show_catalogue.store(true, Ordering::Relaxed);
                     }
                     let listening = active.load(Ordering::Relaxed);
-                    let reply = answers::answer(question, listening);
+                    let reply = answers::answer(question, listening, context.as_deref());
                     note!("asked    «{part}»  ->  {reply}");
                     set_status(&status, &last_utterance_tooltip(&part, &reply));
                     hud::push_update(hud::Update {

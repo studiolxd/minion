@@ -895,6 +895,26 @@ fn ask_ai_text(transcript: &str) -> Option<String> {
     None
 }
 
+/// The names of every command that only exists in `bundle_id`, in the
+/// order the vocabulary declares them — «qué puedo decir aquí» reads this
+/// out. Global commands are not included: this is specifically what the
+/// application in front adds, not everything that happens to work there.
+pub fn contextual_command_names(bundle_id: &str) -> Vec<&'static str> {
+    vocabulary()
+        .contextual
+        .iter()
+        .filter(|command| command.bundles.contains(&bundle_id))
+        .map(|command| command.name)
+        .collect()
+}
+
+/// The application's own display name for a bundle id, if the vocabulary
+/// knows it — «qué puedo decir aquí» names the application it is talking
+/// about.
+pub fn app_name_for(bundle_id: &str) -> Option<&'static str> {
+    vocabulary().apps.iter().find(|app| app.bundle_id == bundle_id).map(|app| app.name)
+}
+
 /// The catalogue [`crate::ai::ask_for_command`] is shown when a phrase
 /// went unrecognised: every global command's name and first, canonical
 /// phrase.
@@ -2386,6 +2406,25 @@ mod tests {
     fn a_pause_with_nothing_it_can_parse_is_not_a_pause() {
         assert_eq!(decision("minion espera"), Decision::Unrecognised);
         assert_eq!(decision("minion espera un momento"), Decision::Unrecognised);
+    }
+
+    #[test]
+    fn contextual_command_names_lists_only_that_bundles_own() {
+        let names = contextual_command_names("com.apple.Terminal");
+        assert!(names.contains(&"interrumpir"), "{names:?}");
+        // Chrome's own commands are not Terminal's.
+        assert!(!names.contains(&"favoritos"), "{names:?}");
+    }
+
+    #[test]
+    fn contextual_command_names_is_empty_for_an_app_with_none_of_its_own() {
+        assert!(contextual_command_names("com.nobody.nothing").is_empty());
+    }
+
+    #[test]
+    fn app_name_for_finds_the_display_name() {
+        assert_eq!(app_name_for("com.apple.Terminal"), Some("Terminal"));
+        assert_eq!(app_name_for("com.nobody.nothing"), None);
     }
 
     #[test]

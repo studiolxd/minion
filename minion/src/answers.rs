@@ -39,6 +39,10 @@ pub enum Question {
     WhoAmI,
     /// What can I say? Opens the list rather than reciting it.
     Help,
+    /// «qué puedo decir aquí» — the contextual commands for the
+    /// application in front, spoken (or notified) rather than opening
+    /// the whole catalogue window.
+    ContextualHelp,
     /// "pon un temporizador de cinco minutos" — how long, and the words
     /// that named it, for the confirmation reply.
     Timer(Duration, String),
@@ -93,6 +97,8 @@ const ASKED: &[(Question, &[&str])] = &[
     (Question::NextMeeting, &["cual es mi proxima reunion", "cual es mi siguiente reunion"]),
     (Question::Help, &["que puedes hacer", "que te puedo decir", "ayuda",
                        "que ordenes hay", "que se decir"]),
+    (Question::ContextualHelp, &["que puedo decir aqui", "que puedo decir en esta aplicacion",
+                                 "que comandos hay aqui", "que puedo decir en esta app"]),
 ];
 
 /// A duration, a clock time, or a day of the month named inside the
@@ -158,7 +164,11 @@ pub fn asked(rest: &str, threshold: f32) -> Option<Question> {
 }
 
 /// Works out the answer, as something to say aloud.
-pub fn answer(question: Question, listening: bool) -> String {
+///
+/// `context` is the application in front's bundle id, read only by
+/// [`Question::ContextualHelp`] — every other question ignores it, the
+/// same way most of them ignore `listening`.
+pub fn answer(question: Question, listening: bool, context: Option<&str>) -> String {
     match question {
         Question::Time => spoken_time(),
         Question::Date => spoken_date(),
@@ -181,6 +191,7 @@ pub fn answer(question: Question, listening: bool) -> String {
         // Answered by opening the window: reading forty commands aloud
         // would be worse than useless.
         Question::Help => "Te abro la lista.".into(),
+        Question::ContextualHelp => contextual_help(context),
         Question::Timer(duration, label) => {
             crate::timers::schedule_timer(duration, label.clone());
             format!("Temporizador de {label}.")
@@ -408,6 +419,34 @@ fn battery() -> String {
     }
 }
 
+/// The maximum number of contextual commands read aloud before the rest
+/// are summed up instead — reading forty of them would be worse than not
+/// answering at all, the same reasoning that makes `Question::Help` open
+/// a window rather than speak.
+const CONTEXTUAL_HELP_MAX: usize = 8;
+
+/// «qué puedo decir aquí»: the application in front's own commands,
+/// spoken as a list — "En Teams puedes decir: enviar mensaje, nuevo
+/// chat…", cut off at [`CONTEXTUAL_HELP_MAX`] with "y N más; abre la
+/// ayuda para verlas" pointing at the full catalogue for the rest.
+fn contextual_help(context: Option<&str>) -> String {
+    let Some(bundle_id) = context else {
+        return "No sé qué aplicación tienes delante, así que no hay nada que decirte de ella.".into();
+    };
+    let app_name = crate::commands::app_name_for(bundle_id).unwrap_or(bundle_id);
+    let names = crate::commands::contextual_command_names(bundle_id);
+    if names.is_empty() {
+        return format!("En {app_name} no tengo comandos propios; los generales siguen valiendo.");
+    }
+    let shown = names.iter().take(CONTEXTUAL_HELP_MAX).copied().collect::<Vec<_>>().join(", ");
+    let rest = names.len().saturating_sub(CONTEXTUAL_HELP_MAX);
+    if rest > 0 {
+        format!("En {app_name} puedes decir: {shown}… y {rest} más; abre la ayuda para verlas.")
+    } else {
+        format!("En {app_name} puedes decir: {shown}.")
+    }
+}
+
 fn volume() -> String {
     let Ok(output) = Command::new("/usr/bin/osascript")
         .args(["-e", "output volume of (get volume settings)"])
@@ -591,6 +630,39 @@ mod tests {
         assert_eq!(asked("cuanta bateria queda", 0.7), Some(Question::Battery));
         assert_eq!(asked("me oyes", 0.7), Some(Question::Listening));
         assert_eq!(asked("a cuanto esta el volumen", 0.7), Some(Question::Volume));
+        assert_eq!(asked("que puedo decir aqui", 0.7), Some(Question::ContextualHelp));
+        assert_eq!(asked("que puedes hacer", 0.7), Some(Question::Help));
+    }
+
+    #[test]
+    fn contextual_help_names_the_app_and_its_own_commands() {
+        let reply = contextual_help(Some("com.apple.Terminal"));
+        assert!(reply.starts_with("En Terminal puedes decir: "), "{reply}");
+        assert!(reply.contains("interrumpir"), "{reply}");
+    }
+
+    #[test]
+    fn contextual_help_with_nothing_in_front_says_so() {
+        assert_eq!(
+            contextual_help(None),
+            "No sé qué aplicación tienes delante, así que no hay nada que decirte de ella."
+        );
+    }
+
+    #[test]
+    fn contextual_help_with_an_unknown_app_says_it_has_nothing_of_its_own() {
+        assert_eq!(
+            contextual_help(Some("com.nobody.nothing")),
+            "En com.nobody.nothing no tengo comandos propios; los generales siguen valiendo."
+        );
+    }
+
+    #[test]
+    fn contextual_help_sums_up_after_the_first_eight() {
+        // Teams has more than eight of its own commands in the built-in
+        // vocabulary, so this is a real case, not a fabricated one.
+        let reply = contextual_help(Some("com.microsoft.teams2"));
+        assert!(reply.contains("más; abre la ayuda para verlas."), "{reply}");
     }
 
     #[test]
@@ -636,7 +708,7 @@ mod tests {
             question,
             Some(Question::Timer(Duration::from_secs(300), "cinco minutos".into()))
         );
-        assert_eq!(answer(question.unwrap(), true), "Temporizador de cinco minutos.");
+        assert_eq!(answer(question.unwrap(), true, None), "Temporizador de cinco minutos.");
         crate::timers::cancel_all();
     }
 
@@ -703,7 +775,7 @@ mod tests {
 
     #[test]
     fn stopping_a_read_answers_and_does_not_panic_with_nothing_playing() {
-        assert_eq!(answer(Question::StopReading, true), "Vale.");
+        assert_eq!(answer(Question::StopReading, true, None), "Vale.");
     }
 
     #[test]
@@ -713,7 +785,7 @@ mod tests {
         // read_clipboard ever returns None in this environment (a CI
         // runner, say, with no pasteboard server).
         if read_clipboard().is_none() {
-            assert_eq!(answer(Question::ReadClipboard, true), "El portapapeles está vacío.");
+            assert_eq!(answer(Question::ReadClipboard, true, None), "El portapapeles está vacío.");
         }
     }
 }
