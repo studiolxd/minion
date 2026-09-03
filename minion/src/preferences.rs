@@ -192,9 +192,10 @@ impl Layout {
     fn hint(&mut self, text: &str, indent: f64) {
         self.gap(spacing::BEFORE_HINT);
         let width = self.content_width() - indent;
-        let lines = wrapped_lines(text, width);
-        let frame = self.place(spacing::HINT_LINE * lines, indent);
-        let view = small_label(self.mtm, text, frame);
+        let blank = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, 0.0));
+        let view = small_label(self.mtm, text, blank);
+        let frame = self.place(text_height(&view, width, text), indent);
+        view.setFrame(frame);
         self.add(&view);
         // The hint explains the control above it, so that is where it
         // belongs for anyone who cannot see the two side by side.
@@ -346,11 +347,33 @@ const PROMPT_LINE: f64 = 19.0;
 /// Indent for a hint that belongs to a checkbox, lining up with its label.
 const INDENT: f64 = 20.0;
 
+/// The height a label needs at a given width, asked of AppKit.
+///
+/// Counting characters and dividing by an average width is what clipped
+/// the accented Spanish hints: «í» and «ó» are not the average character,
+/// and the estimate came up a line short on exactly the lines that
+/// mattered. The cell lays the text out with the font it will be drawn
+/// in, so it knows. [`wrapped_lines`] stays as the fallback for the case
+/// where there is no cell to ask.
+fn text_height(field: &NSTextField, width: f64, text: &str) -> f64 {
+    // A tall box to wrap inside; the answer is the height actually used.
+    const ROOM: f64 = 10_000.0;
+    let bounds = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, ROOM));
+    let measured = field
+        .cell()
+        .map(|cell| cell.cellSizeForBounds(bounds).height)
+        .filter(|height| height.is_finite() && *height > 0.0);
+    match measured {
+        Some(height) => height.ceil().max(spacing::HINT_LINE),
+        None => spacing::HINT_LINE * wrapped_lines(text, width),
+    }
+}
+
 /// How many lines a hint needs at the width it has.
 ///
 /// Approximate — 11-point system text averages close to six points per
 /// character — but erring long only leaves a little space, while erring
-/// short cuts words off.
+/// short cuts words off. Only used when the label has no cell to measure.
 fn wrapped_lines(text: &str, width: f64) -> f64 {
     let per_line = (width / 5.9).max(10.0);
     ((text.chars().count() as f64 / per_line).ceil()).max(1.0)
@@ -716,6 +739,10 @@ impl Preferences {
             .idle_unload()
             .map_or(0.0, |d| d.as_secs() as f64 / 60.0);
         let memory = layout.slider((0.0, 30.0), minutes, 7);
+        layout.hint(
+            "«Nunca» mantiene el modelo cargado: responde antes, usa ~900 MB.",
+            0.0,
+        );
 
         layout.heading("Atajo para pausar y reanudar");
         let current_shortcut = settings
@@ -776,7 +803,7 @@ impl Preferences {
                     false,
                 )
             };
-            window.setTitle(&NSString::from_str("Preferencias de Minion"));
+            window.setTitle(&NSString::from_str("Ajustes de Minion"));
             // Safety: the window is kept alive by this struct for the life
             // of the process, so closing it must not release it — otherwise
             // reopening from the menu would use freed memory.
