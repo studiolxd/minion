@@ -1,0 +1,175 @@
+# Microsoft Teams — the new Teams, bundle com.microsoft.teams2. The schema
+# is documented at the top of macos.toml.
+#
+# Shortcuts checked against Microsoft's own "Keyboard shortcuts for
+# Microsoft Teams" support page (macOS column). Several entries there
+# disagreed with themselves between fetches — small, inconsistent
+# summaries of the same table — so anything that could not be pinned down
+# consistently is marked `# UNVERIFIED` below and kept anyway rather than
+# dropped, since a wrong shortcut is a silent no-op, not a wrong action.
+
+category = "Microsoft Teams"
+
+# No [[apps]] entry: the user's own config.toml already has Teams as an
+# app (bundle com.microsoft.teams2). This pack only adds commands.
+
+# ── Compose ─────────────────────────────────────────────────────────────
+
+[[commands]]
+name = "enviar mensaje"
+phrases = ["envia", "envia el mensaje", "manda el mensaje", "enviar", "enviar el mensaje"]
+keys = "return"
+bundles = ["com.microsoft.teams2"]
+
+[[commands]]
+name = "nueva linea"
+phrases = ["nueva linea", "salto de linea"]
+keys = "shift-return"
+bundles = ["com.microsoft.teams2"]
+
+# UNVERIFIED — confirm with ⌘. in Teams. Microsoft's own page returned
+# both "cmd-o" and "option-cmd-o" for this across two fetches.
+[[commands]]
+name = "adjuntar archivo"
+phrases = ["adjunta", "adjuntar", "adjunta un archivo", "adjuntar archivo"]
+keys = "cmd-o"
+bundles = ["com.microsoft.teams2"]
+
+[[commands]]
+name = "marcar importante"
+phrases = ["importante", "marca como importante", "marcar importante"]
+keys = "cmd-shift-i"
+bundles = ["com.microsoft.teams2"]
+
+[[commands]]
+name = "buscar en la conversacion"
+phrases = ["busca en la conversacion", "buscar en la conversacion"]
+keys = "cmd-f"
+bundles = ["com.microsoft.teams2"]
+
+# ── Navigation ──────────────────────────────────────────────────────────
+
+[[commands]]
+name = "nuevo chat"
+phrases = ["nuevo chat", "crea un chat nuevo"]
+keys = "cmd-n"
+bundles = ["com.microsoft.teams2"]
+
+# "busca a Ana" would need a parameterised search the schema has no place
+# for yet — kept simple: this only opens the search box, ready to dictate
+# into.
+[[commands]]
+name = "buscar en teams"
+phrases = ["busca en teams", "buscar en teams"]
+keys = "cmd-e"
+bundles = ["com.microsoft.teams2"]
+
+# Sections in the app bar, left to right in the default install. The
+# shortcut itself (⌘1…⌘6 selects the Nth app in the bar) is on Microsoft's
+# page; which section sits at which position is not — it is the default
+# order and the user's own sidebar may have rearranged it.
+[[commands]]
+name = "seccion actividad"
+phrases = ["actividad", "ve a actividad", "abre actividad"]
+keys = "cmd-1"
+bundles = ["com.microsoft.teams2"]
+
+[[commands]]
+name = "seccion chats"
+phrases = ["chats", "ve a chats", "abre chats"]
+keys = "cmd-2"
+bundles = ["com.microsoft.teams2"]
+
+[[commands]]
+name = "seccion equipos"
+phrases = ["equipos", "ve a equipos", "abre equipos"]
+keys = "cmd-3"
+bundles = ["com.microsoft.teams2"]
+
+[[commands]]
+name = "seccion calendario"
+phrases = ["calendario", "ve al calendario", "abre el calendario"]
+keys = "cmd-4"
+bundles = ["com.microsoft.teams2"]
+
+[[commands]]
+name = "seccion llamadas"
+phrases = ["llamadas", "ve a llamadas", "abre llamadas"]
+keys = "cmd-5"
+bundles = ["com.microsoft.teams2"]
+
+[[commands]]
+name = "seccion archivos"
+phrases = ["archivos", "ve a archivos", "abre archivos"]
+keys = "cmd-6"
+bundles = ["com.microsoft.teams2"]
+
+# ── In a meeting ────────────────────────────────────────────────────────
+
+[[commands]]
+name = "silenciar microfono"
+phrases = ["silencia el microfono", "silenciar microfono", "activa el microfono", "activar microfono"]
+keys = "cmd-shift-m"
+bundles = ["com.microsoft.teams2"]
+
+[[commands]]
+name = "activar camara"
+phrases = ["activa la camara", "apaga la camara", "activar camara"]
+keys = "cmd-shift-o"
+bundles = ["com.microsoft.teams2"]
+
+[[commands]]
+name = "compartir pantalla"
+phrases = ["comparte la pantalla", "compartir pantalla"]
+keys = "cmd-shift-e"
+bundles = ["com.microsoft.teams2"]
+
+[[commands]]
+name = "levantar la mano"
+phrases = ["levanta la mano", "baja la mano", "levantar la mano", "bajar la mano"]
+keys = "cmd-shift-k"
+bundles = ["com.microsoft.teams2"]
+
+# UNVERIFIED — confirm with ⌘. in Teams. Microsoft's own page came back
+# with "accept video = ⌘⇧V, accept audio = ⌘⇧A" on one fetch and
+# "accept video = ⌘⇧A, accept audio = ⌘⇧S" on another.
+[[commands]]
+name = "aceptar llamada de video"
+phrases = ["acepta la llamada de video", "aceptar llamada de video"]
+keys = "cmd-shift-a"
+bundles = ["com.microsoft.teams2"]
+
+# UNVERIFIED — confirm with ⌘. in Teams. See the note above.
+[[commands]]
+name = "aceptar llamada de audio"
+phrases = ["acepta la llamada de audio", "aceptar llamada de audio"]
+keys = "cmd-shift-s"
+bundles = ["com.microsoft.teams2"]
+
+# UNVERIFIED — confirm with ⌘. in Teams. Not confirmed on Microsoft's own
+# page at all across any fetch.
+[[commands]]
+name = "difuminar fondo"
+phrases = ["difumina el fondo", "difuminar fondo"]
+keys = "cmd-shift-p"
+bundles = ["com.microsoft.teams2"]
+
+# UNVERIFIED — confirm with ⌘. in Teams. Microsoft's own page named this
+# ⌘⇧F on one fetch and macOS's own F11 on another.
+[[commands]]
+name = "pantalla completa teams"
+phrases = ["pon la pantalla completa", "pantalla completa"]
+keys = "cmd-shift-f"
+bundles = ["com.microsoft.teams2"]
+
+[[commands]]
+name = "colgar"
+phrases = ["cuelga", "sal de la reunion", "colgar", "salir de la reunion"]
+keys = "cmd-shift-h"
+bundles = ["com.microsoft.teams2"]
+
+[[commands]]
+name = "rechazar llamada"
+phrases = ["rechaza la llamada", "rechazar llamada"]
+keys = "cmd-shift-d"
+bundles = ["com.microsoft.teams2"]

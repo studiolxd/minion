@@ -47,6 +47,7 @@ const BUILT_IN: &[(&str, &str)] = &[
     ("dev.toml", include_str!("../vocabulary/dev.toml")),
     ("apps.toml", include_str!("../vocabulary/apps.toml")),
     ("sites.toml", include_str!("../vocabulary/sites.toml")),
+    ("teams.toml", include_str!("../vocabulary/teams.toml")),
 ];
 
 /// What `action = "…"` may name.
