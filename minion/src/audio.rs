@@ -73,7 +73,7 @@ const DEVICE_CHECK: Duration = Duration::from_secs(3);
 /// This is crude resampling with no anti-alias filter. For speech in a
 /// narrow band it is good enough; if quality ever gets in the way, this is
 /// the function to replace.
-fn to_16k_mono(input: &[f32], channels: usize, source_hz: u32) -> Vec<f32> {
+pub(crate) fn to_16k_mono(input: &[f32], channels: usize, source_hz: u32) -> Vec<f32> {
     let channels = channels.max(1);
     let step = (source_hz as f32 / TARGET_HZ as f32).max(1.0);
     let frames = input.len() / channels;
@@ -144,6 +144,42 @@ impl NoiseFloor {
         }
         (self.level * Self::MARGIN).clamp(floor, floor * Self::MAX_LIFT)
     }
+}
+
+/// Writes an utterance to a WAV file, for working out what went wrong.
+///
+/// Everything else can be reasoned about from the log; audio cannot. When
+/// recognition behaves differently from every synthetic test, the only way
+/// forward is to listen to what actually arrived.
+pub fn save_recording(samples: &[f32], name: &str) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write;
+
+    let home = std::env::var("HOME").unwrap_or_default();
+    let directory = std::path::PathBuf::from(home).join("Library/Application Support/Minion/recordings");
+    std::fs::create_dir_all(&directory)?;
+    let path = directory.join(format!("{name}.wav"));
+
+    let data: Vec<u8> = samples
+        .iter()
+        .flat_map(|s| ((s.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes())
+        .collect();
+
+    let mut file = std::fs::File::create(&path)?;
+    let rate = TARGET_HZ;
+    file.write_all(b"RIFF")?;
+    file.write_all(&(36 + data.len() as u32).to_le_bytes())?;
+    file.write_all(b"WAVEfmt ")?;
+    file.write_all(&16u32.to_le_bytes())?;
+    file.write_all(&1u16.to_le_bytes())?; // PCM
+    file.write_all(&1u16.to_le_bytes())?; // mono
+    file.write_all(&rate.to_le_bytes())?;
+    file.write_all(&(rate * 2).to_le_bytes())?;
+    file.write_all(&2u16.to_le_bytes())?;
+    file.write_all(&16u16.to_le_bytes())?;
+    file.write_all(b"data")?;
+    file.write_all(&(data.len() as u32).to_le_bytes())?;
+    file.write_all(&data)?;
+    Ok(path)
 }
 
 /// Splits a stream of blocks into utterances.
@@ -219,15 +255,52 @@ impl Segmenter {
 /// `active` mutes processing without closing the device: while false,
 /// incoming audio is discarded as it arrives. Closing and reopening the
 /// microphone instead would make macOS re-check permissions each time.
-/// Opens the current default input, feeding `queue`.
+/// The microphones available, by name.
+///
+/// Used to offer a choice in preferences. Anything that fails to describe
+/// itself is left out rather than shown as a blank line.
+pub fn input_names() -> Vec<String> {
+    let Ok(devices) = cpal::default_host().input_devices() else {
+        return Vec::new();
+    };
+    devices
+        .filter_map(|device| device.description().ok())
+        .map(|description| description.name().to_string())
+        .collect()
+}
+
+/// Finds a microphone by name, or the system's default.
+///
+/// Falling back rather than failing: a device named in the configuration
+/// may simply be unplugged, and being deaf is worse than using another one.
+fn choose_input(preferred: Option<&str>) -> Result<cpal::platform::Device> {
+    let host = cpal::default_host();
+    if let Some(wanted) = preferred.filter(|name| !name.trim().is_empty()) {
+        if let Ok(devices) = host.input_devices() {
+            for device in devices {
+                let matches = device
+                    .description()
+                    .is_ok_and(|description| description.name() == wanted);
+                if matches {
+                    return Ok(device);
+                }
+            }
+        }
+        crate::journal::write(&format!(
+            "Microphone «{wanted}» not found; using the system default."
+        ));
+    }
+    host.default_input_device()
+        .ok_or_else(|| anyhow!("no microphone available"))
+}
+
+/// Opens the chosen input, feeding `queue`.
 fn open_default(
     queue: &Arc<Mutex<Vec<f32>>>,
     active: &Arc<AtomicBool>,
+    preferred: Option<&str>,
 ) -> Result<(cpal::platform::Stream, u32, usize, cpal::DeviceId)> {
-    let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .ok_or_else(|| anyhow!("no microphone available"))?;
+    let device = choose_input(preferred)?;
     let id = device.id()?;
     let config = device.default_input_config()?;
     let source_hz = config.sample_rate();
@@ -261,9 +334,14 @@ fn open_default(
     Ok((stream, source_hz, channels, id))
 }
 
-pub fn start(settings: Settings, active: Arc<AtomicBool>) -> Result<Listener> {
+pub fn start(
+    settings: Settings,
+    active: Arc<AtomicBool>,
+    preferred: Option<String>,
+) -> Result<Listener> {
     let queue = Arc::new(Mutex::new(Vec::<f32>::new()));
-    let (stream, source_hz, channels, device_id) = open_default(&queue, &active)?;
+    let (stream, source_hz, channels, device_id) =
+        open_default(&queue, &active, preferred.as_deref())?;
 
     // Held so it can be swapped when the default input changes.
     let stream = Arc::new(Mutex::new(Some(stream)));
@@ -272,7 +350,13 @@ pub fn start(settings: Settings, active: Arc<AtomicBool>) -> Result<Listener> {
     let watch_stream = Arc::clone(&stream);
     let watch_queue = Arc::clone(&queue);
     let watch_active = Arc::clone(&active);
+    // Only follows the system when no particular microphone was asked for:
+    // choosing one is a decision, and following the default would undo it.
+    let follows_system = preferred.as_ref().is_none_or(|name| name.trim().is_empty());
     std::thread::spawn(move || {
+        if !follows_system {
+            return;
+        }
         let mut current = device_id;
         loop {
             std::thread::sleep(DEVICE_CHECK);
@@ -289,7 +373,7 @@ pub fn start(settings: Settings, active: Arc<AtomicBool>) -> Result<Listener> {
             if let Ok(mut held) = watch_stream.lock() {
                 *held = None;
             }
-            match open_default(&watch_queue, &watch_active) {
+            match open_default(&watch_queue, &watch_active, None) {
                 Ok((fresh, hz, channels, fresh_id)) => {
                     if let Ok(mut held) = watch_stream.lock() {
                         *held = Some(fresh);

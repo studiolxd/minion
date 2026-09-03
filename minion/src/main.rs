@@ -217,12 +217,19 @@ struct Listening {
     acted: Arc<AtomicBool>,
     /// How to answer questions aloud.
     voice_reply: Option<VoiceReply>,
+    /// Which microphone to use, or none to follow the system.
+    microphone: Option<String>,
+    /// Raised to ask the menu bar to open the list of commands.
+    show_catalogue: Arc<AtomicBool>,
+    /// Keep a copy of what was heard, for diagnosis.
+    save_recordings: bool,
 }
 
 /// Settings for speaking back.
 struct VoiceReply {
     voice: Option<String>,
     rate: u32,
+    device: Option<String>,
 }
 
 fn listen_and_obey(setup: Listening) -> Result<()> {
@@ -237,6 +244,9 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
         active,
         acted,
         voice_reply,
+        microphone,
+        show_catalogue,
+        save_recordings,
     } = setup;
 
     // While Minion is speaking it must not act on what it hears: it listens
@@ -256,7 +266,8 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
     note!("Model loaded. {}", resident_memory());
 
     let listener =
-        audio::start(settings, Arc::clone(&active)).context("opening the microphone")?;
+        audio::start(settings, Arc::clone(&active), microphone)
+            .context("opening the microphone")?;
     note!(
         "Microphone: {} Hz, {} channel(s). {} phrases understood.",
         listener.source_hz,
@@ -289,6 +300,14 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
         }
         let seconds = utterance.len() as f32 / audio::TARGET_HZ as f32;
         let started = Instant::now();
+
+        if save_recordings {
+            let name = chrono::Local::now().format("%H-%M-%S").to_string();
+            match audio::save_recording(&utterance, &name) {
+                Ok(path) => note!("saved    {}", path.display()),
+                Err(e) => note!("could not save the recording: {e}"),
+            }
+        }
 
         // Training takes precedence: while it runs, every utterance is a
         // sample of the person's voice rather than something to obey.
@@ -423,6 +442,10 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                     continue;
                 }
                 commands::Decision::Answer(question) => {
+                    // "¿Qué puedes hacer?" is answered by showing the list.
+                    if question == answers::Question::Help {
+                        show_catalogue.store(true, Ordering::Relaxed);
+                    }
                     let listening = active.load(Ordering::Relaxed);
                     let reply = answers::answer(question, listening);
                     note!("asked    «{part}»  ->  {reply}");
@@ -433,6 +456,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                                 &reply,
                                 settings.voice.as_deref(),
                                 settings.rate,
+                                settings.device.as_deref(),
                                 &deaf,
                             );
                             // Whatever arrived while it was talking is its
@@ -602,6 +626,8 @@ fn run_menu_bar(
     log_voices_on: Arc<AtomicBool>,
     training: Training,
     acted: Arc<AtomicBool>,
+    // Raised when someone asks aloud what they can say.
+    catalogue_asked: Arc<AtomicBool>,
 ) -> Result<()> {
     let mtm = MainThreadMarker::new()
         .ok_or_else(|| anyhow!("the menu bar must be built on the main thread"))?;
@@ -618,7 +644,7 @@ fn run_menu_bar(
     let learn = MenuItem::new("Aprender", true, None);
     let show_log = MenuItem::new("Ver el registro", true, None);
 
-    let commands_item = MenuItem::new("Qué puedo decirle", true, None);
+    let commands_item = MenuItem::new("Ayuda", true, None);
     let preferences = MenuItem::new("Preferencias…", true, None);
 
     // The two things you do with the log, together. Kept in scope for the
@@ -627,13 +653,15 @@ fn run_menu_bar(
     log_menu.append(&learn)?;
     log_menu.append(&show_log)?;
 
-    let quit = MenuItem::new("Salir de Minion", true, None);
+    let quit = MenuItem::new("Salir", true, None);
     menu.append(&toggle)?;
     menu.append(&PredefinedMenuItem::separator())?;
-    menu.append(&commands_item)?;
     menu.append(&log_menu)?;
     menu.append(&preferences)?;
     menu.append(&PredefinedMenuItem::separator())?;
+    // Help sits with Quit rather than among the working items: it is where
+    // you look when you do not know what to do, not part of the routine.
+    menu.append(&commands_item)?;
     menu.append(&quit)?;
 
     let toggle_id = toggle.id().clone();
@@ -711,6 +739,7 @@ fn run_menu_bar(
     let training_for_timer = Arc::clone(&training);
     let catalogue_for_timer = Arc::clone(&catalogue_requested);
     let catalogue_window = Rc::clone(&catalogue);
+    let catalogue_asked_aloud = Arc::clone(&catalogue_asked);
     let training_model_path = locate_model(None).unwrap_or_else(|_| "model".into());
     let report_for_timer = Rc::clone(&report);
     let sounds_for_timer = Arc::clone(&sounds_on);
@@ -741,7 +770,9 @@ fn run_menu_bar(
             }
         }
 
-        if catalogue_for_timer.swap(false, Ordering::Relaxed) {
+        if catalogue_asked_aloud.swap(false, Ordering::Relaxed)
+            || catalogue_for_timer.swap(false, Ordering::Relaxed)
+        {
             catalogue_window.show(&commands::catalogue());
         }
         if learn_for_timer.swap(false, Ordering::Relaxed) {
@@ -991,9 +1022,14 @@ fn main() -> Result<()> {
     let worker_log_ignored = Arc::clone(&log_ignored);
     let worker_sounds = Arc::clone(&play_sounds);
     let worker_acted = Arc::clone(&acted);
+    let microphone = config.microphone();
+    let save_recordings = config.save_recordings;
+    let catalogue_asked = Arc::new(AtomicBool::new(false));
+    let worker_catalogue = Arc::clone(&catalogue_asked);
     let voice_reply = config.speak.then(|| VoiceReply {
         voice: config.voice(),
         rate: config.speech_rate(),
+        device: config.speaker(),
     });
     std::thread::spawn(move || {
         if let Err(e) = listen_and_obey(Listening {
@@ -1007,6 +1043,9 @@ fn main() -> Result<()> {
             active: worker_active,
             acted: worker_acted,
             voice_reply,
+            microphone,
+            show_catalogue: worker_catalogue,
+            save_recordings,
         }) {
             eprintln!("Error: {e:#}");
             std::process::exit(1);
@@ -1022,5 +1061,5 @@ fn main() -> Result<()> {
         }
     }
 
-    run_menu_bar(active, play_sounds, log_ignored, training, acted)
+    run_menu_bar(active, play_sounds, log_ignored, training, acted, catalogue_asked)
 }

@@ -11,12 +11,40 @@ Control your Mac by speaking Spanish. Always listening, entirely offline.
 Lives in the menu bar as a small face — eye open while listening, eye shut
 when paused. No Dock icon.
 
-The menu holds one toggle (Pausar / Escuchar), a **Registro** submenu with
-*Aprender* and *Ver el registro*, *Preferencias…*, and Salir.
+The menu holds one toggle (Pausar / Escuchar), *Aprender del registro…*,
+*Preferencias…*, *Ver el registro*, and Salir.
 
 The icon is a template image drawn once as SVG, rendered for the menu bar
 at run time and for the app at build time, so the two cannot drift apart.
 macOS tints it from its alpha, black on a light bar and white on a dark one.
+
+## Questions
+
+Everything else in the vocabulary *does* something; these *return*
+something, which is the whole reason for speaking aloud — the answer is the
+point and there is nowhere else to put it.
+
+```
+«minion, ¿qué hora es?»            → «Las dos y veinte»
+«minion, ¿qué día es hoy?»
+«minion, ¿cuánta batería queda?»   → «68% y cargando»
+«minion, ¿qué volumen tengo?»
+«minion, ¿me oyes?»                → «Sí, te escucho»
+«minion, ¿qué he dicho hoy?»       → «40 órdenes hoy, y 3 que no entendí»
+```
+
+It stays quiet for commands. Opening Chrome is something you can see, and
+announcing it would be noise arriving after the fact — the icon's blink
+already says it was heard. Answers are short and plain: a reply heard forty
+times a day should not be trying to entertain.
+
+While speaking, Minion stops acting on what it hears and discards whatever
+arrived meanwhile. It listens continuously, so its own voice comes straight
+back in through the microphone.
+
+Uses the system synthesiser and whichever Spanish voice macOS has, which
+costs nothing to ship and is good enough to settle the harder question of
+*when* to speak. Turn it off in preferences, or set `speak = false`.
 
 ## Preferences
 
@@ -24,19 +52,12 @@ A native window, opened from the menu. It covers what is worth changing
 without reading documentation:
 
 - sound on running a command
-- whether other people's speech is written to the log
+- whether what other people say is written to the log, or only counted
 - starting at login
 - **sensibilidad** — how sure Minion must be before acting, as words rather
   than a number: nobody wants to type 0.72, they want it to be less touchy
 - **pausa que cierra una frase** — longer if it cuts you off while thinking
 - **liberar memoria** — idle minutes before the model is released
-- **atajo para pausar y reanudar** — ⌥Space by default
-
-That last one earns its place: pausing by voice is easy, but getting
-attention back is not, since a paused microphone hears nothing. The
-shortcut is watched with a global event monitor rather than registered as a
-hotkey, so the keystroke still reaches whatever has focus — Minion listens
-for it without taking it away from anything else.
 
 The controls report by being read rather than by calling back. AppKit
 delivers actions to an Objective-C target, which from Rust means declaring
@@ -60,17 +81,14 @@ Spanish recognition with hands-free listening.
 ## Quick start
 
 ```bash
-./download-model.sh    # ~640 MB, once
-./install.sh           # builds, installs to /Applications, starts at login
+./install.sh    # builds, installs to /Applications, starts at login
 ```
 
-Or to run it without installing:
-
-```bash
-./download-model.sh
-cargo build --release
-./target/release/minion
-```
+The speech models (~670 MB) are downloaded on first run into Application
+Support rather than carried inside the app, which is 29 MB. They never
+change, and keeping them outside means reinstalling does not fetch them
+again. `./download-model.sh` gets them ahead of time if you would rather
+not wait on the first launch.
 
 Grant microphone access when asked. For commands that press keys (copy,
 save, close tab) also grant Accessibility under System Settings → Privacy
@@ -218,7 +236,7 @@ Other phrases have no global meaning at all, and only work in one place:
 
 | Music (Spotify) | Minion itself |
 |---|---|
-| pon la música · para la música | deja de escuchar · duérmete · silénciate · apágate · cállate |
+| pon la música · para la música | deja de escuchar |
 | siguiente canción · canción anterior | (resume from the menu bar) |
 
 Naming something searches for it: «minion, pon la canción Vértigo» —
@@ -325,8 +343,9 @@ Every phrase Minion failed to understand is in the log. `minion learn`
 reads them back, works out what each was probably meant to be, and offers
 to add it as an alias:
 
-From the menu bar: **Aprender del registro…**. It shows what it found and
-asks before changing anything.
+From the menu bar: **Registro → Aprender**. It opens a window with what it
+found — a real window with a close button, not a dialog that blocks
+everything until dismissed — and asks before changing anything.
 
 From a terminal:
 
@@ -379,6 +398,7 @@ rebuilding.
 
 ## Not done yet
 
+- **A tighter memory floor.** 405 MB idle is what ONNX Runtime gives back.
 - **Real VAD.** Energy cannot tell speech from a door slam, and background
   music keeps it triggering. Silero VAD is the next step.
 

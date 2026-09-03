@@ -12,7 +12,7 @@ core-graphics = "0.25.0"
 cpal = "0.18.2"
 libc = "0.2.189"
 objc2 = "0.6.4"
-objc2-app-kit = { version = "0.3.2", features = ["NSWindow", "NSButton", "NSSlider", "NSTextField", "NSControl", "NSView", "NSResponder", "NSApplication", "NSGraphics", "NSText", "NSFont", "NSColor", "NSCell", "NSActionCell", "NSStringDrawing", "NSWorkspace", "NSRunningApplication", "NSImage", "NSPanel", "NSEvent", "NSParagraphStyle", "NSScrollView", "NSClipView"] }
+objc2-app-kit = { version = "0.3.2", features = ["NSWindow", "NSButton", "NSSlider", "NSTextField", "NSControl", "NSView", "NSResponder", "NSApplication", "NSGraphics", "NSText", "NSFont", "NSColor", "NSCell", "NSActionCell", "NSStringDrawing", "NSWorkspace", "NSRunningApplication", "NSImage", "NSPanel", "NSEvent", "NSParagraphStyle", "NSScrollView", "NSClipView", "NSPopUpButton", "NSMenu", "NSMenuItem"] }
 objc2-foundation = { version = "0.3.2", features = ["NSTimer", "NSDate", "NSRunLoop", "block2"] }
 ort = "2.0.0-rc.13"
 parakeet-rs = "0.3.7"

@@ -45,7 +45,25 @@ pub fn default_voice() -> Option<String> {
 /// without this it would hear itself, transcribe what it said and possibly
 /// act on it. Waiting rather than speaking in the background is what makes
 /// the flag reliable — it comes down exactly when the sound stops.
-pub fn say(text: &str, voice: Option<&str>, rate: u32, deaf: &AtomicBool) {
+/// The output devices available, by name.
+pub fn output_names() -> Vec<String> {
+    use cpal::traits::{DeviceTrait, HostTrait};
+    let Ok(devices) = cpal::default_host().output_devices() else {
+        return Vec::new();
+    };
+    devices
+        .filter_map(|device| device.description().ok())
+        .map(|description| description.name().to_string())
+        .collect()
+}
+
+pub fn say(
+    text: &str,
+    voice: Option<&str>,
+    rate: u32,
+    device: Option<&str>,
+    deaf: &AtomicBool,
+) {
     if text.is_empty() {
         return;
     }
@@ -54,6 +72,9 @@ pub fn say(text: &str, voice: Option<&str>, rate: u32, deaf: &AtomicBool) {
     let mut command = Command::new("/usr/bin/say");
     if let Some(voice) = voice {
         command.arg("-v").arg(voice);
+    }
+    if let Some(device) = device.filter(|name| !name.trim().is_empty()) {
+        command.arg("-a").arg(device);
     }
     command.arg("-r").arg(rate.to_string()).arg(text);
     let _ = command.status();
@@ -89,7 +110,7 @@ mod tests {
     #[test]
     fn saying_nothing_does_nothing() {
         let deaf = AtomicBool::new(false);
-        say("", None, DEFAULT_RATE, &deaf);
+        say("", None, DEFAULT_RATE, None, &deaf);
         assert!(!deaf.load(Ordering::Relaxed), "should not go deaf for silence");
     }
 }

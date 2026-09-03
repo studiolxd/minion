@@ -17,8 +17,8 @@ use std::cell::Cell;
 use objc2::rc::Retained;
 use objc2::MainThreadMarker;
 use objc2_app_kit::{
-    NSApplication, NSBackingStoreType, NSButton, NSColor, NSFont, NSLineBreakMode, NSScrollView,
-    NSSlider, NSTextField, NSView, NSWindow, NSWindowStyleMask,
+    NSApplication, NSBackingStoreType, NSButton, NSColor, NSFont, NSLineBreakMode, NSPopUpButton,
+    NSScrollView, NSSlider, NSTextField, NSView, NSWindow, NSWindowStyleMask,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
@@ -30,10 +30,18 @@ const WIDTH: f64 = 380.0;
 /// The layout runs downwards from the top, so the window has to be as tall
 /// as everything in it plus a margin; too short and the final line simply
 /// falls off, which is what it did.
-/// Tall enough for everything plus a bottom margin matching the top one.
+/// Height of the laid-out content.
+///
 /// `everything_fits_in_the_window` checks it, since a control that lands
 /// below the edge does not look like a bug — it simply is not there.
-const HEIGHT: f64 = 686.0;
+const HEIGHT: f64 = 980.0;
+
+/// Height of the window itself.
+///
+/// The content is taller than a laptop screen, so the window shows part of
+/// it and scrolls. Sized to leave room for the menu bar and the Dock
+/// rather than filling the display.
+const WINDOW_HEIGHT: f64 = 660.0;
 const MARGIN: f64 = 22.0;
 
 /// A slider's range and the setting behind it.
@@ -52,6 +60,65 @@ impl Dial {
             now
         })
     }
+}
+
+/// A dropdown of device names, with "follow the system" first.
+struct Chooser {
+    control: Retained<NSPopUpButton>,
+    /// The names behind the entries, in the same order. The first is empty,
+    /// meaning follow the system.
+    values: Vec<String>,
+    last: Cell<isize>,
+}
+
+impl Chooser {
+    /// The name chosen, or `None` for the system default.
+    fn chosen(&self) -> Option<String> {
+        let index = self.control.indexOfSelectedItem().max(0) as usize;
+        self.values
+            .get(index)
+            .filter(|name| !name.is_empty())
+            .cloned()
+    }
+
+    fn changed(&self) -> Option<Option<String>> {
+        let now = self.control.indexOfSelectedItem();
+        (now != self.last.get()).then(|| {
+            self.last.set(now);
+            self.chosen()
+        })
+    }
+}
+
+/// Builds a device dropdown.
+///
+/// "Automático" first and selected unless the configuration names one, so
+/// the ordinary case — follow whatever the Mac is using — needs no thought.
+fn chooser(
+    mtm: MainThreadMarker,
+    y: f64,
+    names: Vec<String>,
+    current: Option<String>,
+) -> Chooser {
+    let control = NSPopUpButton::new(mtm);
+    control.setFrame(NSRect::new(
+        NSPoint::new(MARGIN, y),
+        NSSize::new(WIDTH - MARGIN * 2.0, 26.0),
+    ));
+
+    let mut values = vec![String::new()];
+    control.addItemWithTitle(&NSString::from_str("Automático (el del sistema)"));
+    for name in names {
+        control.addItemWithTitle(&NSString::from_str(&name));
+        values.push(name);
+    }
+
+    let selected = current
+        .and_then(|wanted| values.iter().position(|name| *name == wanted))
+        .unwrap_or(0) as isize;
+    control.selectItemAtIndex(selected);
+
+    Chooser { control, values, last: Cell::new(selected) }
 }
 
 /// A checkbox and the value it last had.
@@ -86,6 +153,10 @@ pub struct Preferences {
     log_voices: Switch,
     at_login: Switch,
     speak: Switch,
+    wake_word: Retained<NSTextField>,
+    last_wake_word: std::cell::RefCell<String>,
+    microphone: Chooser,
+    speaker: Chooser,
     sensitivity: Dial,
     pause: Dial,
     memory: Dial,
@@ -232,7 +303,7 @@ impl Preferences {
         let settings = config::load();
 
         let window = {
-            let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(WIDTH, HEIGHT));
+            let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(WIDTH, WINDOW_HEIGHT));
             let style = NSWindowStyleMask::Titled | NSWindowStyleMask::Closable;
             let window = unsafe {
                 NSWindow::initWithContentRect_styleMask_backing_defer(
@@ -252,13 +323,30 @@ impl Preferences {
             window
         };
 
-        // Laid out from the top down, which is how it reads.
-        // Laid out downwards from the top, leaving MARGIN clear at the
-        // bottom: the last control was sitting on the window's edge.
-        let mut y = HEIGHT - 52.0;
-        let content = window.contentView().expect("a window has a content view");
+        // Everything goes on a canvas as tall as the layout needs, and the
+        // window scrolls over it. Laying out to fit the window instead
+        // would mean dropping settings or cramming them.
+        let canvas = NSView::new(mtm);
+        canvas.setFrame(NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(WIDTH - 16.0, HEIGHT),
+        ));
 
-        let add = |view: &NSView| content.addSubview(view);
+        let scroll = NSScrollView::new(mtm);
+        scroll.setFrame(NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(WIDTH, WINDOW_HEIGHT),
+        ));
+        scroll.setHasVerticalScroller(true);
+        scroll.setDrawsBackground(false);
+        scroll.setDocumentView(Some(&canvas));
+        if let Some(content) = window.contentView() {
+            content.addSubview(&scroll);
+        }
+
+        // Laid out downwards from the top of the canvas.
+        let mut y = HEIGHT - 52.0;
+        let add = |view: &NSView| canvas.addSubview(view);
 
         add(&label(
             mtm,
@@ -312,6 +400,34 @@ impl Preferences {
             true,
         ));
         y -= 34.0;
+
+        add(&label(
+            mtm,
+            "Palabra clave",
+            NSRect::new(NSPoint::new(MARGIN, y), NSSize::new(200.0, 18.0)),
+            false,
+        ));
+        y -= 28.0;
+        let wake_word = NSTextField::new(mtm);
+        let current_wake = settings
+            .wake_words
+            .first()
+            .cloned()
+            .unwrap_or_else(|| crate::commands::DEFAULT_WAKE_WORDS[0].to_string());
+        wake_word.setStringValue(&NSString::from_str(&current_wake));
+        wake_word.setFrame(NSRect::new(
+            NSPoint::new(MARGIN, y),
+            NSSize::new(170.0, 24.0),
+        ));
+        add(&wake_word);
+        y -= 22.0;
+        add(&label(
+            mtm,
+            "Toda orden empieza por ella. Elige algo que no digas por casualidad.",
+            NSRect::new(NSPoint::new(MARGIN, y), NSSize::new(WIDTH - MARGIN * 2.0, 16.0)),
+            true,
+        ));
+        y -= 40.0;
 
         add(&label(
             mtm,
@@ -424,6 +540,52 @@ impl Preferences {
 
         add(&label(
             mtm,
+            "Dispositivos",
+            NSRect::new(NSPoint::new(MARGIN, y), NSSize::new(200.0, 18.0)),
+            true,
+        ));
+        y -= 26.0;
+        add(&label(
+            mtm,
+            "Micrófono",
+            NSRect::new(NSPoint::new(MARGIN, y), NSSize::new(200.0, 18.0)),
+            false,
+        ));
+        y -= 28.0;
+        let microphone = chooser(
+            mtm,
+            y,
+            crate::audio::input_names(),
+            settings.microphone(),
+        );
+        add(&microphone.control);
+        y -= 34.0;
+
+        add(&label(
+            mtm,
+            "Altavoz",
+            NSRect::new(NSPoint::new(MARGIN, y), NSSize::new(200.0, 18.0)),
+            false,
+        ));
+        y -= 28.0;
+        let speaker = chooser(
+            mtm,
+            y,
+            crate::speech::output_names(),
+            settings.speaker(),
+        );
+        add(&speaker.control);
+        y -= 22.0;
+        add(&label(
+            mtm,
+            "En automático cambian con el Mac; fíjalos para que no lo hagan.",
+            NSRect::new(NSPoint::new(MARGIN, y), NSSize::new(WIDTH - MARGIN * 2.0, 16.0)),
+            true,
+        ));
+        y -= 40.0;
+
+        add(&label(
+            mtm,
             "Tu voz",
             NSRect::new(NSPoint::new(MARGIN, y), NSSize::new(200.0, 18.0)),
             true,
@@ -467,6 +629,10 @@ impl Preferences {
             log_voices,
             at_login,
             speak,
+            wake_word,
+            last_wake_word: std::cell::RefCell::new(current_wake),
+            microphone,
+            speaker,
             sensitivity,
             pause,
             memory,
@@ -528,6 +694,7 @@ impl Preferences {
     /// so the caller can report it.
     pub fn poll(&self) -> bool {
         let mut changed = false;
+        let mut needs_restart = false;
 
         if let Some(on) = self.sounds.toggled() {
             save("sounds", if on { "true" } else { "false" });
@@ -545,6 +712,35 @@ impl Preferences {
         }
         if let Some(on) = self.speak.toggled() {
             save("speak", if on { "true" } else { "false" });
+            changed = true;
+        }
+        // The wake word is read once at startup, so changing it needs a
+        // restart — and an empty one would leave nothing to say.
+        let typed_wake = self.wake_word.stringValue().to_string();
+        let wake_changed = typed_wake.trim() != self.last_wake_word.borrow().trim();
+        if wake_changed && !typed_wake.trim().is_empty() {
+            let word = crate::text::normalise(&typed_wake);
+            // The default carries its own misspellings; anything else is
+            // taken as written.
+            if word == crate::commands::DEFAULT_WAKE_WORDS[0] {
+                save("wake_words", "[]");
+            } else {
+                save("wake_words", &format!("[\"{word}\"]"));
+            }
+            *self.last_wake_word.borrow_mut() = typed_wake;
+            needs_restart = true;
+            changed = true;
+        }
+
+        // Devices need a restart to take effect: the stream is opened once
+        // and the listening loop owns it.
+        if let Some(chosen) = self.microphone.changed() {
+            save("microphone", &format!("\"{}\"", chosen.unwrap_or_default()));
+            needs_restart = true;
+            changed = true;
+        }
+        if let Some(chosen) = self.speaker.changed() {
+            save("speaker", &format!("\"{}\"", chosen.unwrap_or_default()));
             changed = true;
         }
         if let Some(step) = self.sensitivity.moved() {
@@ -576,6 +772,11 @@ impl Preferences {
 
         if changed {
             self.update_readouts();
+        }
+        if needs_restart {
+            crate::actions::show_message(
+                "Reinicia Minion desde el menú para que el cambio surta efecto.",
+            );
         }
         changed
     }
@@ -785,10 +986,12 @@ mod tests {
     fn everything_fits_in_the_window() {
         const STEPS: &[f64] = &[
             26.0, 26.0, 30.0, 26.0, 26.0, 20.0, 34.0, // behaviour
+            26.0, 28.0, 22.0, 40.0, // wake word
             28.0, 26.0, 22.0, 34.0, // sensitivity
             26.0, 22.0, 34.0, // pause
             26.0, 40.0, // memory
             28.0, 22.0, 40.0, // shortcut
+            26.0, 28.0, 34.0, 28.0, 22.0, 40.0, // devices
             28.0, 40.0, // voice
         ];
         let bottom = STEPS.iter().fold(HEIGHT - 52.0, |y, step| y - step);

@@ -20,6 +20,8 @@ pub enum Question {
     Volume,
     Listening,
     Activity,
+    /// What can I say? Opens the list rather than reciting it.
+    Help,
 }
 
 /// Ways of asking each one.
@@ -30,6 +32,8 @@ const ASKED: &[(Question, &[&str])] = &[
     (Question::Volume, &["que volumen tengo", "como esta el volumen"]),
     (Question::Listening, &["me oyes", "me escuchas", "estas ahi"]),
     (Question::Activity, &["que he dicho hoy", "cuantas ordenes llevo"]),
+    (Question::Help, &["que puedes hacer", "que te puedo decir", "ayuda",
+                       "que ordenes hay", "que se decir"]),
 ];
 
 /// Recognises a question, if the sentence is one.
@@ -59,6 +63,9 @@ pub fn answer(question: Question, listening: bool) -> String {
             if listening { "Sí, te escucho." } else { "Estoy en pausa." }.to_string()
         }
         Question::Activity => activity(),
+        // Answered by opening the window: reading forty commands aloud
+        // would be worse than useless.
+        Question::Help => "Te abro la lista.".into(),
     }
 }
 

@@ -89,6 +89,23 @@ pub struct Config {
     /// one, default 0.45.
     pub voice_threshold: Option<f32>,
 
+    /// Which microphone to listen through.
+    ///
+    /// Empty follows the system's default, changing along with it when you
+    /// plug in headphones. Naming one pins it there instead.
+    pub microphone: Option<String>,
+
+    /// Which output device to speak through. Empty uses the system's.
+    pub speaker: Option<String>,
+
+    /// Keep a copy of everything heard, as WAV files.
+    ///
+    /// For working out why recognition behaves oddly. Off by default and
+    /// worth turning off again afterwards: it writes every utterance to
+    /// disk, including anything said nearby.
+    #[serde(default)]
+    pub save_recordings: bool,
+
     /// Whether Minion answers questions out loud.
     ///
     /// Only questions: it stays quiet for commands, since opening Chrome is
@@ -167,6 +184,9 @@ impl Default for Config {
             commands: Vec::new(),
             voice_threshold: None,
             resume_shortcut: None,
+            microphone: None,
+            speaker: None,
+            save_recordings: false,
             speak: true,
             voice: None,
             speech_rate: None,
@@ -321,6 +341,16 @@ impl Config {
                 ),
             })
             .collect()
+    }
+
+    /// The microphone to use, or none to follow the system.
+    pub fn microphone(&self) -> Option<String> {
+        self.microphone.clone().filter(|name| !name.trim().is_empty())
+    }
+
+    /// The output device to speak through, or none for the system's.
+    pub fn speaker(&self) -> Option<String> {
+        self.speaker.clone().filter(|name| !name.trim().is_empty())
     }
 
     /// The voice to speak with, or none to stay with the system default.

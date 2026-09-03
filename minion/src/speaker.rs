@@ -211,6 +211,158 @@ mod tests {
             .collect()
     }
 
+    /// Reads a 16 kHz mono WAV written by `say`, for the tests below.
+    fn read_wav(path: &str) -> Option<Vec<f32>> {
+        let bytes = std::fs::read(path).ok()?;
+        // Skip the header and read little-endian 16-bit samples. Enough
+        // for files this test generates itself.
+        let start = 44;
+        Some(
+            bytes[start..]
+                .chunks_exact(2)
+                .map(|pair| i16::from_le_bytes([pair[0], pair[1]]) as f32 / 32768.0)
+                .collect(),
+        )
+    }
+
+    /// Two sentences from each of two system voices.
+    ///
+    /// Synthetic, but it is the property that matters: the same voice
+    /// saying different words must look more alike than two voices saying
+    /// the same words. Without this, an embedding that merely exists looks
+    /// fine while failing to recognise anybody.
+    #[test]
+    fn tells_one_voice_from_another() {
+        let Some(mut model) = model_if_present() else {
+            return;
+        };
+        let files = [
+            "/tmp/claude-501/voces/monica1.wav",
+            "/tmp/claude-501/voces/monica2.wav",
+            "/tmp/claude-501/voces/eddy1.wav",
+            "/tmp/claude-501/voces/eddy2.wav",
+        ];
+        let mut voices = Vec::new();
+        for file in files {
+            let Some(samples) = read_wav(file) else {
+                return; // not generated on this machine; nothing to check
+            };
+            let Some(embedding) = model.embed(&samples) else {
+                return;
+            };
+            voices.push(embedding);
+        }
+
+        let same_a = similarity(&voices[0], &voices[1]); // Mónica vs Mónica
+        let same_b = similarity(&voices[2], &voices[3]); // Eddy vs Eddy
+        let different = similarity(&voices[0], &voices[2]); // Mónica vs Eddy
+
+        println!("  same voice:  {same_a:.3} and {same_b:.3}");
+        println!("  other voice: {different:.3}");
+
+        assert!(
+            same_a > different && same_b > different,
+            "a voice must look more like itself ({same_a:.2}, {same_b:.2}) \
+             than like someone else ({different:.2})"
+        );
+        assert!(
+            same_a > 0.5 && same_b > 0.5,
+            "the same voice should score well above the threshold, got \
+             {same_a:.2} and {same_b:.2}"
+        );
+    }
+
+    /// The same recording at 48 kHz, brought down the way the microphone
+    /// path does it, must still look like the same voice.
+    ///
+    /// This is the property the live path depends on and the one that was
+    /// missing: transcription tolerates a crude downsample, but speaker
+    /// recognition does not — the detail that tells voices apart is
+    /// exactly what aliasing destroys.
+    #[test]
+    fn downsampling_preserves_who_is_speaking() {
+        let Some(mut model) = model_if_present() else {
+            return;
+        };
+        let (Some(at_16k), Some(at_48k)) = (
+            read_wav("/tmp/claude-501/voces/m16.wav"),
+            read_wav("/tmp/claude-501/voces/m48.wav"),
+        ) else {
+            return;
+        };
+
+        let brought_down = crate::audio::to_16k_mono(&at_48k, 1, 48_000);
+        let (Some(direct), Some(resampled)) =
+            (model.embed(&at_16k), model.embed(&brought_down))
+        else {
+            return;
+        };
+
+        let alike = similarity(&direct, &resampled);
+        println!("  same audio, resampled: {alike:.3}");
+        assert!(
+            alike > 0.8,
+            "resampling should not change who is speaking, got {alike:.2}"
+        );
+    }
+
+    /// Compares a stored profile against known voices, to see what it is.
+    ///
+    /// Only runs when a broken profile has been set aside for study; it is
+    /// a diagnostic, not a property of the program.
+    #[test]
+    fn inspect_a_saved_profile() {
+        let Some(home) = std::env::var("HOME").ok() else { return };
+        let path = format!("{home}/Library/Application Support/Minion/voice.txt.roto");
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let stored: Vec<f32> = contents
+            .lines()
+            .last()
+            .unwrap_or("")
+            .split_whitespace()
+            .filter_map(|n| n.parse().ok())
+            .collect();
+        if stored.len() != 192 {
+            return;
+        }
+        let Some(mut model) = model_if_present() else { return };
+
+        for name in ["monica1", "monica2", "eddy1", "eddy2"] {
+            let Some(samples) = read_wav(&format!("/tmp/claude-501/voces/{name}.wav")) else {
+                continue;
+            };
+            if let Some(embedding) = model.embed(&samples) {
+                println!("  profile vs {name}: {:.3}", similarity(&stored, &embedding));
+            }
+        }
+    }
+
+    /// Quiet audio must still identify the speaker.
+    ///
+    /// A microphone across a desk is far quieter than a synthesised file,
+    /// and if the embedding moved with loudness, enrolment and daily use
+    /// would never agree.
+    #[test]
+    fn loudness_does_not_change_who_is_speaking() {
+        let Some(mut model) = model_if_present() else { return };
+        let Some(loud) = read_wav("/tmp/claude-501/voces/monica1.wav") else { return };
+
+        for gain in [0.5, 0.1, 0.02] {
+            let quiet: Vec<f32> = loud.iter().map(|s| s * gain).collect();
+            let (Some(a), Some(b)) = (model.embed(&loud), model.embed(&quiet)) else {
+                return;
+            };
+            let alike = similarity(&a, &b);
+            println!("  at {:>4.0}% volume: {alike:.3}", gain * 100.0);
+            assert!(
+                alike > 0.8,
+                "volume should not change identity, got {alike:.2} at {gain}"
+            );
+        }
+    }
+
     #[test]
     fn the_model_produces_an_embedding() {
         let Some(mut model) = model_if_present() else {
