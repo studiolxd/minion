@@ -28,14 +28,16 @@ use core_foundation::array::{CFArrayGetCount, CFArrayGetTypeID, CFArrayGetValueA
 use core_foundation::base::{CFGetTypeID, CFRelease, CFRetain, CFTypeRef, TCFType};
 use core_foundation::boolean::CFBoolean;
 use core_foundation::string::{CFString, CFStringRef};
-use objc2_app_kit::NSWorkspace;
+use objc2_app_kit::{NSApplicationActivationPolicy, NSWorkspace};
 
 /// Attribute and action names, spelled as the framework spells them.
 pub const ROLE: &str = "AXRole";
+pub const TITLE: &str = "AXTitle";
 pub const WINDOWS: &str = "AXWindows";
 pub const CHILDREN: &str = "AXChildren";
 pub const FOCUSED: &str = "AXFocused";
 pub const FOCUSED_UI_ELEMENT: &str = "AXFocusedUIElement";
+pub const RAISE: &str = "AXRaise";
 
 /// The roles that can be typed into. Deliberately short: a combo box or a
 /// web area may or may not take text, and focusing one that does not is
@@ -59,6 +61,7 @@ extern "C" {
         attribute: CFStringRef,
         value: CFTypeRef,
     ) -> AXError;
+    fn AXUIElementPerformAction(element: AXUIElementRef, action: CFStringRef) -> AXError;
 }
 
 /// Whether this process may use the Accessibility API at all.
@@ -158,6 +161,10 @@ impl Element {
         self.text(ROLE)
     }
 
+    pub fn title(&self) -> Option<String> {
+        self.text(TITLE)
+    }
+
     /// Whether this is something text can be typed into.
     pub fn is_text_input(&self) -> bool {
         self.role().is_some_and(|role| TEXT_ROLES.contains(&role.as_str()))
@@ -174,6 +181,19 @@ impl Element {
             Ok(())
         } else {
             Err(format!("AXFocused refused ({status})"))
+        }
+    }
+
+    /// Brings this window to the front of its own application's windows.
+    /// Which application is in front is a separate question — see
+    /// `actions::open_app`.
+    pub fn raise(&self) -> Result<(), String> {
+        let action = CFString::new(RAISE);
+        let status = unsafe { AXUIElementPerformAction(self.0, action.as_concrete_TypeRef()) };
+        if status == SUCCESS {
+            Ok(())
+        } else {
+            Err(format!("AXRaise refused ({status})"))
         }
     }
 }
@@ -211,6 +231,28 @@ pub fn frontmost() -> Option<RunningApp> {
     })
 }
 
+/// Every ordinary application running right now, in no particular order.
+///
+/// Accessory processes are left out: they have no windows anybody asks to
+/// be taken to, and walking them is time spent on nothing.
+pub fn running_apps() -> Vec<RunningApp> {
+    if cfg!(test) {
+        return Vec::new();
+    }
+    let mut found = Vec::new();
+    for app in NSWorkspace::sharedWorkspace().runningApplications() {
+        if app.activationPolicy() != NSApplicationActivationPolicy::Regular {
+            continue;
+        }
+        found.push(RunningApp {
+            name: app.localizedName().map(|n| n.to_string()).unwrap_or_default(),
+            bundle_id: app.bundleIdentifier().map(|id| id.to_string()),
+            pid: app.processIdentifier(),
+        });
+    }
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,10 +261,11 @@ mod tests {
     fn the_api_is_closed_off_in_tests() {
         // The guard that keeps a test run from reaching into whatever
         // windows are open on the machine running it. Everything else in
-        // this file needs an `Element`, and these are the only two ways
+        // this file needs an `Element`, and these are the only three ways
         // to get one.
         assert!(!trusted());
         assert!(application(1).is_none());
         assert!(frontmost().is_none());
+        assert!(running_apps().is_empty());
     }
 }

@@ -68,6 +68,10 @@ pub enum Question {
     CalendarTomorrow,
     /// "¿cuál es mi próxima reunión?"
     NextMeeting,
+    /// "ve a la ventana de Marca" — the name of the window to be taken
+    /// to. Acts and then says where it went, the same way a reminder is
+    /// created and then read back: there is nothing to answer otherwise.
+    Window(String),
     /// "abre la carpeta Dev" when more than one thing on the machine
     /// answers to that name: the path of the best of them. Opened and
     /// named out loud, since the choice cannot be put to the user from
@@ -128,6 +132,15 @@ fn parse_variable(rest: &str) -> Option<Question> {
     if rest.contains("recuerda") {
         if let Some((text, due, when)) = reminders::parse_reminder(rest, Local::now()) {
             return Some(Question::Reminder(text, due, when));
+        }
+    }
+    // "ve a la ventana de Marca": the window is named, not listed, so it
+    // is parsed the same way a duration is. Gated on the word itself, so
+    // every other sentence about a window — closing one, minimising one —
+    // reaches this file no differently than before.
+    if rest.contains("ventana") {
+        if let Some(question) = crate::targets::asked_about_a_window(rest) {
+            return Some(question);
         }
     }
     if rest.contains("evento") {
@@ -243,6 +256,7 @@ pub fn answer(question: Question, listening: bool) -> String {
         Question::CalendarTomorrow => {
             calendar_answer(reminders::events_tomorrow(Local::now()), "No tienes nada mañana.")
         }
+        Question::Window(name) => crate::targets::go_to_window(&name),
         Question::OpenTarget(path) => crate::targets::open_target(&path),
         Question::NotFound(name) => format!("No encuentro {name}."),
         Question::NextMeeting => match reminders::next_meeting(Local::now()) {

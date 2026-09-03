@@ -621,7 +621,7 @@ the Web API and an OAuth token, which is a different project.
 A known command always wins over a title, so "pon la canción anterior"
 goes back one rather than searching for a song called "anterior".
 
-### Carpetas y archivos por su nombre
+### Carpetas, archivos y ventanas por su nombre
 
 The commands above are fixed phrases. These take a name that only exists
 on this machine, so they are looked up rather than listed:
@@ -631,9 +631,11 @@ on this machine, so they are looked up rather than listed:
 «minion, ve a la carpeta Descargas»     → the standard folders answer outright
 «minion, abre el archivo informe septiembre»
 «minion, abre el documento presupuesto»
+«minion, ve a la ventana del correo»    → raises that window and switches to it
+«minion, cambia a la ventana de Marca»
 ```
 
-They are found with Spotlight, scoped to your home folder, one search
+Files and folders are found with Spotlight, scoped to your home folder, one search
 term per word — so «informe septiembre» reaches "Informe de septiembre
 2026.pdf". An exact name beats one that starts with what you said, which
 beats one that merely contains it; a folder wins when you said *carpeta*;
@@ -642,6 +644,11 @@ and the insides of application bundles are never answers. When two things
 of the same name sit equally deep, the nearer-to-hand one is opened *and
 named out loud* — «Abro Dev en Desarrollo» — so a wrong guess is obvious
 straight away. Nothing found: «No encuentro Dev».
+
+Windows are matched on their titles, then on the application's own name,
+through the Accessibility API — the frontmost application first, then
+everything else that is running. A title heard the way it sounds still
+reaches its window, the same phonetic path application names use.
 
 ## The log
 
