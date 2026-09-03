@@ -703,9 +703,11 @@ fn dictation_text(transcript: &str) -> Option<String> {
         return None;
     }
     let text = words[2..].join(" ");
-    // "pon la música" is a command, not a request to type "la música".
-    // Requiring some length keeps short phrases out of dictation.
-    (text.chars().count() >= 4).then_some(text)
+    // What the old four-character floor was guarding against — "pon la
+    // música" becoming a request to type "la música" — is now handled by
+    // the verb list, which holds no verb that opens a command as well.
+    // Any text at all is text: "minion escribe sí" means sí.
+    (!text.trim().is_empty()).then_some(text)
 }
 
 /// The browser in front, if the application in front is one.
@@ -1601,6 +1603,16 @@ mod tests {
         // Accents and capitals survive: the text comes from the original
         // transcript, not the normalised form used for matching.
         types("Minion escribe Señor Muñoz", "Señor Muñoz");
+    }
+
+    #[test]
+    fn a_short_dictation_is_still_a_dictation() {
+        // Four characters used to be the floor, so this was unrecognised.
+        types("Minion escribe sí", "sí");
+        types("Minion escribe no", "no");
+        // What that floor was guarding against still holds: a verb that
+        // also opens commands is not a dictation verb.
+        assert_eq!(decision("Minion pon la música."), Decision::Run("reproducir"));
     }
 
     #[test]
