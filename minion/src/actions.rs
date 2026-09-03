@@ -58,6 +58,11 @@ pub mod key {
     pub const RIGHT: u16 = 124;
     pub const DOWN: u16 = 125;
     pub const UP: u16 = 126;
+    /// The physical key that reads "=" unshifted and "+" shifted — used
+    /// unshifted for a browser's "zoom in", which binds to ⌘= rather than
+    /// ⌘+ even though the menu shows a plus sign.
+    pub const EQUALS: u16 = 24;
+    pub const MINUS: u16 = 27;
 }
 
 /// Parses a shortcut such as "cmd-shift-b" into a key and its modifiers.
@@ -136,6 +141,7 @@ const NAMED: &[(&str, u16)] = &[
         ("f1", 122), ("f2", 120), ("f3", 99), ("f4", 118), ("f5", 96),
         ("f6", 97), ("f7", 98), ("f8", 100), ("f9", 101), ("f10", 109),
     ("f11", 103), ("f12", 111),
+    ("equals", key::EQUALS), ("minus", key::MINUS),
 ];
 
 /// Modifier keys held during a keystroke.
@@ -539,6 +545,12 @@ mod tests {
             Some((key::LEFT, mods))
         });
         assert_eq!(parse_shortcut("f5"), Some((96, Mods::NONE)));
+    }
+
+    #[test]
+    fn reads_the_zoom_shortcuts_a_browser_binds() {
+        assert_eq!(parse_shortcut("cmd-equals"), Some((key::EQUALS, Mods::CMD)));
+        assert_eq!(parse_shortcut("cmd-minus"), Some((key::MINUS, Mods::CMD)));
     }
 
     #[test]

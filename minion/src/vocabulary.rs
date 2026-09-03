@@ -28,6 +28,7 @@ use serde::Deserialize;
 use crate::actions;
 use crate::commands::{Action, App, Command, ContextualCommand, Site};
 use crate::config::Config;
+use crate::system;
 use crate::text::normalise;
 
 /// The files built into the binary, in load order.
@@ -64,6 +65,22 @@ const NAMED_ACTIONS: &[(&str, Action)] = &[
         Action::Script("tell application \"Spotify\" to previous track"),
     ),
     ("minion:sleep", Action::Sleep),
+    ("window:left", Action::Script(system::WINDOW_LEFT)),
+    ("window:right", Action::Script(system::WINDOW_RIGHT)),
+    ("window:maximize", Action::Script(system::WINDOW_MAXIMIZE)),
+    ("window:other-screen", Action::Script(system::WINDOW_OTHER_SCREEN)),
+    ("system:brightness-up", Action::Script(system::BRIGHTNESS_UP)),
+    ("system:brightness-down", Action::Script(system::BRIGHTNESS_DOWN)),
+    ("system:dark-mode", Action::Script(system::DARK_MODE_TOGGLE)),
+    ("system:wifi-on", Action::Script(system::WIFI_ON)),
+    ("system:wifi-off", Action::Script(system::WIFI_OFF)),
+    ("system:empty-trash", Action::Script(system::EMPTY_TRASH)),
+    ("system:sleep-display", Action::Script(system::SLEEP_DISPLAY)),
+    ("system:screenshot-window", Action::Script(system::SCREENSHOT_WINDOW)),
+    ("clipboard:clear", Action::Script(system::CLIPBOARD_CLEAR)),
+    ("browser:copy-url", Action::Script(system::COPY_URL)),
+    ("browser:duplicate-tab-safari", Action::Script(system::DUPLICATE_TAB_SAFARI)),
+    ("browser:duplicate-tab-chrome", Action::Script(system::DUPLICATE_TAB_CHROME)),
 ];
 
 /// The category given to whatever comes out of `config.toml`.
