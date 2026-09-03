@@ -48,7 +48,28 @@ impl Speaker {
     /// Loads the speaker model from the directory holding the speech model.
     pub fn load(model_dir: &str) -> Result<Self> {
         let path = std::path::Path::new(model_dir).join("speaker.onnx");
+        // Set up like the speech model in main.rs, and for the same
+        // reasons. The defaults open a thread per physical core and keep a
+        // growing arena, which for a 24 MB model asked one short question
+        // at a time is all cost and no benefit: it was most of the process's
+        // twenty-two threads and a slice of the idle memory floor.
         let session = Session::builder()
+            .map_err(|e| anyhow!("{e}"))?
+            .with_intra_threads(1)
+            .map_err(|e| anyhow!("{e}"))?
+            .with_inter_threads(1)
+            .map_err(|e| anyhow!("{e}"))?
+            // Memory patterns pre-allocate for the longest utterance seen
+            // and never give it back.
+            .with_memory_pattern(false)
+            .map_err(|e| anyhow!("{e}"))?
+            // Prepacking keeps a second, faster-to-multiply copy of every
+            // weight alongside the original.
+            .with_config_entry("session.disable_prepacking", "1")
+            .map_err(|e| anyhow!("{e}"))?
+            // Read initializers straight from the mapped file rather than
+            // copying them into the arena first.
+            .with_config_entry("session.use_device_allocator_for_initializers", "1")
             .map_err(|e| anyhow!("{e}"))?
             .commit_from_file(&path)
             .map_err(|e| anyhow!("{e}"))
