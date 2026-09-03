@@ -68,6 +68,9 @@ pub enum Question {
     CalendarTomorrow,
     /// "¿cuál es mi próxima reunión?"
     NextMeeting,
+    /// "lee la última notificación", "¿qué ha llegado?" — how many of
+    /// them to read back. See `notifications.rs`.
+    Notifications(usize),
     /// "ve a la ventana de Marca" — the name of the window to be taken
     /// to. Acts and then says where it went, the same way a reminder is
     /// created and then read back: there is nothing to answer otherwise.
@@ -102,6 +105,10 @@ const ASKED: &[(Question, &[&str])] = &[
     (Question::CalendarToday, &["que tengo hoy"]),
     (Question::CalendarTomorrow, &["que tengo manana"]),
     (Question::NextMeeting, &["cual es mi proxima reunion", "cual es mi siguiente reunion"]),
+    (Question::Notifications(1), &["lee la ultima notificacion", "cual es la ultima notificacion",
+                                  "lee la notificacion"]),
+    (Question::Notifications(3), &["que ha llegado", "que notificaciones tengo",
+                                   "lee las notificaciones", "que me he perdido"]),
     (Question::Help, &["que puedes hacer", "que te puedo decir", "ayuda",
                        "que ordenes hay", "que se decir"]),
 ];
@@ -256,6 +263,7 @@ pub fn answer(question: Question, listening: bool) -> String {
         Question::CalendarTomorrow => {
             calendar_answer(reminders::events_tomorrow(Local::now()), "No tienes nada mañana.")
         }
+        Question::Notifications(count) => crate::notifications::spoken(count),
         Question::Window(name) => crate::targets::go_to_window(&name),
         Question::OpenTarget(path) => crate::targets::open_target(&path),
         Question::NotFound(name) => format!("No encuentro {name}."),

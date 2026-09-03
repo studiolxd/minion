@@ -274,14 +274,33 @@ fn spotlight(query: &str, home: &str) -> Vec<String> {
 /// again. Shared with `notifications.rs`, which shells out for the same
 /// reason.
 pub fn run_bounded(command: &mut Command, timeout: Duration) -> Result<String, String> {
-    use std::io::Read;
+    run_bounded_with_input(command, None, timeout)
+}
+
+/// Same, with something to write to the command's standard input first —
+/// `plutil` reads a property list that way, so nothing has to be written
+/// to a file to be decoded.
+pub fn run_bounded_with_input(
+    command: &mut Command,
+    input: Option<&[u8]>,
+    timeout: Duration,
+) -> Result<String, String> {
+    use std::io::{Read, Write};
 
     let mut child = command
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| e.to_string())?;
+
+    if let Some(input) = input {
+        // Dropped straight after, so the command sees the end of its
+        // input and gets on with it.
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(input);
+        }
+    }
 
     let deadline = Instant::now() + timeout;
     let status = loop {

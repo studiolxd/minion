@@ -29,6 +29,7 @@ mod loopback;
 mod metrics;
 mod microphone;
 mod models;
+mod notifications;
 mod notify;
 mod onboarding;
 mod packs;
@@ -2245,6 +2246,11 @@ fn run_menu_bar(
             // answers::announce_due_timers for the chime, the spoken
             // reply and the notification each one gets.
             answers::announce_due_timers();
+
+            // A spoken «lee la última notificación» that found the
+            // permission missing left a flag here: the dialog can only
+            // be answered on this thread.
+            notifications::offer_disk_access_if_asked();
 
             // Requests left by `minion run "…"` / `minion say "…"`: a
             // second process, typically a keyboard shortcut, asking this
