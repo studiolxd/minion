@@ -357,19 +357,24 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
             // A model loaded for training but with no profile yet means
             // there is nothing to compare against, so anyone is obeyed.
             let known_voice = !voice.profile.is_empty();
-            if let Some(heard) = known_voice
-                .then(|| voice.model.embed(&utterance))
-                .flatten()
-            {
-                let likeness = speaker::similarity(&heard, &voice.profile);
-                if likeness < voice.threshold {
-                    note!("heard    {seconds:.1}s in another voice ({likeness:.2})");
-                    continue;
+            if known_voice {
+                match voice.model.embed(&utterance) {
+                    Some(heard) => {
+                        let likeness = speaker::similarity(&heard, &voice.profile);
+                        if likeness < voice.threshold {
+                            note!("heard    {seconds:.1}s in another voice ({likeness:.2})");
+                            continue;
+                        }
+                        // Logged on the way through as well: without both
+                        // sides, there is no way to tell a threshold that
+                        // is too high from a profile that is wrong.
+                        note!("voice    matched at {likeness:.2}");
+                    }
+                    // Under the hard floor: a cough, a door, half a
+                    // syllable. Let through, but say so, because this is
+                    // the one path where the voice check does not run.
+                    None => note!("voice    {seconds:.1}s too short to check — let through"),
                 }
-                // Logged on the way through as well: without both sides,
-                // there is no way to tell a threshold that is too high
-                // from a profile that is wrong.
-                note!("voice    matched at {likeness:.2}");
             }
         }
 
