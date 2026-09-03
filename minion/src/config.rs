@@ -134,6 +134,14 @@ pub struct Config {
     /// Entirely new commands, bound to a keyboard shortcut.
     #[serde(default)]
     pub commands: Vec<CommandConfig>,
+
+    /// Post a Notification Center banner for answers, timers and blocked
+    /// commands — see `notify.rs`.
+    ///
+    /// On by default: with `speak = false` and the menu bar out of sight,
+    /// a timer or a "¿qué suena?" would otherwise have nowhere to land.
+    #[serde(default = "yes")]
+    pub notifications: bool,
 }
 
 /// A command of your own: what to say, and which keys to press.
@@ -196,6 +204,7 @@ impl Default for Config {
             voice: None,
             speech_rate: None,
             unload_after_minutes: None,
+            notifications: true,
         }
     }
 }
@@ -661,6 +670,14 @@ mod tests {
         assert!(default.sounds);
         let quiet: Config = toml::from_str("sounds = false").expect("should parse");
         assert!(!quiet.sounds);
+    }
+
+    #[test]
+    fn notifications_are_on_by_default_and_can_be_turned_off() {
+        let default: Config = toml::from_str("").expect("empty config should parse");
+        assert!(default.notifications);
+        let quiet: Config = toml::from_str("notifications = false").expect("should parse");
+        assert!(!quiet.notifications);
     }
 
     #[test]
