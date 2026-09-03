@@ -184,6 +184,10 @@ was considered and rejected on that data.
   it and exit — two branches built on `show_message` independently, one
   making it async, the other calling `exit` right after, so the process
   was gone before the `NSAlert` could appear.
+- launchd kills a job's whole process group when its main process exits,
+  so a restart cannot be "spawn `open -n`, then exit": the child dies too.
+  «Reiniciar» asks launchd (`kickstart -k`) when `XPC_SERVICE_NAME` says
+  launchd started us, and only falls back to a `setsid`-detached shell.
 - Never write to the journal from inside the CGEventTap callback: it opens
   a file and takes a lock, which is exactly the kind of slowness that gets
   macOS to disable the tap in the first place. Log outside it, on the run
