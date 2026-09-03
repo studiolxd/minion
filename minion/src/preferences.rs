@@ -30,18 +30,12 @@ const WIDTH: f64 = 380.0;
 /// The layout runs downwards from the top, so the window has to be as tall
 /// as everything in it plus a margin; too short and the final line simply
 /// falls off, which is what it did.
-/// Height of the laid-out content.
+/// The tallest the window will open, scrolling beyond that.
 ///
-/// `everything_fits_in_the_window` checks it, since a control that lands
-/// below the edge does not look like a bug — it simply is not there.
-const HEIGHT: f64 = 980.0;
-
-/// Height of the window itself.
-///
-/// The content is taller than a laptop screen, so the window shows part of
-/// it and scrolls. Sized to leave room for the menu bar and the Dock
-/// rather than filling the display.
-const WINDOW_HEIGHT: f64 = 660.0;
+/// Leaves room for the menu bar and the Dock rather than filling a laptop
+/// screen. The content decides its own height; nothing here has to be
+/// corrected when a setting is added.
+const MAX_WINDOW_HEIGHT: f64 = 640.0;
 const MARGIN: f64 = 22.0;
 
 /// A slider's range and the setting behind it.
@@ -60,6 +54,240 @@ impl Dial {
             now
         })
     }
+}
+
+/// Vertical rhythm, in one place.
+///
+/// Every spacing decision lives here rather than as a number at each call
+/// site. Ten rounds of nudging individual gaps is what made this
+/// necessary: a hint too close to the next control, a section heading too
+/// far from its first item, and no way to fix one without checking all the
+/// others.
+mod spacing {
+    /// Margin at the edges of the window.
+    pub const EDGE: f64 = 22.0;
+    /// From the top of the canvas to the first thing on it.
+    pub const TOP: f64 = 30.0;
+    /// Between two items of the same kind, such as consecutive checkboxes.
+    pub const SIBLING: f64 = 10.0;
+    /// Between an item and the hint that explains it: close, since the
+    /// hint belongs to what is above it.
+    pub const BEFORE_HINT: f64 = 3.0;
+    /// After a hint, before whatever comes next.
+    pub const AFTER_HINT: f64 = 14.0;
+    /// Between one group of settings and the next.
+    pub const GROUP: f64 = 26.0;
+    /// Between a section heading and its first item.
+    pub const AFTER_HEADING: f64 = 10.0;
+    /// Between a field's label and the field itself.
+    pub const AFTER_LABEL: f64 = 6.0;
+
+    /// Heights of the things being placed.
+    pub const HEADING: f64 = 18.0;
+    pub const LABEL: f64 = 18.0;
+    pub const CHECKBOX: f64 = 20.0;
+    pub const FIELD: f64 = 24.0;
+    pub const BUTTON: f64 = 26.0;
+    pub const SLIDER: f64 = 22.0;
+    pub const HINT_LINE: f64 = 15.0;
+}
+
+/// Places controls down a canvas, applying the rhythm above.
+///
+/// Nothing outside this struct decides how far apart two things go, and
+/// the canvas grows to whatever the contents need instead of being a
+/// constant that has to be corrected every time something is added.
+struct Layout {
+    mtm: MainThreadMarker,
+    canvas: Retained<NSView>,
+    width: f64,
+    /// Distance from the top of the canvas to the next free position.
+    used: f64,
+}
+
+impl Layout {
+    fn new(mtm: MainThreadMarker, width: f64) -> Self {
+        Self { mtm, canvas: NSView::new(mtm), width, used: spacing::TOP }
+    }
+
+    fn content_width(&self) -> f64 {
+        self.width - spacing::EDGE * 2.0
+    }
+
+    /// Reserves a strip of the given height and returns its frame.
+    ///
+    /// Positions are measured downwards while laying out and flipped at the
+    /// end, so adding something never moves what came before it.
+    fn place(&mut self, height: f64, indent: f64) -> NSRect {
+        let frame = NSRect::new(
+            NSPoint::new(spacing::EDGE + indent, -(self.used + height)),
+            NSSize::new(self.content_width() - indent, height),
+        );
+        self.used += height;
+        frame
+    }
+
+    fn gap(&mut self, amount: f64) {
+        self.used += amount;
+    }
+
+    fn add(&self, view: &NSView) {
+        self.canvas.addSubview(view);
+    }
+
+    /// A section heading.
+    fn heading(&mut self, text: &str) {
+        if self.used > spacing::TOP {
+            self.gap(spacing::GROUP);
+        }
+        let frame = self.place(spacing::HEADING, 0.0);
+        let view = small_label(self.mtm, text, frame);
+        self.add(&view);
+        self.gap(spacing::AFTER_HEADING);
+    }
+
+    /// A label naming the control that follows it.
+    fn field_label(&mut self, text: &str) {
+        let frame = self.place(spacing::LABEL, 0.0);
+        let view = plain_label(self.mtm, text, frame);
+        self.add(&view);
+        self.gap(spacing::AFTER_LABEL);
+    }
+
+    /// A line of explanation, belonging to whatever is above it.
+    ///
+    /// Its height follows the text, so a long one is not clipped — which is
+    /// what a fixed height did to half of these.
+    fn hint(&mut self, text: &str, indent: f64) {
+        self.gap(spacing::BEFORE_HINT);
+        let width = self.content_width() - indent;
+        let lines = wrapped_lines(text, width);
+        let frame = self.place(spacing::HINT_LINE * lines, indent);
+        let view = small_label(self.mtm, text, frame);
+        self.add(&view);
+        self.gap(spacing::AFTER_HINT);
+    }
+
+    fn checkbox(&mut self, title: &str, on: bool) -> Switch {
+        let frame = self.place(spacing::CHECKBOX, 0.0);
+        let button = unsafe {
+            NSButton::checkboxWithTitle_target_action(
+                &NSString::from_str(title),
+                None,
+                None,
+                self.mtm,
+            )
+        };
+        button.setFrame(frame);
+        self.add(&button);
+        self.gap(spacing::SIBLING);
+        let switch = Switch { control: button, last: Cell::new(on) };
+        switch.show(on);
+        switch
+    }
+
+    /// A slider with its readout to the right.
+    fn slider(&mut self, range: (f64, f64), value: f64, steps: usize) -> Dial {
+        let frame = self.place(spacing::SLIDER, 0.0);
+        const READOUT: f64 = 74.0;
+
+        // Safety: no target and no action, so nothing is called back into.
+        let control = unsafe { NSSlider::sliderWithTarget_action(None, None, self.mtm) };
+        control.setMinValue(range.0);
+        control.setMaxValue(range.1);
+        control.setDoubleValue(value);
+        control.setNumberOfTickMarks(steps as isize);
+        control.setAllowsTickMarkValuesOnly(true);
+        // Report while being dragged, not only on release: the readout
+        // beside the slider is the whole point of having one.
+        control.setContinuous(true);
+        control.setFrame(NSRect::new(
+            frame.origin,
+            NSSize::new(frame.size.width - READOUT, frame.size.height),
+        ));
+        self.add(&control);
+
+        let readout = small_label(
+            self.mtm,
+            "",
+            NSRect::new(
+                NSPoint::new(
+                    frame.origin.x + frame.size.width - READOUT + 6.0,
+                    frame.origin.y + 2.0,
+                ),
+                NSSize::new(READOUT - 6.0, spacing::LABEL),
+            ),
+        );
+        self.add(&readout);
+
+        // Read back rather than trusting what was set: with tick marks the
+        // control snaps to the nearest one, and the difference would look
+        // like the user had moved it.
+        let settled = control.doubleValue();
+        Dial { control, readout, last: Cell::new(settled) }
+    }
+
+    /// A dropdown of device names, with "follow the system" first.
+    fn chooser(&mut self, names: Vec<String>, current: Option<String>) -> Chooser {
+        let frame = self.place(spacing::BUTTON, 0.0);
+        let control = NSPopUpButton::new(self.mtm);
+        control.setFrame(frame);
+
+        let mut values = vec![String::new()];
+        control.addItemWithTitle(&NSString::from_str("Automático (el del sistema)"));
+        for name in names {
+            control.addItemWithTitle(&NSString::from_str(&name));
+            values.push(name);
+        }
+
+        let selected = current
+            .and_then(|wanted| values.iter().position(|name| *name == wanted))
+            .unwrap_or(0) as isize;
+        control.selectItemAtIndex(selected);
+        self.add(&control);
+        self.gap(spacing::SIBLING);
+
+        Chooser { control, values, last: Cell::new(selected) }
+    }
+
+    /// Turns downward positions into the coordinates AppKit wants.
+    fn finish(self) -> (Retained<NSView>, f64) {
+        let height = self.used + spacing::EDGE;
+        self.canvas.setFrame(NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(self.width, height),
+        ));
+        // Everything was placed with negative y measured from the top;
+        // shift it into the canvas now that the height is known.
+        for view in self.canvas.subviews().iter() {
+            let frame = view.frame();
+            view.setFrame(NSRect::new(
+                NSPoint::new(frame.origin.x, height + frame.origin.y),
+                frame.size,
+            ));
+        }
+        (self.canvas, height)
+    }
+}
+
+/// Narrows a frame to a fixed width, keeping its position.
+///
+/// For fields and buttons, which look wrong stretched across the window.
+fn narrow(frame: NSRect, width: f64) -> NSRect {
+    NSRect::new(frame.origin, NSSize::new(width, frame.size.height))
+}
+
+/// Indent for a hint that belongs to a checkbox, lining up with its label.
+const INDENT: f64 = 20.0;
+
+/// How many lines a hint needs at the width it has.
+///
+/// Approximate — 11-point system text averages close to six points per
+/// character — but erring long only leaves a little space, while erring
+/// short cuts words off.
+fn wrapped_lines(text: &str, width: f64) -> f64 {
+    let per_line = (width / 5.9).max(10.0);
+    ((text.chars().count() as f64 / per_line).ceil()).max(1.0)
 }
 
 /// A dropdown of device names, with "follow the system" first.
@@ -88,37 +316,6 @@ impl Chooser {
             self.chosen()
         })
     }
-}
-
-/// Builds a device dropdown.
-///
-/// "Automático" first and selected unless the configuration names one, so
-/// the ordinary case — follow whatever the Mac is using — needs no thought.
-fn chooser(
-    mtm: MainThreadMarker,
-    y: f64,
-    names: Vec<String>,
-    current: Option<String>,
-) -> Chooser {
-    let control = NSPopUpButton::new(mtm);
-    control.setFrame(NSRect::new(
-        NSPoint::new(MARGIN, y),
-        NSSize::new(WIDTH - MARGIN * 2.0, 26.0),
-    ));
-
-    let mut values = vec![String::new()];
-    control.addItemWithTitle(&NSString::from_str("Automático (el del sistema)"));
-    for name in names {
-        control.addItemWithTitle(&NSString::from_str(&name));
-        values.push(name);
-    }
-
-    let selected = current
-        .and_then(|wanted| values.iter().position(|name| *name == wanted))
-        .unwrap_or(0) as isize;
-    control.selectItemAtIndex(selected);
-
-    Chooser { control, values, last: Cell::new(selected) }
 }
 
 /// A checkbox and the value it last had.
@@ -209,6 +406,14 @@ fn pretty(shortcut: &str) -> String {
     out
 }
 
+fn small_label(mtm: MainThreadMarker, text: &str, frame: NSRect) -> Retained<NSTextField> {
+    label(mtm, text, frame, true)
+}
+
+fn plain_label(mtm: MainThreadMarker, text: &str, frame: NSRect) -> Retained<NSTextField> {
+    label(mtm, text, frame, false)
+}
+
 fn label(mtm: MainThreadMarker, text: &str, frame: NSRect, small: bool) -> Retained<NSTextField> {
     let field = NSTextField::labelWithString(&NSString::from_str(text), mtm);
     field.setFrame(frame);
@@ -224,46 +429,7 @@ fn label(mtm: MainThreadMarker, text: &str, frame: NSRect, small: bool) -> Retai
     field
 }
 
-fn checkbox(mtm: MainThreadMarker, title: &str, y: f64, on: bool) -> Switch {
-    let button = unsafe {
-        NSButton::checkboxWithTitle_target_action(&NSString::from_str(title), None, None, mtm)
-    };
-    button.setFrame(NSRect::new(
-        NSPoint::new(MARGIN, y),
-        NSSize::new(WIDTH - MARGIN * 2.0, 20.0),
-    ));
-    let switch = Switch { control: button, last: Cell::new(on) };
-    switch.show(on);
-    switch
-}
 
-fn slider(mtm: MainThreadMarker, y: f64, range: (f64, f64), value: f64, steps: usize) -> Dial {
-    // Safety: no target and no action, so nothing is called back into.
-    let control = unsafe { NSSlider::sliderWithTarget_action(None, None, mtm) };
-    control.setMinValue(range.0);
-    control.setMaxValue(range.1);
-    control.setDoubleValue(value);
-    control.setNumberOfTickMarks(steps as isize);
-    control.setAllowsTickMarkValuesOnly(true);
-    control.setFrame(NSRect::new(
-        NSPoint::new(MARGIN, y),
-        NSSize::new(WIDTH - MARGIN * 2.0 - 74.0, 22.0),
-    ));
-    let readout = label(
-        mtm,
-        "",
-        NSRect::new(
-            NSPoint::new(WIDTH - MARGIN - 68.0, y + 2.0),
-            NSSize::new(68.0, 18.0),
-        ),
-        true,
-    );
-    // Read back rather than trusting what was set: with tick marks the
-    // control snaps to the nearest one, and the difference would look like
-    // the user had moved it — writing the setting back on every launch.
-    let settled = control.doubleValue();
-    Dial { control, readout, last: Cell::new(settled) }
-}
 
 /// The sensitivity settings, in the order they appear on the slider.
 ///
@@ -301,9 +467,134 @@ fn sensitivity_at(step: f64) -> (&'static str, f32) {
 impl Preferences {
     pub fn new(mtm: MainThreadMarker) -> Self {
         let settings = config::load();
+        let mut layout = Layout::new(mtm, WIDTH);
+
+        layout.heading("Comportamiento");
+        let sounds = layout.checkbox("Sonido al ejecutar una orden", settings.sounds);
+        let log_voices = layout.checkbox(
+            "Anotar en el registro lo que dicen otros",
+            settings.log_ignored_speech,
+        );
+        layout.hint(
+            "Con el micrófono abierto se transcribe todo lo que se habla cerca. \
+             Normalmente solo se cuenta cuánto se oyó, no qué se dijo.",
+            INDENT,
+        );
+        let at_login = layout.checkbox("Abrir al iniciar sesión", startup::enabled());
+        let speak = layout.checkbox("Responder en voz alta", settings.speak);
+        layout.hint(
+            "Solo a preguntas: «¿qué hora es?», «¿cuánta batería queda?».",
+            INDENT,
+        );
+
+        layout.heading("Palabra clave");
+        let current_wake = settings
+            .wake_words
+            .first()
+            .cloned()
+            .unwrap_or_else(|| crate::commands::DEFAULT_WAKE_WORDS[0].to_string());
+        let wake_word = NSTextField::new(mtm);
+        wake_word.setStringValue(&NSString::from_str(&current_wake));
+        wake_word.setFrame(narrow(layout.place(spacing::FIELD, 0.0), 170.0));
+        layout.add(&wake_word);
+        layout.hint(
+            "Toda orden empieza por ella. Elige algo que no digas por casualidad.",
+            0.0,
+        );
+
+        layout.heading("Escucha");
+        layout.field_label("Sensibilidad");
+        let sensitivity = layout.slider(
+            (0.0, (SENSITIVITY.len() - 1) as f64),
+            sensitivity_step(settings.command_threshold()),
+            SENSITIVITY.len(),
+        );
+        layout.hint(
+            "Más alta obedece a la primera; más baja se equivoca menos.",
+            0.0,
+        );
+
+        layout.field_label("Pausa que cierra una frase");
+        let pause = layout.slider(
+            (400.0, 1200.0),
+            settings.audio_settings().silence_end_ms as f64,
+            9,
+        );
+        layout.hint(
+            "Más larga si te corta al pensar; más corta si tarda en responder.",
+            0.0,
+        );
+
+        layout.field_label("Liberar memoria tras");
+        let minutes = settings
+            .idle_unload()
+            .map_or(0.0, |d| d.as_secs() as f64 / 60.0);
+        let memory = layout.slider((0.0, 30.0), minutes, 7);
+
+        layout.heading("Atajo para pausar y reanudar");
+        let current_shortcut = settings
+            .resume_shortcut()
+            .unwrap_or_else(|| config::DEFAULT_RESUME_SHORTCUT.to_string());
+        // Safety: no target and no action, so nothing is called back into.
+        let shortcut = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str(&pretty(&current_shortcut)),
+                None,
+                None,
+                mtm,
+            )
+        };
+        shortcut.setFrame(narrow(layout.place(spacing::BUTTON, 0.0), 170.0));
+        layout.add(&shortcut);
+        layout.hint("Pulsa el botón y luego la combinación que quieras.", 0.0);
+
+        layout.heading("Dispositivos");
+        layout.field_label("Micrófono");
+        let microphone = layout.chooser(crate::audio::input_names(), settings.microphone());
+        layout.field_label("Altavoz");
+        let speaker = layout.chooser(crate::speech::output_names(), settings.speaker());
+        layout.hint(
+            "En automático cambian con el Mac; fíjalos para que no lo hagan.",
+            0.0,
+        );
+
+        layout.heading("Tu voz");
+        let trained = crate::speaker::has_profile();
+        // Safety: no target and no action, so nothing is called back into.
+        let train = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str(if trained {
+                    "Volver a entrenar"
+                } else {
+                    "Entrenar mi voz"
+                }),
+                None,
+                None,
+                mtm,
+            )
+        };
+        train.setFrame(narrow(layout.place(spacing::BUTTON, 0.0), 170.0));
+        layout.add(&train);
+        let train_status_frame = {
+            layout.gap(spacing::BEFORE_HINT);
+            layout.place(spacing::HINT_LINE * 2.0, 0.0)
+        };
+        let train_status = small_label(
+            mtm,
+            if trained {
+                "Minion solo obedece a tu voz."
+            } else {
+                "Ahora obedece a cualquiera que diga la palabra clave."
+            },
+            train_status_frame,
+        );
+        layout.add(&train_status);
+
+        let (canvas, content_height) = layout.finish();
 
         let window = {
-            let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(WIDTH, WINDOW_HEIGHT));
+            let visible = content_height.min(MAX_WINDOW_HEIGHT);
+            let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(WIDTH, visible));
             let style = NSWindowStyleMask::Titled | NSWindowStyleMask::Closable;
             let window = unsafe {
                 NSWindow::initWithContentRect_styleMask_backing_defer(
@@ -320,308 +611,21 @@ impl Preferences {
             // reopening from the menu would use freed memory.
             unsafe { window.setReleasedWhenClosed(false) };
             window.center();
+
+            // Scrolls when the settings are taller than a laptop screen.
+            let scroll = NSScrollView::new(mtm);
+            scroll.setFrame(NSRect::new(
+                NSPoint::new(0.0, 0.0),
+                NSSize::new(WIDTH, visible),
+            ));
+            scroll.setHasVerticalScroller(true);
+            scroll.setDrawsBackground(false);
+            scroll.setDocumentView(Some(&canvas));
+            if let Some(content) = window.contentView() {
+                content.addSubview(&scroll);
+            }
             window
         };
-
-        // Everything goes on a canvas as tall as the layout needs, and the
-        // window scrolls over it. Laying out to fit the window instead
-        // would mean dropping settings or cramming them.
-        let canvas = NSView::new(mtm);
-        canvas.setFrame(NSRect::new(
-            NSPoint::new(0.0, 0.0),
-            NSSize::new(WIDTH - 16.0, HEIGHT),
-        ));
-
-        let scroll = NSScrollView::new(mtm);
-        scroll.setFrame(NSRect::new(
-            NSPoint::new(0.0, 0.0),
-            NSSize::new(WIDTH, WINDOW_HEIGHT),
-        ));
-        scroll.setHasVerticalScroller(true);
-        scroll.setDrawsBackground(false);
-        scroll.setDocumentView(Some(&canvas));
-        if let Some(content) = window.contentView() {
-            content.addSubview(&scroll);
-        }
-
-        // Laid out downwards from the top of the canvas.
-        let mut y = HEIGHT - 52.0;
-        let add = |view: &NSView| canvas.addSubview(view);
-
-        add(&label(
-            mtm,
-            "Comportamiento",
-            NSRect::new(NSPoint::new(MARGIN, y), NSSize::new(200.0, 18.0)),
-            true,
-        ));
-        y -= 26.0;
-
-        let sounds = checkbox(mtm, "Sonido al ejecutar una orden", y, settings.sounds);
-        add(&sounds.control);
-        y -= 26.0;
-
-        let log_voices = checkbox(
-            mtm,
-            "Anotar en el registro lo que dicen otros",
-            y,
-            settings.log_ignored_speech,
-        );
-        add(&log_voices.control);
-        // The hint belongs to the checkbox above it, so it sits close under
-        // it — and the gap to the next control matches the one between the
-        // checkboxes, so the group reads as one thing.
-        y -= 30.0;
-        add(&label(
-            mtm,
-            "Con el micrófono abierto se transcribe todo lo que se habla cerca. \
-             Normalmente solo se cuenta cuánto se oyó, no qué se dijo.",
-            NSRect::new(
-                NSPoint::new(MARGIN + 20.0, y),
-                NSSize::new(WIDTH - MARGIN * 2.0 - 20.0, 28.0),
-            ),
-            true,
-        ));
-        y -= 26.0;
-
-        let at_login = checkbox(mtm, "Abrir al iniciar sesión", y, startup::enabled());
-        add(&at_login.control);
-        y -= 26.0;
-
-        let speak = checkbox(mtm, "Responder en voz alta", y, settings.speak);
-        add(&speak.control);
-        y -= 20.0;
-        add(&label(
-            mtm,
-            "Solo a preguntas: «¿qué hora es?», «¿cuánta batería queda?».",
-            NSRect::new(
-                NSPoint::new(MARGIN + 20.0, y - 14.0),
-                NSSize::new(WIDTH - MARGIN * 2.0 - 20.0, 16.0),
-            ),
-            true,
-        ));
-        y -= 34.0;
-
-        add(&label(
-            mtm,
-            "Palabra clave",
-            NSRect::new(NSPoint::new(MARGIN, y), NSSize::new(200.0, 18.0)),
-            false,
-        ));
-        y -= 28.0;
-        let wake_word = NSTextField::new(mtm);
-        let current_wake = settings
-            .wake_words
-            .first()
-            .cloned()
-            .unwrap_or_else(|| crate::commands::DEFAULT_WAKE_WORDS[0].to_string());
-        wake_word.setStringValue(&NSString::from_str(&current_wake));
-        wake_word.setFrame(NSRect::new(
-            NSPoint::new(MARGIN, y),
-            NSSize::new(170.0, 24.0),
-        ));
-        add(&wake_word);
-        y -= 22.0;
-        add(&label(
-            mtm,
-            "Toda orden empieza por ella. Elige algo que no digas por casualidad.",
-            NSRect::new(NSPoint::new(MARGIN, y), NSSize::new(WIDTH - MARGIN * 2.0, 16.0)),
-            true,
-        ));
-        y -= 40.0;
-
-        add(&label(
-            mtm,
-            "Escucha",
-            NSRect::new(NSPoint::new(MARGIN, y), NSSize::new(200.0, 18.0)),
-            true,
-        ));
-        y -= 28.0;
-
-        add(&label(
-            mtm,
-            "Sensibilidad",
-            NSRect::new(NSPoint::new(MARGIN, y), NSSize::new(200.0, 18.0)),
-            false,
-        ));
-        y -= 26.0;
-        // Positions rather than a raw range: each step has its own name.
-        let sensitivity = slider(
-            mtm,
-            y,
-            (0.0, (SENSITIVITY.len() - 1) as f64),
-            sensitivity_step(settings.command_threshold()),
-            SENSITIVITY.len(),
-        );
-        add(&sensitivity.control);
-        add(&sensitivity.readout);
-        y -= 22.0;
-        add(&label(
-            mtm,
-            "Más alta obedece a la primera; más baja se equivoca menos.",
-            NSRect::new(NSPoint::new(MARGIN, y), NSSize::new(WIDTH - MARGIN * 2.0, 16.0)),
-            true,
-        ));
-        y -= 34.0;
-
-        add(&label(
-            mtm,
-            "Pausa que cierra una frase",
-            NSRect::new(NSPoint::new(MARGIN, y), NSSize::new(240.0, 18.0)),
-            false,
-        ));
-        y -= 26.0;
-        let pause = slider(
-            mtm,
-            y,
-            (400.0, 1200.0),
-            settings.audio_settings().silence_end_ms as f64,
-            9,
-        );
-        add(&pause.control);
-        add(&pause.readout);
-        y -= 22.0;
-        add(&label(
-            mtm,
-            "Más larga si te corta al pensar; más corta si tarda en responder.",
-            NSRect::new(NSPoint::new(MARGIN, y), NSSize::new(WIDTH - MARGIN * 2.0, 16.0)),
-            true,
-        ));
-        y -= 34.0;
-
-        add(&label(
-            mtm,
-            "Liberar memoria tras",
-            NSRect::new(NSPoint::new(MARGIN, y), NSSize::new(240.0, 18.0)),
-            false,
-        ));
-        y -= 26.0;
-        let minutes = settings
-            .idle_unload()
-            .map_or(0.0, |d| d.as_secs() as f64 / 60.0);
-        let memory = slider(mtm, y, (0.0, 30.0), minutes, 7);
-        add(&memory.control);
-        add(&memory.readout);
-        y -= 40.0;
-
-        add(&label(
-            mtm,
-            "Atajo para pausar y reanudar",
-            NSRect::new(NSPoint::new(MARGIN, y), NSSize::new(260.0, 18.0)),
-            false,
-        ));
-        y -= 28.0;
-        let current = settings
-            .resume_shortcut()
-            .unwrap_or_else(|| config::DEFAULT_RESUME_SHORTCUT.to_string());
-        // A button rather than a text field: a shortcut is something you
-        // press, and nobody should have to know it is spelled "alt-space".
-        // Safety: no target and no action, so nothing is called back into.
-        let shortcut = unsafe {
-            NSButton::buttonWithTitle_target_action(
-                &NSString::from_str(&pretty(&current)),
-                None,
-                None,
-                mtm,
-            )
-        };
-        shortcut.setFrame(NSRect::new(
-            NSPoint::new(MARGIN, y),
-            NSSize::new(170.0, 26.0),
-        ));
-        add(&shortcut);
-        y -= 22.0;
-        add(&label(
-            mtm,
-            "Pulsa el botón y luego la combinación que quieras.",
-            NSRect::new(NSPoint::new(MARGIN, y), NSSize::new(WIDTH - MARGIN * 2.0, 16.0)),
-            true,
-        ));
-        y -= 40.0;
-
-        add(&label(
-            mtm,
-            "Dispositivos",
-            NSRect::new(NSPoint::new(MARGIN, y), NSSize::new(200.0, 18.0)),
-            true,
-        ));
-        y -= 26.0;
-        add(&label(
-            mtm,
-            "Micrófono",
-            NSRect::new(NSPoint::new(MARGIN, y), NSSize::new(200.0, 18.0)),
-            false,
-        ));
-        y -= 28.0;
-        let microphone = chooser(
-            mtm,
-            y,
-            crate::audio::input_names(),
-            settings.microphone(),
-        );
-        add(&microphone.control);
-        y -= 34.0;
-
-        add(&label(
-            mtm,
-            "Altavoz",
-            NSRect::new(NSPoint::new(MARGIN, y), NSSize::new(200.0, 18.0)),
-            false,
-        ));
-        y -= 28.0;
-        let speaker = chooser(
-            mtm,
-            y,
-            crate::speech::output_names(),
-            settings.speaker(),
-        );
-        add(&speaker.control);
-        y -= 22.0;
-        add(&label(
-            mtm,
-            "En automático cambian con el Mac; fíjalos para que no lo hagan.",
-            NSRect::new(NSPoint::new(MARGIN, y), NSSize::new(WIDTH - MARGIN * 2.0, 16.0)),
-            true,
-        ));
-        y -= 40.0;
-
-        add(&label(
-            mtm,
-            "Tu voz",
-            NSRect::new(NSPoint::new(MARGIN, y), NSSize::new(200.0, 18.0)),
-            true,
-        ));
-        y -= 28.0;
-        let trained = crate::speaker::has_profile();
-        // Safety: no target and no action, so nothing is called back into.
-        let train = unsafe {
-            NSButton::buttonWithTitle_target_action(
-                &NSString::from_str(if trained {
-                    "Volver a entrenar"
-                } else {
-                    "Entrenar mi voz"
-                }),
-                None,
-                None,
-                mtm,
-            )
-        };
-        train.setFrame(NSRect::new(
-            NSPoint::new(MARGIN, y),
-            NSSize::new(170.0, 26.0),
-        ));
-        add(&train);
-        y -= 40.0;
-        let train_status = label(
-            mtm,
-            if trained {
-                "Minion solo obedece a tu voz."
-            } else {
-                "Ahora obedece a cualquiera que diga «minion»."
-            },
-            NSRect::new(NSPoint::new(MARGIN, y - 18.0), NSSize::new(WIDTH - MARGIN * 2.0, 52.0)),
-            true,
-        );
-        add(&train_status);
 
         let preferences = Self {
             window,
@@ -637,7 +641,7 @@ impl Preferences {
             pause,
             memory,
             shortcut,
-            shortcut_value: std::cell::RefCell::new(current),
+            shortcut_value: std::cell::RefCell::new(current_shortcut),
             capturing: Cell::new(false),
             button_clicks: Cell::new(0),
             train,
@@ -979,31 +983,35 @@ impl Report {
 mod tests {
     use super::*;
 
-    /// The layout runs downwards from the top, so nothing may end up below
-    /// the bottom margin — and getting it wrong just makes a control
-    /// vanish rather than fail. This mirrors the constructor's steps.
     #[test]
-    fn everything_fits_in_the_window() {
-        const STEPS: &[f64] = &[
-            26.0, 26.0, 30.0, 26.0, 26.0, 20.0, 34.0, // behaviour
-            26.0, 28.0, 22.0, 40.0, // wake word
-            28.0, 26.0, 22.0, 34.0, // sensitivity
-            26.0, 22.0, 34.0, // pause
-            26.0, 40.0, // memory
-            28.0, 22.0, 40.0, // shortcut
-            26.0, 28.0, 34.0, 28.0, 22.0, 40.0, // devices
-            28.0, 40.0, // voice
-        ];
-        let bottom = STEPS.iter().fold(HEIGHT - 52.0, |y, step| y - step);
-        assert!(
-            bottom >= MARGIN,
-            "the last control ends at {bottom}, below the {MARGIN} margin"
+    fn a_long_hint_gets_more_than_one_line() {
+        // A fixed height is what clipped these; the count has to follow
+        // the text.
+        let short = wrapped_lines("Sonido al ejecutar.", 336.0);
+        let long = wrapped_lines(
+            "Con el micrófono abierto se transcribe todo lo que se habla \
+             cerca. Normalmente solo se cuenta cuánto se oyó, no qué se dijo.",
+            336.0,
         );
-        // And not so much room that the window looks half empty.
-        assert!(
-            bottom <= MARGIN * 2.0,
-            "there is {bottom} of space at the bottom, more than the layout needs"
-        );
+        assert_eq!(short, 1.0);
+        assert!(long >= 2.0, "a two-line hint needs two lines, got {long}");
+    }
+
+    #[test]
+    fn a_narrower_hint_needs_more_lines() {
+        let text = "Toda orden empieza por ella. Elige algo que no digas por casualidad.";
+        assert!(wrapped_lines(text, 200.0) > wrapped_lines(text, 400.0));
+    }
+
+    #[test]
+    fn spacing_is_ordered_from_tight_to_loose() {
+        // The rhythm only reads as deliberate if the distances rank the
+        // way the relationships do: a hint clings to what it explains, and
+        // groups stand furthest apart.
+        assert!(spacing::BEFORE_HINT < spacing::SIBLING);
+        assert!(spacing::SIBLING < spacing::AFTER_HINT);
+        assert!(spacing::AFTER_HINT < spacing::GROUP);
+        assert!(spacing::AFTER_LABEL < spacing::AFTER_HEADING);
     }
 
     #[test]
