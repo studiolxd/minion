@@ -78,12 +78,16 @@ category = "macOS"
 [[apps]]
 name = "Finder"
 bundle_id = "com.apple.finder"
-aliases = ["finder", "el buscador", "archivos"]
+# "fainder" is not a mishearing but a pronunciation: the English name as
+# a Spanish mouth says it. Listed so that text::phonetic can reach every
+# spelling of it — "faynder", "fainde" — from one entry.
+aliases = ["finder", "fainder", "el buscador", "archivos"]
 
 [[apps]]
 name = "Mail"
 bundle_id = "com.apple.mail"
-aliases = ["mail", "correo", "el correo"]
+# "meil": the English name as it is said here. See Finder above.
+aliases = ["mail", "meil", "correo", "el correo"]
 
 [[apps]]
 name = "Notas"

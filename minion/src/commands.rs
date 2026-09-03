@@ -880,24 +880,57 @@ fn near_alias(word: &str, alias: &str) -> bool {
     same_start && crate::text::edits_between(word, alias) <= 1
 }
 
+/// Whether some run of whole words in the sentence *sounds* like the alias.
+///
+/// The names are English and the recogniser writes Spanish, so it picks a
+/// different spelling for the same sounds every time: "chrome", "crome",
+/// "cromo", "croma". [`crate::text::phonetic`] reduces both sides to those
+/// sounds, and one comparison then covers every spelling of them —
+/// including the ones nobody has said yet, which is what listing them one
+/// by one can never do.
+///
+/// Whole words and equality, never a substring or a near miss: everything
+/// this is allowed to forgive is already forgiven inside `phonetic`, and
+/// anything looser would undo the work `near_alias` did to keep "gmail"
+/// out of Mail. Very short sounds are refused for the same reason — at
+/// three letters, two different words share a form too easily.
+fn sounds_alias(words: &[&str], alias: &str) -> bool {
+    const MIN_SOUNDS: usize = 4;
+    let wanted = crate::text::phonetic(alias);
+    if wanted.chars().count() < MIN_SOUNDS {
+        return false;
+    }
+    let spread = alias.split_whitespace().count();
+    if spread == 0 || spread > words.len() {
+        return false;
+    }
+    words
+        .windows(spread)
+        .any(|window| crate::text::phonetic(&window.join(" ")) == wanted)
+}
+
 /// Finds an application named in the sentence, with its match score.
 ///
-/// Whole words only, in three grades: named outright, run together with
-/// another word, or one slip away from the name. Bigger mangles stay in
-/// the alias lists — what the recogniser really writes ("shafari",
-/// "cromo") is listed, which is explicit and cannot spread.
+/// Whole words only, in four grades: named outright, run together with
+/// another word, said so that it sounds like the name, or one slip away
+/// from it. Bigger mangles stay in the alias lists — what the recogniser
+/// really writes ("shafari", "grum") is listed, which is explicit and
+/// cannot spread.
 fn find_app(rest: &str) -> Option<(&'static App, f32)> {
     let words: Vec<&str> = rest.split_whitespace().collect();
     let mut best: Option<(&App, f32)> = None;
     for app in all_apps() {
         for alias in app.aliases {
-            // A plain mention beats a run-together one, which beats a
-            // misheard one; longer aliases beat shorter ones, so "vs code"
-            // wins over a stray "code".
+            // A plain mention beats a run-together one, which beats one
+            // that only sounds right, which beats a misheard one; longer
+            // aliases beat shorter ones, so "vs code" wins over a stray
+            // "code".
             let score = if names_alias(&words, alias) {
                 0.9 + (alias.len() as f32 / 100.0).min(0.09)
             } else if words.iter().any(|word| run_together(word, alias)) {
                 0.9
+            } else if sounds_alias(&words, alias) {
+                0.85
             } else if words.iter().any(|word| near_alias(word, alias)) {
                 0.8
             } else {
@@ -2236,6 +2269,65 @@ mod tests {
         for command in &vocabulary().commands {
             assert!(catalogue.contains(command.name), "{} should be listed", command.name);
         }
+    }
+
+    #[test]
+    fn an_app_name_is_found_however_it_is_spelled() {
+        // Not in any alias list, and not one edit from anything in one:
+        // these only reach their application because they *sound* like it.
+        // Every spelling the recogniser has produced so far is already
+        // listed by hand, which is exactly what this stops being necessary.
+        for (spoken, app) in [
+            ("minion abre kromo", "Chrome"),
+            ("minion abre crom", "Chrome"),
+            ("minion abre zafari", "Safari"),
+            ("minion abre safary", "Safari"),
+            ("minion abre spotifai", "Spotify"),
+            ("minion abre uasap", "WhatsApp"),
+            ("minion abre klod", "Claude"),
+            ("minion abre faynder", "Finder"),
+        ] {
+            assert_eq!(
+                decide(spoken).0,
+                Decision::Launch {
+                    name: app,
+                    bundle_id: all_apps().find(|a| a.name == app).expect("app").bundle_id,
+                },
+                "«{spoken}» should open {app}"
+            );
+        }
+    }
+
+    #[test]
+    fn sounding_alike_is_not_enough_on_its_own() {
+        // The three the substring search used to get wrong, plus the words
+        // that merely rhyme with an application. Sounds are compared whole
+        // word to whole word, so none of them reaches an application.
+        for spoken in [
+            "minion abre gmail punto com",
+            "minion abre mallorca punto com",
+            "minion abre marca punto com",
+            "minion abre el codo",
+            "minuto abre chrome",
+        ] {
+            assert!(
+                !matches!(decide(spoken).0, Decision::Launch { .. }),
+                "«{spoken}» should not open an application"
+            );
+        }
+        // And the commands that live near an application name still win.
+        assert_eq!(decision("minion cierra la ventana"), Decision::Run("cerrar ventana"));
+        assert_eq!(decision("minion copia esto"), Decision::Run("copiar"));
+    }
+
+    #[test]
+    fn a_name_that_only_sounds_right_scores_below_one_said_outright() {
+        // The grades have to stay in order, or a mishearing outranks the
+        // real thing when both are in the same sentence.
+        let (_, said) = decide("minion abre chrome");
+        let (_, sounded) = decide("minion abre kromo");
+        assert!(sounded < said, "{sounded} should be below {said}");
+        assert!(sounded >= threshold());
     }
 
     #[test]
