@@ -19,8 +19,13 @@ use crate::text::{keywords, normalise, similarity};
 /// "miñón", "minial", "mini" — normalisation flattens the accents but not
 /// the rest. Anything close enough is accepted anyway; see
 /// [`sounds_like_wake_word`].
+///
+/// "minium" and "minial" are two edits from the name and are here rather
+/// than reachable by tolerance: at two edits "mínimo" and "mínima" come
+/// too. "minio" is gone for the same reason — it is one edit from
+/// "mínimo", and "minio" itself is still one edit from "minion".
 pub const DEFAULT_WAKE_WORDS: &[&str] =
-    &["minion", "minions", "minon", "miñon", "minial", "mini", "minio"];
+    &["minion", "minions", "minon", "minial", "mini", "minium"];
 
 /// Set once at startup from the configuration file. Absent means defaults.
 static USER_APPS: OnceLock<Vec<App>> = OnceLock::new();
@@ -486,25 +491,26 @@ pub enum Decision {
 /// often enough that whole sentences were being discarded after being
 /// understood perfectly.
 ///
-/// The tolerance is bounded — two edits at most, and the first two letters
-/// must agree — so an ordinary word cannot open a command by accident.
+/// The tolerance is bounded — one edit, and the first four letters must
+/// agree — so an ordinary word cannot open a command by accident. Two
+/// edits were tried and had to go: "mínimo", "mínima", "minie" and
+/// "minuto" all reached "minion" that way, and "Minuto abre Chrome"
+/// opened Chrome. What the recogniser really writes two edits away is
+/// listed above instead, which is explicit and cannot spread.
 fn sounds_like_wake_word(word: &str) -> bool {
     let words = wake_words();
     if words.contains(&word) {
         return true;
     }
     words.iter().any(|wake| {
-        let shortest = word.len().min(wake.len());
-        if shortest < 4 {
+        // Short wake words have no room for tolerance: "mini" is one edit
+        // from "mina", "mino" and "mixi", all of them ordinary speech.
+        if wake.chars().count() < 5 || word.chars().count() < 4 {
             return false;
         }
-        // Three letters of shared opening. Two was not enough: "millón"
-        // is two edits from "minion" and starts with "mi", so half of
-        // "un millón de gracias" would have opened a command.
-        let prefix = 3.min(wake.len().saturating_sub(1)).max(1);
-        let same_start = word.chars().take(prefix).eq(wake.chars().take(prefix));
-        let allowance = if shortest >= 5 { 2 } else { 1 };
-        same_start && crate::text::edits_between(word, wake) <= allowance
+        const PREFIX: usize = 4;
+        let same_start = word.chars().take(PREFIX).eq(wake.chars().take(PREFIX));
+        same_start && crate::text::edits_between(word, wake) <= 1
     })
 }
 
@@ -516,27 +522,24 @@ fn sounds_like_wake_word(word: &str) -> bool {
 fn strip_wake_word(phrase: &str) -> Option<&str> {
     let mut words = phrase.split_whitespace();
     let first = words.next()?;
-    if !sounds_like_wake_word(first) {
-        return None;
-    }
     let rest = phrase[first.len()..].trim();
 
-    // If the first word was only part of the wake word, the next one may
-    // be the remainder rather than the start of the command.
-    let Some(second) = words.next() else {
-        return Some(rest);
-    };
-    let joined = format!("{first}{second}");
-    let split_wake = wake_words()
-        .iter()
-        .any(|wake| joined == *wake || crate::text::edits_between(&joined, wake) <= 1);
-
-    // Only when joining actually produces the wake word: "mini on" does,
-    // "minion abre" does not.
-    if split_wake {
-        return Some(rest[second.len()..].trim());
+    // The two halves of a split wake word are tried before the first word
+    // on its own: "mine" is not close enough to "minion" to be accepted by
+    // itself, and it should not be — only "mine on" is.
+    if let Some(second) = words.next() {
+        let joined = format!("{first}{second}");
+        let split_wake = wake_words()
+            .iter()
+            .any(|wake| joined == *wake || crate::text::edits_between(&joined, wake) <= 1);
+        // Only when joining actually produces the wake word: "mini on"
+        // does, "minion abre" does not.
+        if split_wake {
+            return Some(rest[second.len()..].trim());
+        }
     }
-    Some(rest)
+
+    sounds_like_wake_word(first).then_some(rest)
 }
 
 /// Reads "otra vez", "repite", "hazlo tres veces" and the like.
@@ -1238,6 +1241,9 @@ mod tests {
             "Minión, ¿qué hora es?",
             "Minio abre chrome",
             "Miñón abre safari",
+            "Minions abre chrome",
+            "Minium abre chrome",
+            "Mine on abre chrome",
         ] {
             assert_ne!(
                 decide(spoken).0,
@@ -1266,12 +1272,21 @@ mod tests {
     #[test]
     fn an_ordinary_word_does_not_open_a_command() {
         // The tolerance has to stop somewhere, or conversation starts
-        // running things. Two edits and a shared opening is the limit.
+        // running things. One edit and four shared letters is the limit:
+        // everything in the second group used to open commands, and
+        // "minuto abre Chrome" really did open Chrome.
         for spoken in [
             "millón de gracias",
             "misión cumplida",
             "camión abre chrome",
             "opinión abre chrome",
+            "mínimo abre chrome",
+            "minuto abre chrome",
+            "mina abre chrome",
+            "minas abre chrome",
+            "minero abre chrome",
+            "mínima abre chrome",
+            "minie abre chrome",
         ] {
             assert_eq!(
                 decide(spoken).0,
