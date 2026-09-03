@@ -220,7 +220,10 @@ pub fn open_app(bundle_id: &str) -> Result<(), String> {
 /// own save dialog, exactly as ⌘Q would. Nothing is lost without being
 /// asked about first.
 pub fn quit_app(bundle_id: &str) -> Result<(), String> {
-    applescript(&format!("tell application id \"{bundle_id}\" to quit"))
+    applescript(&format!(
+        "tell application id \"{}\" to quit",
+        applescript_string(bundle_id)
+    ))
 }
 
 /// Types text into whatever has focus.
@@ -405,6 +408,18 @@ pub fn applescript(script: &str) -> Result<(), String> {
     run(Command::new("/usr/bin/osascript").arg("-e").arg(script))
 }
 
+/// Escapes a string for interpolation into an AppleScript string literal
+/// (inside the `"..."` quotes).
+///
+/// AppleScript has no other escape mechanism worth using here: a `"` ends
+/// the literal early and a `\` starts an escape, so both have to be
+/// backslash-escaped before a config value (a bundle id, say) is spliced
+/// into a script — otherwise a value containing one breaks the script, or
+/// worse, runs something the value never meant to say.
+pub fn applescript_string(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 /// Adjusts system output volume by `delta` points on a 0-100 scale.
 pub fn adjust_volume(delta: i32) -> Result<(), String> {
     applescript(&format!(
@@ -523,5 +538,18 @@ mod tests {
     fn rejects_a_shortcut_with_no_key() {
         assert_eq!(parse_shortcut("cmd-shift"), None);
         assert_eq!(parse_shortcut("nonsense"), None);
+    }
+
+    #[test]
+    fn escapes_quotes_and_backslashes_for_applescript() {
+        assert_eq!(applescript_string("com.apple.Safari"), "com.apple.Safari");
+        assert_eq!(applescript_string(r#"say "hi""#), r#"say \"hi\""#);
+        assert_eq!(applescript_string(r"C:\path"), r"C:\\path");
+        // A value crafted to break out of the string and add a command:
+        // the quote must come through escaped, not close the literal.
+        assert_eq!(
+            applescript_string(r#"x" to quit application "Finder"#),
+            r#"x\" to quit application \"Finder"#
+        );
     }
 }
