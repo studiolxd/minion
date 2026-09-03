@@ -1815,12 +1815,9 @@ fn run_menu_bar(
     let _capture = preferences::capture_keys(move |code, mods| {
         panel_for_capture.is_capturing() && panel_for_capture.capture(code, mods)
     });
-    // Requests from the menu thread, which must not touch AppKit itself.
-    let open_requested = Arc::new(AtomicBool::new(false));
+    // «Vocabulario…», from the menu (the other request flags are declared
+    // above, before the assistant, which shares them).
     let open_vocabulary_requested = Arc::new(AtomicBool::new(false));
-    let learn_requested = Arc::new(AtomicBool::new(false));
-    let catalogue_requested = Arc::new(AtomicBool::new(false));
-    let stats_requested = Arc::new(AtomicBool::new(false));
 
     // What each "Últimas órdenes" slot currently holds, so the menu-event
     // thread — which owns no state of its own — can look one up by number
