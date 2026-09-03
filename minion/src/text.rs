@@ -51,17 +51,34 @@ pub fn keywords(phrase: &str) -> Vec<String> {
 
 /// How closely `heard` matches `expected`, from 0 to 1.
 ///
-/// The score combines both directions: how much of the expected phrase was
-/// heard (recall) and how much of what was heard belongs to it (precision).
-/// Both matter, for different reasons — recall alone would let a single
-/// word fire a long command, precision alone would let a rambling sentence
-/// match anything it happens to contain.
+/// The score has to mean something across its whole range, because the
+/// «Sensibilidad» slider cuts it wherever the user puts it. The scale:
 ///
-/// They are combined as F1, with one exception: saying every word of a
-/// short command plus a word or two of context ("guarda el archivo" for
-/// "guarda esto") is ordinary speech and must still match, even though
-/// precision drops. A whole sentence that merely contains the command gets
-/// no such allowance.
+/// | Score | What it is |
+/// |---|---|
+/// | 1.0 | every word of the command, said exactly, and nothing else |
+/// | 0.9–1.0 | every word, with a slip or a word or two of context |
+/// | 0.75–0.9 | every word, but leaning on the fuzzy matching to get there |
+/// | below 0.75 | part of the command only |
+///
+/// Two things are combined. First, how well each expected word was said:
+/// exactly (1.0), run together with its neighbour (0.9), one edit away
+/// (0.8) or recognised only by its stem (0.75). Second, how much else was
+/// said around it. Saying every word of a short command plus a word or two
+/// of context ("guarda el archivo" for "guarda esto") is ordinary speech,
+/// so each extra word costs a little rather than disqualifying the match.
+///
+/// A phrase that says the whole command never falls below 0.75, whatever
+/// slack it needed, so it always clears the default 0.7 threshold; raising
+/// the threshold above that is what makes the app pickier, in steps that
+/// each rule out one kind of slack.
+///
+/// A phrase that says only part of the command is scored as the F1 of
+/// recall and precision instead — recall alone would let a single word
+/// fire a long command, precision alone would let a rambling sentence
+/// match anything it happens to contain. The same applies to a sentence
+/// that merely contains the command among many other words: three or more
+/// words of surplus is a sentence, not a command with context.
 ///
 /// It also means the table can hold one natural phrasing while shorter
 /// renderings still score well: "pantalla completa" against "pon la
@@ -85,66 +102,80 @@ pub fn similarity(heard: &str, expected: &str) -> f32 {
         return 0.0;
     }
 
-    let hits = expected_words
-        .iter()
-        .filter(|e| heard_words.iter().any(|h| words_match(h, e, strict)))
-        .count() as f32;
-
-    let recall = hits / expected_words.len() as f32;
-    let precision = hits / heard_words.len() as f32;
-
-    if recall + precision == 0.0 {
+    // How well each expected word was said, and what the slack cost.
+    let mut hits = 0;
+    let mut quality = 0.0;
+    let mut slack = 0.0;
+    for word in &expected_words {
+        let best = heard_words
+            .iter()
+            .map(|h| match_quality(h, word, strict))
+            .fold(0.0, f32::max);
+        if best > 0.0 {
+            hits += 1;
+            quality += best;
+            slack += 1.0 - best;
+        }
+    }
+    if hits == 0 {
         return 0.0;
     }
-    let f1 = 2.0 * precision * recall / (precision + recall);
 
     // Every word of the command was said, with at most two words of
     // context around it. That is someone speaking naturally, not a
     // sentence that happens to contain the words.
-    let complete = recall > 0.999;
     let surplus = heard_words.len() - expected_words.len().min(heard_words.len());
-    if complete && surplus <= 2 {
-        return f1.max(0.8);
+    if hits == expected_words.len() && surplus <= 2 {
+        const EXTRA_WORD: f32 = 0.08;
+        const FLOOR: f32 = 0.75;
+        return (1.0 - slack - EXTRA_WORD * surplus as f32).max(FLOOR);
     }
-    f1
+
+    let recall = quality / expected_words.len() as f32;
+    let precision = quality / heard_words.len() as f32;
+    2.0 * precision * recall / (precision + recall)
 }
 
-/// Whether two words should be treated as the same one.
+/// How well one heard word stands in for an expected one, 0 if it does not.
 ///
-/// Tolerates a single recogniser slip ("safaris" for "safari"). One edit is
-/// the ceiling on purpose: at two, "ventana" becomes "pestana", "copiar"
-/// becomes "cortar" and "deshacer" becomes "rehacer" — all pairs of
-/// commands that do very different things. Bigger mangles are handled by
-/// listing the mangled form as an alias, which is explicit and safe.
-fn words_match(a: &str, b: &str, strict: bool) -> bool {
-    if a == b {
-        return true;
+/// The grades are the ways the recogniser goes wrong, in order of how much
+/// benefit of the doubt each one needs. One edit is the ceiling on purpose:
+/// at two, "ventana" becomes "pestana", "copiar" becomes "cortar" and
+/// "deshacer" becomes "rehacer" — all pairs of commands that do very
+/// different things. Bigger mangles are handled by listing the mangled form
+/// as an alias, which is explicit and safe.
+fn match_quality(heard: &str, expected: &str, strict: bool) -> f32 {
+    if heard == expected {
+        return 1.0;
     }
     // The heard word may swallow the expected one: the recogniser writes
     // "abrecrome" when two words run together, and "crome" is still in
     // there. The reverse is not allowed — an expected word containing what
     // was heard means the heard word is merely a prefix of something else,
     // and "marca" is not "marcadores".
-    if b.len() >= 4 && a.len() > b.len() && a.contains(b) {
-        return true;
+    if expected.len() >= 4 && heard.len() > expected.len() && heard.contains(expected) {
+        return 0.9;
     }
 
     // A command of a single word has nothing around it to disambiguate,
     // so it gets no slack at all: "contar" is one edit from "cortar" and
     // used to run it at full confidence.
     if strict {
-        return false;
+        return 0.0;
     }
 
     // Words shorter than four characters must match exactly: at that
     // length a single edit is a different word ("pon" and "son").
-    if a.len().max(b.len()) < 4 {
-        return false;
+    if heard.len().max(expected.len()) < 4 {
+        return 0.0;
     }
-    if edit_distance(a, b) <= 1 {
-        return true;
+    if edit_distance(heard, expected) <= 1 {
+        return 0.8;
     }
-    shares_stem(a, b)
+    if shares_stem(heard, expected) {
+        return 0.75;
+    }
+    0.0
 }
 
 /// Whether two long words are the same word in different clothes.
@@ -193,6 +224,65 @@ fn edit_distance(a: &str, b: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whether two words match at all, the shape most of these tests want.
+    fn words_match(a: &str, b: &str, strict: bool) -> bool {
+        match_quality(a, b, strict) > 0.0
+    }
+
+
+    #[test]
+    fn saying_the_command_exactly_scores_full() {
+        assert_eq!(similarity("cierra la ventana", "cierra la ventana"), 1.0);
+        assert_eq!(similarity("cerrar ventana", "cierra la ventana"), 1.0);
+    }
+
+    #[test]
+    fn slack_costs_score() {
+        let perfect = similarity("cierra la ventana", "cierra la ventana");
+        // One word one edit away is still the command, but less certainly.
+        let slip = similarity("cierra la ventena", "cierra la ventana");
+        assert!(slip < perfect, "a slip should score below {perfect}, got {slip}");
+        // And context costs by the word, so more of it scores lower.
+        let one = similarity("cierra la ventana ahora", "cierra la ventana");
+        let two = similarity("cierra la ventana ahora mismo", "cierra la ventana");
+        assert!(one < perfect, "one extra word should score below {perfect}");
+        assert!(two < one, "two extra words should score below one ({two} vs {one})");
+    }
+
+    #[test]
+    fn the_default_threshold_accepts_ordinary_speech() {
+        // Every phrasing the command suite accepts, scored directly: the
+        // default must let all of them through, whatever slack they needed.
+        const DEFAULT: f32 = crate::commands::DEFAULT_THRESHOLD;
+        for (spoken, canonical) in [
+            ("cerrar ventana", "cierra la ventana"),
+            ("cierra esta ventana", "cierra la ventana"),
+            ("cierra la ventana por favor", "cierra la ventana"),
+            ("guarda el archivo", "guarda esto"),
+            ("subir el volumen", "sube el volumen"),
+            ("actualiza la pagina", "recarga la pagina"),
+            ("minimized the ventana", "minimiza la ventana"),
+            ("seleccionar todo", "selecciona todo"),
+            ("abre una ventana nueva", "ventana nueva"),
+        ] {
+            let score = similarity(spoken, canonical);
+            assert!(
+                score >= DEFAULT,
+                "«{spoken}» scores {score}, below the default {DEFAULT}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_demanding_threshold_rejects_a_slip() {
+        // What the «Sensibilidad» slider is for: at its most demanding,
+        // only what was said exactly gets through.
+        let slip = similarity("cierra la ventena", "cierra la ventana");
+        assert!(slip < 0.95, "a one-edit slip should not survive 0.95, got {slip}");
+        assert!(slip >= crate::commands::DEFAULT_THRESHOLD);
+        assert!(similarity("cierra la ventana", "cierra la ventana") >= 0.95);
+    }
 
     #[test]
     fn a_shared_stem_survives_a_foreign_ending() {
