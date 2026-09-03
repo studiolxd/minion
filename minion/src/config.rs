@@ -208,6 +208,16 @@ pub struct Config {
     /// a timer or a "¿qué suena?" would otherwise have nowhere to land.
     #[serde(default = "yes")]
     pub notifications: bool,
+
+    /// Look once a day for a newer Minion, and offer to install it —
+    /// see `updater.rs`.
+    ///
+    /// On by default, and quiet: the check only ever says anything when
+    /// there is a new version, so a machine that is up to date never
+    /// hears about it. False stops the automatic check; «Buscar
+    /// actualizaciones…» in the menu still works.
+    #[serde(default = "yes")]
+    pub check_updates: bool,
 }
 
 /// How Minion decides when to listen.
@@ -316,6 +326,7 @@ impl Default for Config {
             search_engine: None,
             ask_before_learning: true,
             notifications: true,
+            check_updates: true,
         }
     }
 }

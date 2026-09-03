@@ -69,6 +69,11 @@
 # finished timers and blocked commands. On by default.
 # notifications = true
 
+# Look once a day for a newer version of Minion and offer to install it.
+# On by default, and silent unless there is one. «Buscar
+# actualizaciones…» in the menu asks straight away either way.
+# check_updates = true
+
 # Which system voice to use. Empty picks a Spanish one automatically.
 # voice = "Mónica"
 
