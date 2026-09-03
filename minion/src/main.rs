@@ -614,6 +614,9 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                                 note!(
                                     "dictation rendered {rendered_len} chars from {spoken_len} spoken"
                                 );
+                                // Plus the space typed after it, as the
+                                // session counted for the spoken text.
+                                session.retype_length(rendered_len + 1);
                             }
                             acted.store(true, Ordering::Relaxed);
                         }

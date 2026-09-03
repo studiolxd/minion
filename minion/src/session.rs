@@ -152,6 +152,15 @@ impl Session {
     /// and should call this then so a refused command is not offered as
     /// something to undo. `main.rs` should call `session.forget_undo()`
     /// wherever it currently checks `!done.succeeded` in `report`.
+    /// Corrects the undo length after dictation rendered the spoken text
+    /// into something longer or shorter (punctuation, numbers, personal
+    /// vocabulary): «deshaz» must remove what reached the keyboard.
+    pub fn retype_length(&mut self, chars: usize) {
+        if let Some(Undoable::Typed(_)) = self.undoable {
+            self.undoable = Some(Undoable::Typed(chars));
+        }
+    }
+
     pub fn forget_undo(&mut self) {
         self.undoable = None;
     }
@@ -307,6 +316,19 @@ mod tests {
         assert_eq!(
             session.interpret("minion deshaz lo que has hecho", Decision::UndoLast, None),
             Outcome::Undo(None)
+        );
+    }
+
+    #[test]
+    fn the_undo_length_follows_what_was_really_typed() {
+        let mut session = Session::new();
+        say(&mut session, "minion empieza a dictar");
+        say(&mut session, "hola coma qué tal");
+        session.retype_length(12);
+        say(&mut session, "minion deja de dictar");
+        assert_eq!(
+            say(&mut session, "minion deshaz lo que has hecho"),
+            vec![Outcome::Undo(Some(Undoable::Typed(12)))]
         );
     }
 
