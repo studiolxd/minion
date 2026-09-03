@@ -107,6 +107,11 @@ pub struct Listener {
     _stream: Arc<Mutex<Option<cpal::platform::Stream>>>,
     /// Completed utterances, as 16 kHz mono samples.
     pub utterances: Receiver<Utterance>,
+    /// Raised as soon as an utterance opens, and cleared by whoever reads
+    /// it. Speech takes a second or two to finish and the model takes about
+    /// a second to load, so the loop can use the news to start loading
+    /// while the sentence is still being said rather than after it.
+    pub speech_started: Arc<AtomicBool>,
     pub source_hz: u32,
     pub channels: usize,
 }
@@ -613,6 +618,8 @@ pub fn start(
 
     let (send, utterances) = mpsc::channel();
     let segment_queue = Arc::clone(&queue);
+    let speech_started = Arc::new(AtomicBool::new(false));
+    let segment_started = Arc::clone(&speech_started);
 
     std::thread::spawn(move || {
         let mut segmenter = Segmenter::new(settings);
@@ -634,7 +641,13 @@ pub fn start(
             }
 
             for block in pending.chunks(BLOCK_SAMPLES) {
-                if let Some(utterance) = segmenter.push(block) {
+                let utterance = segmenter.push(block);
+                // Announced while it is still being spoken, not when it
+                // ends: whoever is waiting has work it can start now.
+                if segmenter.speaking {
+                    segment_started.store(true, Ordering::Relaxed);
+                }
+                if let Some(utterance) = utterance {
                     if send.send(utterance).is_err() {
                         return; // nobody is listening any more
                     }
@@ -646,6 +659,7 @@ pub fn start(
     Ok(Listener {
         _stream: stream,
         utterances,
+        speech_started,
         source_hz,
         channels,
     })

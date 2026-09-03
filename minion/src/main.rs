@@ -67,8 +67,13 @@ const BLINK_SECONDS: f64 = 0.45;
 /// what makes the preferences window feel like a window rather than a form.
 const UI_REFRESH_SECONDS: f64 = 0.05;
 
-/// How often the recognition loop wakes up to see whether it has gone idle.
-const IDLE_CHECK: Duration = Duration::from_secs(20);
+/// How often the recognition loop wakes up between utterances.
+///
+/// Short, because this is also how quickly it notices that someone has
+/// started talking while the model is unloaded: a second of loading that
+/// happens while the sentence is still being spoken is a second the
+/// speaker never waits for. The wake-up itself is one atomic read.
+const IDLE_CHECK: Duration = Duration::from_millis(250);
 
 /// Locates the speech model.
 ///
@@ -283,6 +288,23 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
         let utterance = match listener.utterances.recv_timeout(IDLE_CHECK) {
             Ok(utterance) => utterance,
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Someone has started talking. If the model was released
+                // while idle, load it now: the sentence and the silence
+                // that closes it take longer than the load, so this hides
+                // the second the user used to wait through after speaking.
+                let speech_starting = listener.speech_started.swap(false, Ordering::Relaxed);
+                if speech_starting && model.is_none() && active.load(Ordering::Relaxed) {
+                    match load_model(&model_path) {
+                        Ok(loaded) => {
+                            model = Some(loaded);
+                            // Counts as use, or the idle check below would
+                            // release it again before a word is transcribed.
+                            last_used = Instant::now();
+                            note!("Speech starting — model reloaded. {}", resident_memory());
+                        }
+                        Err(e) => eprintln!("could not reload the model: {e:#}"),
+                    }
+                }
                 if let Some(idle_for) = idle_unload {
                     if model.is_some() && last_used.elapsed() >= idle_for {
                         model = None;
