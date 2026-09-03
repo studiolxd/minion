@@ -111,11 +111,47 @@ const UI_REFRESH_SECONDS: f64 = 0.05;
 /// speaker never waits for. The wake-up itself is one atomic read.
 const IDLE_CHECK: Duration = Duration::from_millis(250);
 
+/// Whether `executable` lives inside a `.app` bundle.
+///
+/// Shared with [`relaunch_arguments`]'s bundle detection: same question,
+/// "is this a bundled copy or a bare binary".
+fn is_bundled(executable: &Path) -> bool {
+    executable
+        .ancestors()
+        .any(|path| path.extension().is_some_and(|kind| kind == "app"))
+}
+
+/// Where the model might be, given where the executable is running from.
+///
+/// The bundle candidates (`Contents/Resources/model` and the sibling of the
+/// binary) are always worth a look — a bundled Minion has no other way to
+/// find its model. The working directory is only worth a look for a
+/// development build run from the repo: a bundled app's cwd is `/` and
+/// checking it there risks matching an unrelated `model` folder that
+/// happens to sit wherever the double-click launched from.
+///
+/// Pure — no filesystem access — so the candidate list can be checked for
+/// both cases without a real executable path or a real bundle.
+fn model_candidates(executable: &Path, cwd_allowed: bool) -> Vec<std::path::PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(macos_dir) = executable.parent() {
+        candidates.push(macos_dir.join("../Resources/model"));
+        candidates.push(macos_dir.join("model"));
+    }
+    if cwd_allowed {
+        candidates.push(Path::new("model").to_path_buf());
+        candidates.push(Path::new("../model").to_path_buf());
+    }
+    candidates
+}
+
 /// Locates the speech model, without fetching anything.
 ///
 /// Order: explicit argument, `MINION_MODEL`, the app bundle's Resources,
-/// then the working directory. The bundle case is what makes double-click
-/// launching work, since a bundled app starts with `/` as its directory.
+/// then — for a development build only, never a bundled one — the working
+/// directory, then the downloaded copy in Application Support. The bundle
+/// case is what makes double-click launching work, since a bundled app
+/// starts with `/` as its directory.
 ///
 /// Separate from downloading it because the two belong to different
 /// moments: this answers "is it here?" in microseconds, while fetching it
@@ -135,16 +171,18 @@ fn find_model(argument: Option<String>) -> Option<String> {
     }
 
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-
-    // Inside the app bundle: Contents/MacOS/minion -> Contents/Resources/model
-    if let Ok(executable) = std::env::current_exe() {
-        if let Some(macos_dir) = executable.parent() {
-            candidates.push(macos_dir.join("../Resources/model"));
-            candidates.push(macos_dir.join("model"));
+    match std::env::current_exe() {
+        Ok(executable) => {
+            let cwd_allowed = !is_bundled(&executable);
+            candidates.extend(model_candidates(&executable, cwd_allowed));
+        }
+        // No way to tell where we are running from — fall back to the
+        // development-build behaviour, which is also the safer guess.
+        Err(_) => {
+            candidates.push(Path::new("model").to_path_buf());
+            candidates.push(Path::new("../model").to_path_buf());
         }
     }
-    candidates.push(Path::new("model").to_path_buf());
-    candidates.push(Path::new("../model").to_path_buf());
 
     // Downloaded on first run, and kept outside the bundle so reinstalling
     // does not fetch 670 MB again.
@@ -1596,5 +1634,35 @@ mod tests {
         let boot = boot_time().expect("macOS knows when it started");
         assert!(boot > 1_000_000_000, "the epoch is not a boot time");
         assert_eq!(Some(boot), boot_time(), "it must not move while running");
+    }
+
+    #[test]
+    fn a_bundled_minion_never_looks_at_the_working_directory() {
+        let inside = Path::new("/Applications/Minion.app/Contents/MacOS/minion");
+        assert!(is_bundled(inside));
+        let candidates = model_candidates(inside, !is_bundled(inside));
+        assert_eq!(
+            candidates,
+            vec![
+                Path::new("/Applications/Minion.app/Contents/MacOS/../Resources/model"),
+                Path::new("/Applications/Minion.app/Contents/MacOS/model"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_development_build_also_checks_the_working_directory() {
+        let built = Path::new("/Users/someone/minion/target/debug/minion");
+        assert!(!is_bundled(built));
+        let candidates = model_candidates(built, !is_bundled(built));
+        assert_eq!(
+            candidates,
+            vec![
+                Path::new("/Users/someone/minion/target/debug/../Resources/model"),
+                Path::new("/Users/someone/minion/target/debug/model"),
+                Path::new("model"),
+                Path::new("../model"),
+            ]
+        );
     }
 }
