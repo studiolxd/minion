@@ -1,0 +1,38 @@
+# Everything else that gets opened by name: chat, design, notes.
+# The schema is documented at the top of macos.toml.
+#
+# A seventh file rather than a corner of macos.toml: these are not part of
+# macOS, and they are the entries most likely to be swapped out for
+# somebody else's.
+
+category = "Aplicaciones"
+
+[[apps]]
+name = "WhatsApp"
+bundle_id = "net.whatsapp.WhatsApp"
+aliases = ["whatsapp", "guasap", "wasap"]
+
+[[apps]]
+name = "Telegram"
+bundle_id = "ru.keepcoder.Telegram"
+aliases = ["telegram", "telegrama"]
+
+[[apps]]
+name = "Discord"
+bundle_id = "com.hnc.Discord"
+aliases = ["discord", "diskord"]
+
+[[apps]]
+name = "Figma"
+bundle_id = "com.figma.Desktop"
+aliases = ["figma", "figna"]
+
+[[apps]]
+name = "Obsidian"
+bundle_id = "md.obsidian"
+aliases = ["obsidian", "obsidiana"]
+
+[[apps]]
+name = "Claude"
+bundle_id = "com.anthropic.claudefordesktop"
+aliases = ["claude", "clod"]

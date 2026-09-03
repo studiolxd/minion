@@ -26,6 +26,7 @@ mod speech;
 mod startup;
 mod speaker;
 mod text;
+mod vocabulary;
 
 use std::cell::Cell;
 use std::path::Path;

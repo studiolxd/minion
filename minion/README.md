@@ -202,9 +202,13 @@ quits it; "cierra la pestaña" closes a tab even though no app is named;
 "minimiza la ventana" does neither. Naming an app is not on its own an
 instruction to open it.
 
-Chrome · Safari · Terminal · Orca · Finder · Mail · Notas · Calendario ·
-Spotify · WhatsApp · Telegram · Figma · Obsidian · Discord · Teams ·
-VS Code · Claude · ChatGPT · Ajustes · Vista Previa · Monitor de Actividad
+Chrome · Safari · Firefox · Terminal · VS Code · Finder · Mail · Notas ·
+Calendario · Ajustes · Vista Previa · Monitor de Actividad · Word · Excel ·
+PowerPoint · Pages · Numbers · Keynote · Spotify · Music · WhatsApp ·
+Telegram · Discord · Figma · Obsidian · Claude
+
+The list is not compiled in — see **Adding commands and applications**
+below. «Qué puedo decirle» in the menu always shows what is really loaded.
 
 ### Web addresses
 
@@ -307,6 +311,63 @@ asked for. Set `log_ignored_speech = true` while tuning, when seeing the
 exact wording is the point.
 
 It rotates at 5 MB, keeping one previous copy.
+
+## Adding commands and applications
+
+The vocabulary is TOML, not Rust. It ships as one file per subject in
+`minion/vocabulary/`:
+
+```
+macos.toml      Apple's own apps, clipboard, windows, tabs, screenshots, sound
+browsers.toml   Chrome, Safari, Firefox and what those commands mean inside one
+office.toml     Word, Excel, PowerPoint, Pages, Numbers, Keynote
+media.toml      Spotify, Music, and the transport controls
+dev.toml        Terminal, VS Code, and the terminal-only commands
+apps.toml       chat, design, notes — everything else opened by name
+sites.toml      pages you can name without their domain
+```
+
+Those are built into the binary, so Minion works with nothing else on
+disk. To add your own without rebuilding, **drop a `.toml` file in
+`~/Library/Application Support/Minion/vocabulary/`** and restart. Anything
+there is read after the built-in files, and `config.toml` is read after
+that, so a later entry with the same `name` replaces the earlier one:
+
+```toml
+category = "Trabajo"
+
+[[apps]]
+name = "Notion"
+bundle_id = "notion.id"
+aliases = ["notion", "nocion"]
+
+[[commands]]
+name = "compilar"
+phrases = ["compila el proyecto", "compila"]
+keys = "cmd-shift-b"
+bundles = ["com.microsoft.VSCode"]   # optional: only inside these apps
+
+[[sites]]
+name = "intranet"
+url = "https://intranet.example.com"
+```
+
+A command says what it does with exactly one of `keys` (a shortcut),
+`action` (one of Minion's own: `volume:up`, `volume:down`, `volume:mute`,
+`volume:unmute`, `music:play`, `music:pause`, `music:next`,
+`music:previous`, `minion:sleep`), `text` (type this) or `url` (open this).
+There is deliberately no way to run a script from a vocabulary file: it is
+data that may have been downloaded, and data that runs is not data.
+
+The schema is documented in full at the top of `vocabulary/macos.toml`. A
+file that does not parse is reported in the log and skipped, and so is a
+single bad entry — one typo costs that line, not the rest.
+`vocabulary/local.example.toml` holds the three applications that only
+exist on the machine Minion was written on; copy it if you have them.
+
+Not done yet: a separate community repository of vocabulary packs, and an
+«Actualizar vocabulario» item in the menu to fetch them. For now, packs are
+files you put in that directory yourself.
 
 ## Configuration
 
@@ -440,3 +501,7 @@ rebuilding.
 
 - **Developer ID signing**, so the app can be shared with other machines.
   The ad-hoc signature is enough for this one.
+
+- **A community vocabulary repository**, and an «Actualizar vocabulario»
+  menu item to pull packs from it. The loader already reads whatever is in
+  `~/Library/Application Support/Minion/vocabulary/`; nothing fetches it.

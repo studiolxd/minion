@@ -1,0 +1,38 @@
+# Applications that only exist on one particular Mac.
+#
+# NOT LOADED. This file is an example, kept next to the vocabulary it
+# belongs beside; nothing reads it. The entries below used to sit in
+# Minion's built-in tables, where they made every installation answer to
+# names only this machine has.
+#
+# To use them, copy this file to:
+#
+#   ~/Library/Application Support/Minion/vocabulary/local.toml
+#
+# or paste the [[apps]] blocks into config.toml. Either way, check the
+# bundle identifier against your own copy first:
+#
+#   defaults read "/Applications/Whatever.app/Contents/Info" CFBundleIdentifier
+#
+# Restart Minion afterwards; vocabulary is read once, at startup.
+#
+# The schema is documented at the top of macos.toml.
+
+category = "En este Mac"
+
+[[apps]]
+name = "Orca"
+bundle_id = "com.stablyai.orca"
+aliases = ["orca", "orka", "el editor", "editor"]
+
+[[apps]]
+name = "Teams"
+bundle_id = "com.microsoft.teams2"
+aliases = ["teams", "tims"]
+
+# The identifier is the one this Mac's copy reports, which is not the one
+# a fresh download from openai.com uses. Check yours.
+[[apps]]
+name = "ChatGPT"
+bundle_id = "com.openai.codex"
+aliases = ["chat gpt", "chatgpt", "gepete"]
