@@ -1326,6 +1326,7 @@ dependencies = [
  "core-foundation",
  "core-graphics",
  "cpal",
+ "hmac-sha256",
  "libc",
  "objc2",
  "objc2-app-kit",

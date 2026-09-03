@@ -10,6 +10,9 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 core-foundation = "0.10.1"
 core-graphics = "0.25.0"
 cpal = "0.18.2"
+# Already in the dependency tree via ort-sys; used directly here to check
+# downloaded model files against a known hash rather than pulling in sha2.
+hmac-sha256 = "1.1.14"
 libc = "0.2.189"
 objc2 = "0.6.4"
 objc2-app-kit = { version = "0.3.2", features = ["NSWindow", "NSButton", "NSSlider", "NSTextField", "NSControl", "NSView", "NSResponder", "NSApplication", "NSGraphics", "NSText", "NSFont", "NSColor", "NSCell", "NSActionCell", "NSStringDrawing", "NSWorkspace", "NSRunningApplication", "NSImage", "NSPanel", "NSEvent", "NSParagraphStyle", "NSScrollView", "NSClipView", "NSPopUpButton", "NSMenu", "NSMenuItem"] }
