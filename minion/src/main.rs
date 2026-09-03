@@ -48,6 +48,29 @@ use commands::Decision;
 
 /// What the tooltip says when there is nothing more particular to report.
 const TOOLTIP_IDLE: &str = "Minion — control por voz";
+const TOOLTIP_LISTENING: &str = "Minion — escuchando";
+const TOOLTIP_PAUSED: &str = "Minion — en pausa";
+
+/// How much of a transcript the tooltip carries.
+///
+/// Long enough to recognise the sentence, short enough that the tooltip
+/// stays one line. What was heard in full is in the log.
+const TOOLTIP_TRANSCRIPT: usize = 48;
+
+/// The tooltip line for an utterance and what came of it.
+///
+/// This is the whole visible trace of what Minion just did: the sounds can
+/// be turned off, the icon only blinks, and the log is a file. Pure, so
+/// the shortening can be tested.
+fn last_utterance_tooltip(transcript: &str, outcome: &str) -> String {
+    let trimmed = transcript.trim();
+    let short: String = if trimmed.chars().count() > TOOLTIP_TRANSCRIPT {
+        trimmed.chars().take(TOOLTIP_TRANSCRIPT - 1).collect::<String>() + "…"
+    } else {
+        trimmed.to_string()
+    };
+    format!("Minion — última: “{short}” → {outcome}")
+}
 
 /// Where to send someone whose microphone Minion cannot use.
 const MICROPHONE_SETTINGS: &str =
@@ -264,6 +287,8 @@ struct Listening {
     show_catalogue: Arc<AtomicBool>,
     /// Keep a copy of what was heard, for diagnosis.
     save_recordings: bool,
+    /// What the tooltip should say.
+    status: Status,
 }
 
 /// Settings for speaking back.
@@ -288,6 +313,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
         microphone,
         show_catalogue,
         save_recordings,
+        status,
     } = setup;
 
     // While Minion is speaking it must not act on what it hears: it listens
@@ -538,6 +564,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                     let listening = active.load(Ordering::Relaxed);
                     let reply = answers::answer(question, listening);
                     note!("asked    «{part}»  ->  {reply}");
+                    set_status(&status, &last_utterance_tooltip(&part, &reply));
                     acted.store(true, Ordering::Relaxed);
                     match &voice_reply {
                         Some(settings) => {
@@ -607,6 +634,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                 log_ignored_speech.load(Ordering::Relaxed),
                 play_sounds.load(Ordering::Relaxed),
                 &acted,
+                &status,
             );
 
             if commands::is_sleep(&decision) {
@@ -648,6 +676,7 @@ fn report(
     log_ignored_speech: bool,
     play_sounds: bool,
     acted: &AtomicBool,
+    status: &Status,
 ) {
         match decision {
             Decision::Ignored => {
@@ -658,9 +687,11 @@ fn report(
                 } else {
                     note!("heard    {seconds:.1}s of speech, not addressed to me");
                 }
+                set_status(status, &last_utterance_tooltip(transcript, "no era para mí"));
             }
             Decision::Unrecognised => {
                 note!("unknown  «{transcript}»  ->  not understood");
+                set_status(status, &last_utterance_tooltip(transcript, "no entendido"));
                 if play_sounds {
                     actions::play_sound(sounds::UNSURE);
                 }
@@ -684,6 +715,7 @@ fn report(
                             confidence * 100.0
                         );
                         acted.store(true, Ordering::Relaxed);
+                        set_status(status, &last_utterance_tooltip(transcript, &done.description));
                         if play_sounds {
                             actions::play_sound(sounds::DONE);
                         }
@@ -694,6 +726,10 @@ fn report(
                             "BLOCKED  «{transcript}»  ->  {}  — macOS refused it. \
                              Grant Accessibility in System Settings.",
                             done.description
+                        );
+                        set_status(
+                            status,
+                            &last_utterance_tooltip(transcript, "bloqueado por macOS"),
                         );
                         if play_sounds {
                             actions::play_sound(sounds::UNSURE);
@@ -964,6 +1000,14 @@ fn run_menu_bar(
             return;
         }
         shown_as_listening.set(awake);
+        // Pausing and resuming happen from three places — the menu, the
+        // shortcut and a spoken order — and this is the one that sees all
+        // three, because they all end up flipping the same flag.
+        if !downloading_for_timer.load(Ordering::Relaxed) {
+            if let Ok(mut text) = status_for_timer.lock() {
+                *text = if awake { TOOLTIP_LISTENING } else { TOOLTIP_PAUSED }.to_string();
+            }
+        }
         let face = if awake { icon::awake() } else { icon::asleep() };
         if let Ok(face) = face {
             let _ = tray_for_timer.set_icon_with_as_template(Some(face), true);
@@ -1259,7 +1303,9 @@ fn main() -> Result<()> {
     // exists to report it.
     let found = find_model(first_argument);
     let downloading = Arc::new(AtomicBool::new(found.is_none()));
-    let status: Status = Arc::new(Mutex::new(String::new()));
+    let status: Status = Arc::new(Mutex::new(
+        if found.is_some() { TOOLTIP_LISTENING } else { TOOLTIP_IDLE }.to_string(),
+    ));
     let Some(model_path) = found.or_else(|| {
         models::directory().map(|path| path.to_string_lossy().into_owned())
     }) else {
@@ -1346,7 +1392,7 @@ fn main() -> Result<()> {
             }
             note!("Model downloaded.");
             worker_downloading.store(false, Ordering::Relaxed);
-            set_status(&worker_status, TOOLTIP_IDLE);
+            set_status(&worker_status, TOOLTIP_LISTENING);
         }
         if let Err(e) = listen_and_obey(Listening {
             model_path,
@@ -1362,6 +1408,7 @@ fn main() -> Result<()> {
             microphone,
             show_catalogue: worker_catalogue,
             save_recordings,
+            status: Arc::clone(&worker_status),
         }) {
             fatal(&format!(
                 "Minion no puede escuchar y va a cerrarse.\n\n{e:#}\n\nComprueba \
@@ -1394,6 +1441,22 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_tooltip_says_what_was_heard_and_what_came_of_it() {
+        assert_eq!(
+            last_utterance_tooltip("  minion, abre Chrome  ", "abrir Chrome"),
+            "Minion — última: “minion, abre Chrome” → abrir Chrome"
+        );
+    }
+
+    #[test]
+    fn a_long_sentence_is_shortened_rather_than_wrapped() {
+        let long = "minion, escribe que mañana por la mañana tengo que llamar al fontanero";
+        let tooltip = last_utterance_tooltip(long, "escribir");
+        assert!(tooltip.contains('…'), "should be cut: {tooltip}");
+        assert!(!tooltip.contains("fontanero"), "and cut at the right place: {tooltip}");
+    }
 
     #[test]
     fn a_bundled_minion_restarts_through_its_bundle() {
