@@ -710,6 +710,67 @@ fn dictation_text(transcript: &str) -> Option<String> {
     (!text.trim().is_empty()).then_some(text)
 }
 
+/// What an edit command asks for, said while dictating instead of more
+/// text to type. Purely a description — [`crate::dictation::Transformer`]
+/// is the one that knows what was actually typed, so it is the one that
+/// turns this into an exact edit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EditIntent {
+    /// «borra la última palabra» / «borra eso»
+    DeleteLastWord,
+    /// «borra la última frase»
+    DeleteLastPhrase,
+    /// «cambia X por Y», exactly as heard — case and accents kept, so the
+    /// retyped text still looks dictated rather than transcribed.
+    Replace { find: String, replace: String },
+}
+
+/// Recognises an edit command, said while dictating instead of more text
+/// to type. Only when the edit phrase is the *whole* utterance (the wake
+/// word optional): "borra la última palabra que dije" has extra words of
+/// its own and is dictated content, not obeyed.
+///
+/// Works on the original words, not the normalised form: «cambia X por
+/// Y» must retype Y with its accents and capitals, the same reason
+/// [`dictation_text`] keeps the original transcript.
+pub fn dictation_edit(part: &str) -> Option<EditIntent> {
+    let normalised = normalise(part);
+    let normalised_word_count = normalised.split_whitespace().count();
+    let rest = strip_wake_word(&normalised).unwrap_or(&normalised);
+    let stripped = normalised_word_count - rest.split_whitespace().count();
+    let words: Vec<&str> = part.split_whitespace().skip(stripped).collect();
+    if words.is_empty() {
+        return None;
+    }
+
+    for phrase in ["borra la ultima palabra", "borra eso"] {
+        if keywords(rest) == keywords(phrase) {
+            return Some(EditIntent::DeleteLastWord);
+        }
+    }
+    if keywords(rest) == keywords("borra la ultima frase") {
+        return Some(EditIntent::DeleteLastPhrase);
+    }
+
+    dictation_replace(&words)
+}
+
+/// «cambia X por Y»: the verb, then whatever comes before the *last* «por»
+/// is what to find, and whatever comes after it is what to type instead —
+/// the last one, so "por" is free to appear inside X itself.
+fn dictation_replace(words: &[&str]) -> Option<EditIntent> {
+    let first = words.first()?;
+    if spanish::canonical_verb(&normalise(first)) != "cambiar" {
+        return None;
+    }
+    let rest = &words[1..];
+    let sep = rest.iter().rposition(|w| normalise(w) == "por")?;
+    let find = rest[..sep].join(" ");
+    let replace = rest[sep + 1..].join(" ");
+    (!find.is_empty() && !replace.is_empty())
+        .then_some(EditIntent::Replace { find, replace })
+}
+
 /// The browser in front, if the application in front is one.
 ///
 /// Returns the entry from [`BROWSERS`] so the value is `'static` and can
@@ -1976,6 +2037,52 @@ mod tests {
         assert_eq!(decide("minion modo dictado").0, Decision::StartDictation);
         assert_eq!(decide("minion deja de dictar").0, Decision::StopDictation);
         assert_eq!(decide("minion fin del dictado").0, Decision::StopDictation);
+    }
+
+    #[test]
+    fn edit_commands_are_recognised_with_or_without_the_wake_word() {
+        assert_eq!(dictation_edit("minion borra la última palabra"), Some(EditIntent::DeleteLastWord));
+        assert_eq!(dictation_edit("borra la última palabra"), Some(EditIntent::DeleteLastWord));
+        assert_eq!(dictation_edit("borra eso"), Some(EditIntent::DeleteLastWord));
+        assert_eq!(dictation_edit("minion borra la última frase"), Some(EditIntent::DeleteLastPhrase));
+        assert_eq!(dictation_edit("borra la última frase"), Some(EditIntent::DeleteLastPhrase));
+        assert_eq!(
+            dictation_edit("cambia mundo por planeta"),
+            Some(EditIntent::Replace { find: "mundo".to_string(), replace: "planeta".to_string() })
+        );
+        assert_eq!(
+            dictation_edit("minion cambia mundo por planeta"),
+            Some(EditIntent::Replace { find: "mundo".to_string(), replace: "planeta".to_string() })
+        );
+    }
+
+    #[test]
+    fn cambia_keeps_case_and_accents_and_takes_the_last_por() {
+        // "por" is a filler everywhere else, but here it is the separator
+        // and must survive even when it is also part of what to find.
+        assert_eq!(
+            dictation_edit("cambia gato por perro por Águila"),
+            Some(EditIntent::Replace {
+                find: "gato por perro".to_string(),
+                replace: "Águila".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn a_sentence_that_merely_contains_the_edit_words_is_not_an_edit() {
+        // Extra content words ("que dije") make this dictated text, not a
+        // command: an edit command must be the whole utterance.
+        assert_eq!(dictation_edit("borra la última palabra que dije"), None);
+        assert_eq!(dictation_edit("minion borra la última palabra que dije"), None);
+    }
+
+    #[test]
+    fn cambia_needs_both_a_find_and_a_replacement() {
+        assert_eq!(dictation_edit("cambia mundo"), None);
+        assert_eq!(dictation_edit("cambia por planeta"), None);
+        assert_eq!(dictation_edit("minion cierra la ventana"), None);
+        assert_eq!(dictation_edit("hola qué tal"), None);
     }
 
     #[test]
