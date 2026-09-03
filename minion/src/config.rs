@@ -181,6 +181,20 @@ pub enum ListenMode {
     Always,
     /// Only while the shortcut is held down.
     Hold,
+    /// Named sequences of phrases, run one after another. Only read from
+    /// here — a downloaded vocabulary pack cannot define one, since a
+    /// macro presses keys and launches applications on its own say-so,
+    /// which is not something a file that may have come from elsewhere
+    /// gets to do.
+    #[serde(default)]
+    pub macros: Vec<MacroConfig>,
+
+    /// Which engine a bare "busca X" searches, with nothing after it
+    /// naming one: "google", "youtube", "wikipedia" or "amazon". Empty,
+    /// unset or unrecognised all mean "google" — the last of those is
+    /// reported in the log, at startup, the same as an alias with no
+    /// command to point at.
+    pub search_engine: Option<String>,
 }
 
 /// A command of your own: what to say, and which keys to press.
@@ -236,6 +250,21 @@ pub struct AppConfig {
     pub aliases: Vec<String>,
 }
 
+/// A macro of your own: a name, the ways of asking for it, and what it
+/// does when asked.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MacroConfig {
+    /// Shown in the log when it runs.
+    pub name: String,
+    /// Ways of asking for it.
+    pub phrases: Vec<String>,
+    /// What to do, in order. Each one must be a phrase Minion would
+    /// understand on its own, without the wake word — that is added back
+    /// on before it is decided.
+    pub steps: Vec<String>,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -262,6 +291,8 @@ impl Default for Config {
             conversation_seconds: None,
             listen_mode: None,
             pause_during: None,
+            macros: Vec::new(),
+            search_engine: None,
         }
     }
 }
@@ -660,6 +691,48 @@ impl Config {
                 .collect(),
         )
     }
+
+    /// Named macros as `'static` entries, ready for [`crate::commands`].
+    ///
+    /// Phrases are normalised, the same as [`Self::extra_commands`]'s —
+    /// they are compared against normalised speech. Steps are kept exactly
+    /// as written: each one is decided afresh, with the wake word added
+    /// back on, so it is normalised then, and keeping the original casing
+    /// here is what lets the log show a step the way it was written.
+    pub fn macros(&self) -> Vec<crate::commands::Macro> {
+        self.macros
+            .iter()
+            .map(|entry| crate::commands::Macro {
+                name: Box::leak(entry.name.clone().into_boxed_str()),
+                phrases: Box::leak(
+                    entry
+                        .phrases
+                        .iter()
+                        .map(|p| &*Box::leak(crate::text::normalise(p).into_boxed_str()))
+                        .collect::<Vec<&'static str>>()
+                        .into_boxed_slice(),
+                ),
+                steps: Box::leak(
+                    entry
+                        .steps
+                        .iter()
+                        .map(|s| &*Box::leak(s.clone().into_boxed_str()))
+                        .collect::<Vec<&'static str>>()
+                        .into_boxed_slice(),
+                ),
+            })
+            .collect()
+    }
+
+    /// The search engine named in the file, not yet checked against the
+    /// ones Minion knows.
+    ///
+    /// Left to the caller: that table lives in `commands.rs`, next to
+    /// everything else about how a search is carried out, and it is the
+    /// one place that can report an unrecognised name and fall back.
+    pub fn search_engine(&self) -> Option<String> {
+        self.search_engine.clone().filter(|s| !s.trim().is_empty())
+    }
 }
 
 #[cfg(test)]
@@ -980,5 +1053,54 @@ mod tests {
         assert!(config.wake_words().is_none());
         assert_eq!(config.voice_threshold(), DEFAULT_VOICE_THRESHOLD);
         assert_eq!(config.command_threshold(), crate::commands::DEFAULT_THRESHOLD);
+        assert!(config.macros().is_empty());
+        assert!(config.search_engine().is_none());
+    }
+
+    #[test]
+    fn reads_macros_of_your_own() {
+        let config: Config = toml::from_str(
+            r#"
+            [[macros]]
+            name = "modo trabajo"
+            phrases = ["Modo Trabajo", "empieza a trabajar"]
+            steps = ["abre Slack", "abre Chrome", "sube el volumen"]
+            "#,
+        )
+        .expect("macro config should parse");
+        let macros = config.macros();
+        assert_eq!(macros.len(), 1);
+        assert_eq!(macros[0].name, "modo trabajo");
+        // Phrases are normalised, since they are matched against speech.
+        assert_eq!(macros[0].phrases, ["modo trabajo", "empieza a trabajar"]);
+        // Steps keep their original casing: they are decided afresh later,
+        // and this is what lets the log show them as they were written.
+        assert_eq!(macros[0].steps, ["abre Slack", "abre Chrome", "sube el volumen"]);
+    }
+
+    #[test]
+    fn a_macro_needs_all_three_fields() {
+        let bad: Result<Config, _> = toml::from_str(
+            r#"
+            [[macros]]
+            name = "roto"
+            phrases = ["roto"]
+            "#,
+        );
+        assert!(bad.is_err(), "a macro with no steps must not pass unnoticed");
+    }
+
+    #[test]
+    fn an_empty_search_engine_is_none() {
+        let config: Config = toml::from_str("search_engine = \"\"").expect("should parse");
+        assert!(config.search_engine().is_none());
+    }
+
+    #[test]
+    fn a_named_search_engine_is_read_as_written() {
+        // Validating it against the ones Minion actually knows is
+        // `commands::configure`'s job, not this one's.
+        let config: Config = toml::from_str("search_engine = \"YouTube\"").expect("should parse");
+        assert_eq!(config.search_engine().as_deref(), Some("YouTube"));
     }
 }

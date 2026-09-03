@@ -22,6 +22,7 @@ mod learn;
 mod models;
 mod preferences;
 mod session;
+mod shortcuts;
 mod spanish;
 mod speech;
 mod startup;

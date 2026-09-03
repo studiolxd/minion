@@ -17,6 +17,7 @@ use std::sync::OnceLock;
 
 use crate::actions::{self, key, Mods};
 use crate::config::Config;
+use crate::shortcuts;
 use crate::spanish;
 use crate::text::{keywords, normalise, similarity};
 use crate::vocabulary::Vocabulary;
@@ -43,6 +44,12 @@ static VOCABULARY: OnceLock<Vocabulary> = OnceLock::new();
 static USER_ALIASES: OnceLock<Vec<(&'static str, &'static str)>> = OnceLock::new();
 static USER_WAKE_WORDS: OnceLock<Vec<&'static str>> = OnceLock::new();
 static USER_THRESHOLD: OnceLock<f32> = OnceLock::new();
+
+/// Named macros, from `config.toml` only — see [`Macro`].
+static MACROS: OnceLock<Vec<Macro>> = OnceLock::new();
+/// Which engine a bare "busca X" searches. Set from `config.toml`;
+/// unset, invalid, or absent all mean the first of [`SEARCH_ENGINES`].
+static USER_SEARCH_ENGINE: OnceLock<&'static str> = OnceLock::new();
 
 /// The vocabulary in force.
 ///
@@ -82,6 +89,23 @@ pub fn configure(config: &Config) {
     if let Some(threshold) = config.threshold {
         let _ = USER_THRESHOLD.set(threshold.clamp(0.3, 1.0));
     }
+    let _ = MACROS.set(config.macros());
+    if let Some(name) = config.search_engine() {
+        let normalised = normalise(&name);
+        match SEARCH_ENGINES.iter().find(|(engine, _)| *engine == normalised) {
+            Some((engine, _)) => {
+                let _ = USER_SEARCH_ENGINE.set(engine);
+            }
+            None => crate::journal::write(&format!(
+                "Ignoring search_engine «{name}»: not one of {}",
+                SEARCH_ENGINES.iter().map(|(engine, _)| *engine).collect::<Vec<_>>().join(", ")
+            )),
+        }
+    }
+    // Cached now rather than on first use, so the list is already warm the
+    // first time someone says "atajo …" instead of making that utterance
+    // wait on `shortcuts list`.
+    shortcuts::refresh();
 }
 
 /// Where the command an alias points at lives, if it exists at all.
@@ -238,6 +262,56 @@ pub struct ContextualCommand {
 /// are already working in.
 const BROWSERS: &[&str] = &["com.google.Chrome", "com.apple.Safari", "org.mozilla.firefox"];
 
+/// A named sequence of phrases, defined in `config.toml`.
+///
+/// Only phrases, deliberately: `shortcut = "…"` and `keys = "…"` steps were
+/// considered and dropped. Everything a step could do is already sayable
+/// — including running a shortcut, once that lands — so a second kind of
+/// step would just be another way to write the same thing. Packs cannot
+/// define one: a macro presses keys and launches applications on its own
+/// say-so, which is not something data that may have been downloaded gets
+/// to do.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Macro {
+    /// Shown in the log when it runs.
+    pub name: &'static str,
+    /// Ways of asking for it.
+    pub phrases: &'static [&'static str],
+    /// What to do, in order — each one a phrase Minion would understand on
+    /// its own, wake word added back on before it is decided.
+    pub steps: &'static [&'static str],
+}
+
+/// Named macros in force. Empty until [`configure`] has read them.
+fn macros() -> &'static [Macro] {
+    MACROS.get().map_or(&[], |m| m.as_slice())
+}
+
+/// Search engines a bare or targeted "busca X" can reach, and the URL a
+/// query slots into. The first is the default when nothing else is named.
+///
+/// Lives in code rather than as a `[[sites]]` entry in
+/// `vocabulary/sites.toml`: that table only carries a plain URL an app
+/// opens as it is, with no place for where a query goes. A `search =
+/// "https://…?q={}"` field there is a reasonable next step, once more than
+/// the web needs one — kept here until then.
+const SEARCH_ENGINES: &[(&str, &str)] = &[
+    ("google", "https://www.google.com/search?q={}"),
+    ("youtube", "https://www.youtube.com/results?search_query={}"),
+    ("wikipedia", "https://es.wikipedia.org/w/index.php?search={}"),
+    ("amazon", "https://www.amazon.es/s?k={}"),
+];
+
+/// Words that ask for a Finder search instead of one of [`SEARCH_ENGINES`].
+const FINDER_WORDS: &[&str] = &["finder", "buscador"];
+
+/// The engine a bare "busca X" reaches: the user's, if `search_engine` in
+/// `config.toml` named a real one, otherwise the first of
+/// [`SEARCH_ENGINES`].
+fn default_search_engine() -> &'static str {
+    USER_SEARCH_ENGINE.get().copied().unwrap_or(SEARCH_ENGINES[0].0)
+}
+
 /// What was decided, before anything has been done about it.
 ///
 /// Deciding and acting are deliberately separate: it makes the vocabulary
@@ -354,6 +428,12 @@ pub enum Decision {
     Answer(crate::answers::Question),
     /// Run a command from the table, identified by name.
     Run(&'static str),
+    /// Run an installed Apple Shortcut, by its own name.
+    Shortcut(String),
+    /// Run a named macro: several phrases, in order.
+    Macro(&'static Macro),
+    /// Search for something in the Finder.
+    SearchFinder(String),
     /// Started with the wake word, but nothing was recognised.
     Unrecognised,
     /// Not addressed to the machine.
@@ -516,6 +596,99 @@ fn music_query(transcript: &str) -> Option<String> {
     let title = words.get(position + 1..)?.join(" ");
     let title = title.trim_matches(|c: char| !c.is_alphanumeric()).to_string();
     (!title.is_empty()).then_some(title)
+}
+
+/// What "busca X" asked for: where to look, besides what.
+enum SearchRequest {
+    /// A ready web address, engine already resolved.
+    Web(String),
+    /// Look in the Finder instead of on the web.
+    Finder(String),
+}
+
+/// Percent-encodes a query for a URL.
+///
+/// Mirrors `actions::search_spotify`'s own encoding, which is private to
+/// that module and built for a `spotify:` URI rather than a `?q=`.
+fn url_encode(query: &str) -> String {
+    query
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_string()
+            } else if c == ' ' {
+                "+".to_string()
+            } else {
+                let mut buffer = [0u8; 4];
+                c.encode_utf8(&mut buffer)
+                    .bytes()
+                    .map(|b| format!("%{b:02X}"))
+                    .collect()
+            }
+        })
+        .collect()
+}
+
+/// Extracts a search request: "busca X en Google", "busca X en el
+/// Finder", or a bare "busca X" for the default engine.
+///
+/// Works from the raw transcript, not [`keywords`]: "en" and "el", which
+/// mark where to search, are exactly the words `keywords` strips as
+/// filler. The query keeps its original casing and accents for the same
+/// reason [`music_query`] and [`dictation_text`] do — it is content headed
+/// for a search box, not something matched against the vocabulary.
+fn search_request(transcript: &str) -> Option<SearchRequest> {
+    let words: Vec<&str> = transcript.split_whitespace().collect();
+    let normalised: Vec<String> = words.iter().map(|w| normalise(w)).collect();
+
+    if normalised.first().is_none_or(|w| !wake_words().contains(&w.as_str())) {
+        return None;
+    }
+    if spanish::canonical_verb(normalised.get(1)?) != "buscar" || words.len() < 3 {
+        return None;
+    }
+
+    // "en <engine>", found from the end — a query is free text and may
+    // itself contain the word "en" ("busca cuando el amor en la ciudad").
+    if let Some(en_at) = normalised.iter().rposition(|w| w == "en") {
+        if en_at > 1 && en_at + 1 < normalised.len() {
+            let mut engine_at = en_at + 1;
+            if matches!(normalised[engine_at].as_str(), "el" | "la") {
+                engine_at += 1;
+            }
+            let named_last = engine_at == normalised.len() - 1;
+            if named_last {
+                if let Some(engine) = normalised.get(engine_at) {
+                    let query = words[2..en_at].join(" ");
+                    let query = query.trim_matches(|c: char| !c.is_alphanumeric() && c != ' ');
+                    if !query.is_empty() {
+                        if FINDER_WORDS.contains(&engine.as_str()) {
+                            return Some(SearchRequest::Finder(query.to_string()));
+                        }
+                        if let Some((_, template)) =
+                            SEARCH_ENGINES.iter().find(|(name, _)| name == engine)
+                        {
+                            let url = template.replace("{}", &url_encode(query));
+                            return Some(SearchRequest::Web(url));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // No "en …" naming a known engine: the whole remainder is the query,
+    // for the default one.
+    let query = words[2..].join(" ");
+    let query = query.trim_matches(|c: char| !c.is_alphanumeric() && c != ' ');
+    if query.is_empty() {
+        return None;
+    }
+    let template = SEARCH_ENGINES
+        .iter()
+        .find(|(name, _)| *name == default_search_engine())
+        .map_or(SEARCH_ENGINES[0].1, |(_, t)| t);
+    Some(SearchRequest::Web(template.replace("{}", &url_encode(query))))
 }
 
 /// Extracts text to be typed, if the sentence asks for dictation.
@@ -687,6 +860,16 @@ fn names_a_site(words: &[String]) -> bool {
         .any(|word| vocabulary().sites.iter().any(|site| site.name == word))
 }
 
+/// Whichever of the table wins the race for a phrase: a built-in or
+/// user-defined command, or a macro. Kept as one `Option` in `decide_in`
+/// so a macro is exactly as strong a match as a command — neither shadows
+/// the other just for being checked first.
+#[derive(Clone, Copy)]
+enum TableHit {
+    Command(&'static Command),
+    Macro(&'static Macro),
+}
+
 /// Works out what a transcription means with no application context.
 pub fn decide(transcript: &str) -> (Decision, f32) {
     decide_in(transcript, None)
@@ -748,13 +931,23 @@ pub fn decide_in(transcript: &str, context: Option<&str>) -> (Decision, f32) {
     }
 
     // Table commands next: they are more specific than "open something".
-    // The user's own are searched alongside the built-in ones.
-    let mut best: Option<(&Command, f32)> = None;
+    // The user's own are searched alongside the built-in ones, and so are
+    // macros — a macro is just as much the user's own as a `[[commands]]`
+    // entry, so it races the same way for the same phrase.
+    let mut best: Option<(TableHit, f32)> = None;
     for command in &vocabulary().commands {
         for phrase in command.phrases {
             let score = similarity(rest, phrase);
             if score >= threshold() && best.is_none_or(|(_, b)| score > b) {
-                best = Some((command, score));
+                best = Some((TableHit::Command(command), score));
+            }
+        }
+    }
+    for macro_ in macros() {
+        for phrase in macro_.phrases {
+            let score = similarity(rest, phrase);
+            if score >= threshold() && best.is_none_or(|(_, b)| score > b) {
+                best = Some((TableHit::Macro(macro_), score));
             }
         }
     }
@@ -774,6 +967,31 @@ pub fn decide_in(transcript: &str, context: Option<&str>) -> (Decision, f32) {
         }
     }
 
+    // An installed Apple Shortcut, named outright. Checked here, at the
+    // same standing as a table command, since "atajo …" is as explicit a
+    // marker as a phrase from the table.
+    if best.is_none() {
+        if let Some(name) = shortcuts::requested_name(rest) {
+            if let Some(installed) = shortcuts::find(name) {
+                return (Decision::Shortcut(installed), 1.0);
+            }
+        }
+    }
+
+    // "busca X [en …]": before applications, so "busca chrome en google"
+    // is a search and not an attempt to launch Chrome — "en" is as
+    // explicit a marker as "atajo" is for a shortcut.
+    if best.is_none() {
+        if let Some(request) = search_request(transcript) {
+            return match request {
+                SearchRequest::Web(url) => {
+                    (Decision::Browse { url, in_browser: browser_in_front(context) }, 0.9)
+                }
+                SearchRequest::Finder(query) => (Decision::SearchFinder(query), 0.9),
+            };
+        }
+    }
+
     // Phrasings the user added, or that were learned from the log. The
     // target may be any command with that name, the user's own included.
     for (name, phrase) in USER_ALIASES.get().into_iter().flatten() {
@@ -782,7 +1000,7 @@ pub fn decide_in(transcript: &str, context: Option<&str>) -> (Decision, f32) {
             continue;
         }
         if let Some(command) = named_command(name) {
-            best = Some((command, score));
+            best = Some((TableHit::Command(command), score));
         } else if let Some(bundle) = context {
             // A contextual command only exists where it applies, so this
             // is the one place it can be reached by name.
@@ -872,7 +1090,8 @@ pub fn decide_in(transcript: &str, context: Option<&str>) -> (Decision, f32) {
     }
 
     match best {
-        Some((command, score)) => (Decision::Run(command.name), score),
+        Some((TableHit::Command(command), score)) => (Decision::Run(command.name), score),
+        Some((TableHit::Macro(macro_), score)) => (Decision::Macro(macro_), score),
         None => (Decision::Unrecognised, 0.0),
     }
 }
@@ -942,8 +1161,115 @@ pub fn perform(decision: &Decision) -> Option<Done> {
                 outcome: run_action(command.action),
             })
         }
+        Decision::SearchFinder(query) => Some(Done {
+            description: format!("buscar «{query}» en el Finder"),
+            outcome: run_finder_search(query),
+        }),
+        // Logged in its own line, not the generic "ran … -> …" one, the
+        // same way `heard`, `voice` and `blank` are: `None` here is what
+        // stops `report` in main.rs from adding a second one.
+        Decision::Shortcut(name) => {
+            crate::journal::write(&format!("shortcut «{name}»"));
+            if let Err(reason) = shortcuts::run(name) {
+                crate::journal::write(&format!("BLOCKED  shortcut «{name}»: {reason}"));
+            }
+            None
+        }
+        Decision::Macro(macro_) => {
+            run_macro(macro_);
+            None
+        }
         _ => None,
     }
+}
+
+/// Opens a Finder search window and fills it in.
+///
+/// There is no CLI for "open a Finder search with this text" the way
+/// `open -b` covers applications: Spotlight (⌘Space) searches everything,
+/// not just files, and may be remapped besides, while Finder's own "Find"
+/// (⌘F) is scoped to the frontmost window, which is what a spoken "busca X
+/// en el Finder" most plausibly means — the folder you are already
+/// looking at, not the whole disk. Simulated because there is nothing to
+/// script: activate Finder, press ⌘F, type the query. `keystroke` sends
+/// Unicode text, the same as `actions::type_text` does through Core
+/// Graphics, so accents survive regardless of keyboard layout.
+fn run_finder_search(query: &str) -> Result<(), String> {
+    actions::applescript(&format!(
+        "tell application \"Finder\" to activate\n\
+         tell application \"System Events\"\n\
+         keystroke \"f\" using {{command down}}\n\
+         delay 0.3\n\
+         keystroke \"{}\"\n\
+         end tell",
+        actions::applescript_string(query)
+    ))
+}
+
+/// What trying one macro step decided.
+enum StepResult {
+    Ok,
+    /// The step itself named another macro.
+    Recursive,
+    /// The step could not be carried out, or named nothing at all.
+    Refused,
+}
+
+/// Decides and carries out one macro step, for real.
+///
+/// Split out from [`run_macro_steps`] so the sequencing — order, stopping
+/// at the first refusal, the recursion guard — is testable on its own,
+/// with a stand-in for this that touches nothing on the machine.
+fn try_macro_step(step: &str) -> StepResult {
+    let wake = wake_words().first().copied().unwrap_or("minion");
+    let (decision, _) = decide(&format!("{wake} {step}"));
+    if matches!(decision, Decision::Macro(_)) {
+        return StepResult::Recursive;
+    }
+    match perform(&decision) {
+        Some(done) if done.outcome.is_ok() => StepResult::Ok,
+        _ => StepResult::Refused,
+    }
+}
+
+/// Runs a macro's steps in order, stopping at the first one that fails.
+///
+/// `try_step` decides what a step means and, unless it names another
+/// macro, carries it out. Taken as a parameter rather than calling
+/// [`try_macro_step`] directly so a test can supply one that only records
+/// what it was asked to do.
+fn run_macro_steps(macro_: &Macro, mut try_step: impl FnMut(&str) -> StepResult) {
+    let total = macro_.steps.len();
+    for (i, step) in macro_.steps.iter().enumerate() {
+        crate::journal::write(&format!("macro    {}: {}/{total} {step}", macro_.name, i + 1));
+        match try_step(step) {
+            StepResult::Ok => {}
+            StepResult::Recursive => {
+                crate::journal::write(&format!(
+                    "macro    {}: a macro cannot call another macro — stopped",
+                    macro_.name
+                ));
+                return;
+            }
+            StepResult::Refused => {
+                crate::journal::write(&format!(
+                    "macro    {}: stopped at {}/{total} — «{step}» was refused",
+                    macro_.name,
+                    i + 1
+                ));
+                return;
+            }
+        }
+        // A gap between steps, not before the first or after the last.
+        // Skipped under test: nothing here should make the suite slow.
+        if i + 1 < total && !cfg!(test) {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+    }
+}
+
+fn run_macro(macro_: &Macro) {
+    run_macro_steps(macro_, try_macro_step);
 }
 
 fn run_action(action: Action) -> Result<(), String> {
@@ -1811,5 +2137,129 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn browses_to(phrase: &str, expected: &str) {
+        match decision(phrase) {
+            Decision::Browse { url, .. } => assert_eq!(url, expected, "for «{phrase}»"),
+            other => panic!("«{phrase}» should open {expected}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn searches_a_named_engine() {
+        browses_to(
+            "minion busca gatos en google",
+            "https://www.google.com/search?q=gatos",
+        );
+        browses_to(
+            "minion busca gatos en youtube",
+            "https://www.youtube.com/results?search_query=gatos",
+        );
+        browses_to(
+            "minion busca gatos en wikipedia",
+            "https://es.wikipedia.org/w/index.php?search=gatos",
+        );
+        browses_to(
+            "minion busca zapatillas en amazon",
+            "https://www.amazon.es/s?k=zapatillas",
+        );
+    }
+
+    #[test]
+    fn a_multi_word_query_survives_the_engine_search() {
+        browses_to(
+            "minion busca gatos graciosos en google",
+            "https://www.google.com/search?q=gatos+graciosos",
+        );
+    }
+
+    #[test]
+    fn a_bare_search_uses_the_default_engine() {
+        // No `search_engine` configured in a test, so the default applies.
+        browses_to("minion busca gatos", "https://www.google.com/search?q=gatos");
+    }
+
+    #[test]
+    fn searches_the_finder_instead_of_the_web() {
+        assert_eq!(
+            decision("minion busca recibos en el finder"),
+            Decision::SearchFinder("recibos".to_string())
+        );
+    }
+
+    #[test]
+    fn an_unknown_engine_falls_back_to_a_plain_search() {
+        // "en el horno" names nothing Minion knows how to search, so the
+        // whole sentence becomes the query instead of being discarded.
+        browses_to(
+            "minion busca pan en el horno",
+            "https://www.google.com/search?q=pan+en+el+horno",
+        );
+    }
+
+    #[test]
+    fn a_search_with_nothing_to_look_for_is_not_a_search() {
+        assert_eq!(decision("minion busca"), Decision::Unrecognised);
+    }
+
+    #[test]
+    fn macro_steps_run_in_order() {
+        let seen = std::cell::RefCell::new(Vec::new());
+        let steps: &[&str] = &["abre Slack", "abre Chrome", "sube el volumen"];
+        let macro_ = Macro { name: "modo trabajo", phrases: &["modo trabajo"], steps };
+        run_macro_steps(&macro_, |step| {
+            seen.borrow_mut().push(step.to_string());
+            StepResult::Ok
+        });
+        assert_eq!(*seen.borrow(), steps.to_vec());
+    }
+
+    #[test]
+    fn a_macro_stops_at_the_first_refused_step() {
+        let seen = std::cell::RefCell::new(Vec::new());
+        let steps: &[&str] = &["uno", "dos", "tres", "cuatro"];
+        let macro_ = Macro { name: "prueba", phrases: &["prueba"], steps };
+        run_macro_steps(&macro_, |step| {
+            seen.borrow_mut().push(step.to_string());
+            if step == "dos" { StepResult::Refused } else { StepResult::Ok }
+        });
+        assert_eq!(*seen.borrow(), vec!["uno".to_string(), "dos".to_string()]);
+    }
+
+    #[test]
+    fn a_macro_cannot_call_another_macro() {
+        let seen = std::cell::RefCell::new(Vec::new());
+        let steps: &[&str] = &["uno", "atajo de otro macro", "tres"];
+        let macro_ = Macro { name: "prueba", phrases: &["prueba"], steps };
+        run_macro_steps(&macro_, |step| {
+            seen.borrow_mut().push(step.to_string());
+            if step.starts_with("atajo") { StepResult::Recursive } else { StepResult::Ok }
+        });
+        assert_eq!(*seen.borrow(), vec!["uno".to_string(), "atajo de otro macro".to_string()]);
+    }
+
+    #[test]
+    fn an_empty_macro_runs_nothing() {
+        let seen = std::cell::RefCell::new(Vec::new());
+        let macro_ = Macro { name: "vacio", phrases: &["vacio"], steps: &[] };
+        run_macro_steps(&macro_, |step| {
+            seen.borrow_mut().push(step.to_string());
+            StepResult::Ok
+        });
+        assert!(seen.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_step_nobody_understands_is_refused_not_ignored() {
+        // `try_macro_step` never runs anything real in this suite — there
+        // is no macro in the global table for a step to name, since no
+        // test calls `configure`, so its `Decision::Macro` branch is only
+        // exercised through `run_macro_steps`'s injected `StepResult`
+        // above. This checks the other half: a step that names nothing at
+        // all must stop the macro rather than being silently skipped.
+        // Same phrase `admits_when_it_does_not_understand` already proves
+        // decides to `Unrecognised`.
+        assert!(matches!(try_macro_step("haz un pino"), StepResult::Refused));
     }
 }
