@@ -33,6 +33,12 @@ Do not resurrect 1 or 2. The user chose Rust deliberately over Python/Go.
 - Menu: "Escuchar/Pausar" is one toggle; "Ayuda" sits above "Salir".
 - Commit with clear messages (imperative, say why). The user asks for commits
   explicitly ("haz commits"); do them after each working change.
+- Dictated text is logged verbatim, on purpose: `minion learn` needs to see
+  exactly what was said to turn it into an alias. Do not start redacting or
+  truncating it.
+- Commands are never gated by voice similarity beyond the single 0.32
+  `voice_threshold` check — the user rejected escalating that per command
+  (e.g. a higher bar for dictation or quitting apps). One check, one number.
 
 ## Build, test, install
 
@@ -41,8 +47,8 @@ Do not resurrect 1 or 2. The user chose Rust deliberately over Python/Go.
 ```sh
 export PATH="/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:$PATH"
 cd /Users/suvi/Dev/talon/minion
-cargo test                 # ~132 tests, must all pass
-cargo clippy --all-targets # 6 pre-existing warnings (new clippy); add none
+cargo test                 # ~179 tests, must all pass
+cargo clippy --all-targets # 5 pre-existing warnings (new clippy); add none
 ./build-app.sh             # cargo build --release + Minion.app, signed with
                            # the user's Apple Development certificate
 ./install.sh               # quits the running copy, copies to /Applications,
@@ -94,33 +100,69 @@ was considered and rejected on that data.
 ## Architecture (src/)
 
 - `main.rs` — orchestration: `listen_and_obey()`, menu bar, log, flock,
-  permission report, idle model unload (5 min → 405 MB).
-- `audio.rs` — cpal capture, resample, energy VAD with adaptive noise floor,
-  320 ms preroll (without it "Chrome" lost its first consonant), segmenter.
+  permission report, idle model unload (5 min → 405 MB). Also has `fatal()`
+  (log + Spanish `NSAlert` + exit 0, never a non-zero exit that would make
+  launchd loop), a panic hook (release runs `panic = "abort"`, so the hook
+  is the only record of what killed it), tray-first model download (icon
+  exists before the 670 MB fetch starts, so the menu bar is never empty),
+  «Reiniciar», and a stateful tooltip (listening/paused, last utterance and
+  outcome). A `session.rs` module — the session state machine behind
+  `listen_and_obey`, pure and tested — is being extracted from it right now
+  in a parallel worktree; expect `listen_and_obey` to shrink around it.
+- `audio.rs` — cpal capture, resample through a windowed-sinc anti-alias
+  filter before decimating to 16 kHz (the naive decimator folded 8–24 kHz
+  into 0–8 kHz, which is where fricatives live — "Chrome" and "Safari"
+  were the worst hit), energy VAD with adaptive noise floor, 320 ms preroll
+  (without it "Chrome" lost its first consonant), segmenter. Emits
+  `Utterance { samples, speech_start, speech_end }` so downstream code can
+  isolate the speech from the preroll/silence around it.
 - `commands.rs` — vocabulary: `DEFAULT_WAKE_WORDS`, `APPS` (with aliases),
   `COMMANDS`, `CONTEXTUAL_COMMANDS`, `NUMBERED`; `decide_in()` order:
   dictation → mode/undo → contextual → COMMANDS → questions → numbered →
   music → user aliases → websites → apps. Wake word is matched fuzzily
-  (≤2 edits, 3 shared leading letters; 2 let "millón" through) and a wake
-  word split in two ("Mini on") is rejoined.
+  (≤1 edit, 4 shared leading letters; 2 edits let "minuto" and "mínimo"
+  through, so listed two-edit forms as explicit aliases instead) and a
+  wake word split in two ("Mini on") is rejoined before judging. App
+  aliases match whole words only (`near_alias`/`run_together`, never a
+  substring search — that read "gmail" as containing "mail" and opened
+  Mail), with a bounded one-edit fuzzy path scored 0.8, below a plain or
+  run-together mention.
 - `text.rs` — normalise, keyword F1 similarity, `words_match` (≤1 edit, or
-  a shared stem ≥6 letters covering ¾ of the shorter word), `edits_between`.
+  a shared stem ≥6 letters covering ¾ of the shorter word) with a real
+  `strict` mode — a single-keyword command gets no edit-distance slack at
+  all, so "cortar" cannot fire as "contar" — and `edits_between`.
 - `spanish.rs` — filler words, verb canonicalisation (explicit table, no
-  stemmer on purpose).
+  stemmer on purpose). `text::keywords()` canonicalises verbs *before*
+  dropping fillers: "para" is both a filler and the imperative of "parar",
+  and dropping first turned "para la música" into just `[musica]`, which
+  paused Spotify instead of opening it.
 - `speaker.rs` — ECAPA-TDNN embeddings, cosine similarity, threshold
   **0.32** (measured on real mic audio: worst 0.38, avg 0.57; 0.45 rejected
-  the owner). `fbank.rs` is the Kaldi-compatible mel frontend.
+  the owner). Verifies short clips by tiling them up to a working length
+  instead of waving them through unchecked, and embeds only the speech
+  slice of the utterance (via `Utterance.speech_start/end`), not the
+  preroll and silence around it. `fbank.rs` is the Kaldi-compatible mel
+  frontend.
 - `answers.rs` / `speech.rs` — spoken answers (time, date, battery, volume,
   help) via the system synthesiser.
 - `preferences.rs` — AppKit window; controls are **polled** by an NSTimer in
   `NSRunLoopCommonModes` (not Objective-C targets — documented at the top).
 - `hotkey.rs` — CGEventTap on its own thread (an `NSEvent` global monitor on
-  the main loop broke the menu). Default ⌥Space pauses/resumes.
+  the main loop broke the menu). Default ⌥Space pauses/resumes. Re-enables
+  the tap on `TapDisabledByTimeout`/`TapDisabledByUserInput` — macOS turns a
+  slow tap off and it used to never come back, so ⌥Space would silently
+  stop working until the next restart.
 - `actions.rs` — key codes (positional! Spanish ISO layout breaks `cmd-[`
   etc.), open/quit apps, type text, shortcut parsing.
 - `learn.rs` / `enroll.rs` — turn `unknown` log lines into aliases; record
-  the voice profile. `journal.rs`, `config.rs`, `icon.rs`, `models.rs`,
-  `startup.rs` are what their names say.
+  the voice profile. `journal.rs` rotates while running (not just at
+  startup) and mirrors to stdout only when stdout is a TTY (launchd
+  redirects it to a second, unrotated log otherwise). `config.rs` edits
+  are pure functions (`with_option(contents, key, value)`) with
+  `toml_string` escaping quotes and backslashes before they reach the
+  file. `models.rs` pins each download to a repository revision and checks
+  its SHA-256 before keeping it. `icon.rs`, `startup.rs` are what their
+  names say.
 - `assets/*.svg` — the face. Asleep keeps the **same smile**, only the eye
   closes.
 
@@ -137,6 +179,18 @@ was considered and rejected on that data.
   second copy. `flock` guards against duplicates anyway.
 - Speaker verification bugs hide behind synthetic tests (0.84 same-voice on
   clean audio). Measure on real recordings before changing thresholds.
+- `fatal()` must *wait* for its dialog (`show_message_and_wait`), not queue
+  it and exit — two branches built on `show_message` independently, one
+  making it async, the other calling `exit` right after, so the process
+  was gone before the `NSAlert` could appear.
+- Never write to the journal from inside the CGEventTap callback: it opens
+  a file and takes a lock, which is exactly the kind of slowness that gets
+  macOS to disable the tap in the first place. Log outside it, on the run
+  loop, between callbacks.
+- The Accessibility-pane prompt must fire once per **boot**, not once per
+  process start: launchd's `ThrottleInterval` restarts a crash-looping
+  Minion every 10–30 s, and each restart used to reopen System Settings.
+  `kern.boottime`, stashed in Application Support, is the marker.
 
 ## Open items
 
