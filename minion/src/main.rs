@@ -827,6 +827,15 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                         }
                     }
                 }
+                // The HUD appears the instant Silero opens an utterance —
+                // long before there is a transcript, let alone a decision.
+                // `speech_open` is a level, not a latch (unlike
+                // `speech_started` below): calling this every tick while
+                // still speaking is harmless, since both of the panel's
+                // lines are already pending.
+                if listener.speech_open.load(Ordering::Relaxed) {
+                    hud::note_speech_open();
+                }
                 // Someone has started talking. If the model was released
                 // while idle, load it now: the sentence and the silence
                 // that closes it take longer than the load, so this hides
@@ -1059,6 +1068,11 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
             continue;
         }
         let elapsed_ms = started.elapsed().as_millis();
+
+        // The transcript is known now, the decision is not — the HUD's
+        // first line can already stop being an ellipsis while the second
+        // keeps animating through the speaker check and `session::resolve`.
+        hud::push_update(hud::Update { heard: Some(transcript.clone()), outcome: None });
 
         // One sentence can hold several instructions joined by "y luego".
         for part in session.split(&transcript) {
@@ -1359,6 +1373,10 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                     let reply = answers::answer(question, listening);
                     note!("asked    «{part}»  ->  {reply}");
                     set_status(&status, &last_utterance_tooltip(&part, &reply));
+                    hud::push_update(hud::Update {
+                        heard: Some(part.clone()),
+                        outcome: Some(reply.clone()),
+                    });
                     acted.store(true, Ordering::Relaxed);
                     answered.store(true, Ordering::Relaxed);
                     match &voice_reply {
@@ -1391,6 +1409,10 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                     acted.store(true, Ordering::Relaxed);
                     let reply = "Conversación olvidada.";
                     set_status(&status, &last_utterance_tooltip(&part, reply));
+                    hud::push_update(hud::Update {
+                        heard: Some(part.clone()),
+                        outcome: Some(reply.to_string()),
+                    });
                     match &voice_reply {
                         Some(settings) => {
                             speaking.store(true, Ordering::Relaxed);
@@ -1439,6 +1461,10 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                         Err(why) => why.to_string(),
                     };
                     set_status(&status, &last_utterance_tooltip(&part, &reply));
+                    hud::push_update(hud::Update {
+                        heard: Some(part.clone()),
+                        outcome: Some(reply.clone()),
+                    });
                     acted.store(true, Ordering::Relaxed);
                     answered.store(true, Ordering::Relaxed);
                     match &voice_reply {
@@ -1696,10 +1722,18 @@ fn report(
                 note!("heard    {seconds:.1}s of speech, not addressed to me");
             }
             set_status(at.status, &last_utterance_tooltip(transcript, "no era para mí"));
+            hud::push_update(hud::Update {
+                heard: Some(transcript.to_string()),
+                outcome: Some("no era para mí".to_string()),
+            });
         }
         Decision::Unrecognised => {
             note!("unknown  «{transcript}»  ->  not understood");
             set_status(at.status, &last_utterance_tooltip(transcript, "no entendido"));
+            hud::push_update(hud::Update {
+                heard: Some(transcript.to_string()),
+                outcome: Some("no entendido".to_string()),
+            });
             if at.play_sounds {
                 let _ = actions::play_sound(sounds::UNSURE);
             }
@@ -1723,6 +1757,10 @@ fn report(
                         at.status,
                         &last_utterance_tooltip(transcript, "bloqueado por macOS"),
                     );
+                    hud::push_update(hud::Update {
+                        heard: Some(transcript.to_string()),
+                        outcome: Some("bloqueado por macOS".to_string()),
+                    });
                     if at.play_sounds {
                         let _ = actions::play_sound(sounds::BLOCKED);
                     }
@@ -1741,6 +1779,10 @@ fn report(
                     );
                     at.acted.store(true, Ordering::Relaxed);
                     set_status(at.status, &last_utterance_tooltip(transcript, &done.description));
+                    hud::push_update(hud::Update {
+                        heard: Some(transcript.to_string()),
+                        outcome: Some(done.description.clone()),
+                    });
                     if at.play_sounds {
                         let _ = actions::play_sound(sounds::DONE);
                     }
@@ -2247,7 +2289,10 @@ fn run_menu_bar(
             || onboarding_for_timer.is_visible()
             || vocabulary_editor_for_timer.is_visible()
             || blink_until.get().is_some()
-            || speaking_for_timer.load(Ordering::Relaxed);
+            || speaking_for_timer.load(Ordering::Relaxed)
+            // The HUD's own ellipsis animates on a 300 ms cycle — the
+            // throttled 250 ms tick below would make it stutter.
+            || hud_for_timer.is_visible();
         if !watched && !on_schedule(throttle_tick, UI_THROTTLE_TICKS) {
             return;
         }
@@ -2585,14 +2630,15 @@ fn run_menu_bar(
             if !wanted.is_empty() && *wanted != *shown_tooltip.borrow() {
                 let _ = tray_for_timer.set_tooltip(Some(&*wanted));
                 shown_tooltip.replace(wanted.clone());
-                // "Últimas órdenes" reads the same line — see
-                // `parse_last_utterance` for why this is a first version
-                // rather than a queue pushed to from the listening loop.
+                // "Últimas órdenes" reads the same line — kept as a tooltip
+                // parse on purpose, unlike the HUD (which the listening
+                // loop now feeds directly through `hud::push_update`): this
+                // menu only wants the finished pair, once, and the tooltip
+                // is already exactly that.
                 // "no era para mí" is speech Minion decided was not
                 // addressed to it at all, so it is not an order to keep.
                 if let Some((text, outcome)) = parse_last_utterance(&wanted) {
                     if outcome != "no era para mí" {
-                        hud_for_timer.note_heard(hud_now, &text, &outcome);
                         let mut queue = history.borrow_mut();
                         if queue.len() == HISTORY_LEN {
                             queue.pop_back();

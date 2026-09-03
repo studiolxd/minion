@@ -14,12 +14,17 @@
 //! update", "stays open while dictating or a question is pending") can be
 //! tested without a screen.
 //!
-//! What the listening loop feeds in — the dictation text and whether a
-//! learning question is pending — arrives through two module-level
-//! functions, [`set_dictation_text`] and [`set_question_pending`], rather
-//! than a struct field: the loop that owns that state is not this file's
-//! to change (see CLAUDE.md), and a free function is the smallest thing
-//! that could be added to it from outside.
+//! What the listening loop feeds in — the dictation text, whether a
+//! learning question is pending, that an utterance just opened, and the
+//! transcript/decision as they arrive — comes through module-level
+//! functions ([`set_dictation_text`], [`set_question_pending`],
+//! [`note_speech_open`], [`push_update`]) rather than a struct field: the
+//! loop that owns that state is not this file's to change (see
+//! CLAUDE.md), and a free function is the smallest thing that could be
+//! added to it from outside. The panel appears the instant speech opens —
+//! before there is anything to show but an animated ellipsis — and its two
+//! lines fill in independently as the transcript, then the decision,
+//! arrive; see [`Content`].
 
 use std::cell::{Cell, RefCell};
 use std::sync::{Mutex, OnceLock};
@@ -174,6 +179,61 @@ impl Visibility {
     }
 }
 
+/// What the listening loop found out about the utterance in progress: the
+/// transcript, the decision, or both — however much is known so far.
+/// Pushed through [`push_update`] rather than parsed back out of the
+/// tooltip, which only ever held the finished pair (see the module doc's
+/// history and `main.rs`'s `parse_last_utterance`, kept only for "Últimas
+/// órdenes").
+#[derive(Debug, Default, Clone)]
+pub struct Update {
+    pub heard: Option<String>,
+    pub outcome: Option<String>,
+}
+
+/// The panel's two lines: what was heard, and what it became. Each starts
+/// "pending" — drawn as the animated ellipsis — the moment speech opens,
+/// and stops being pending once [`push_update`] supplies it. Pure, so the
+/// sequence (open → heard → outcome) can be tested without AppKit.
+#[derive(Debug, Default)]
+struct Content {
+    heard: String,
+    heard_pending: bool,
+    outcome: String,
+    outcome_pending: bool,
+}
+
+impl Content {
+    /// Silero opened a new utterance: both lines go back to pending, even
+    /// if the last one never resolved (e.g. it turned out to be noise).
+    fn note_speech_open(&mut self) {
+        self.heard.clear();
+        self.heard_pending = true;
+        self.outcome.clear();
+        self.outcome_pending = true;
+    }
+
+    fn push_update(&mut self, update: Update) {
+        if let Some(heard) = update.heard {
+            self.heard = heard;
+            self.heard_pending = false;
+        }
+        if let Some(outcome) = update.outcome {
+            self.outcome = outcome;
+            self.outcome_pending = false;
+        }
+    }
+}
+
+/// Which ellipsis frame to show after `elapsed_ms` of waiting — "·", "··",
+/// "···" cycling every 300 ms, so a still-open panel visibly breathes
+/// rather than looking stuck.
+fn ellipsis_frame(elapsed_ms: u64) -> &'static str {
+    const FRAMES: [&str; 3] = ["·", "··", "···"];
+    const FRAME_MS: u64 = 300;
+    FRAMES[(elapsed_ms / FRAME_MS) as usize % FRAMES.len()]
+}
+
 /// Cuts `text` to at most `max_chars`, keeping the end — while dictating,
 /// what was typed most recently is what the cursor is at, so that is what
 /// has to stay on screen when the buffer outgrows the panel.
@@ -254,8 +314,10 @@ pub struct Hud {
     state: RefCell<Visibility>,
     shown: Cell<bool>,
     current_face: Cell<Option<Face>>,
-    last_heard: RefCell<String>,
-    last_outcome: RefCell<String>,
+    content: RefCell<Content>,
+    /// When the current pending spell (speech open, or waiting on a
+    /// transcript/outcome) began — the ellipsis animates from here.
+    pending_since: Cell<Option<Instant>>,
     last_dictation: RefCell<String>,
     dictating: Cell<bool>,
 }
@@ -348,8 +410,8 @@ impl Hud {
             state: RefCell::new(state),
             shown: Cell::new(false),
             current_face: Cell::new(None),
-            last_heard: RefCell::new(String::new()),
-            last_outcome: RefCell::new(String::new()),
+            content: RefCell::new(Content::default()),
+            pending_since: Cell::new(None),
             last_dictation: RefCell::new(String::new()),
             dictating: Cell::new(false),
         }
@@ -359,13 +421,11 @@ impl Hud {
         self.state.borrow_mut().set_pinned(on);
     }
 
-    /// Something was heard and decided — the outcome already reads as it
-    /// does in the log and the menu bar's tooltip ("abrir Chrome", "no
-    /// entendido"…).
-    pub fn note_heard(&self, now: Instant, heard: &str, outcome: &str) {
-        self.state.borrow_mut().note_heard(now);
-        *self.last_heard.borrow_mut() = heard.to_string();
-        *self.last_outcome.borrow_mut() = outcome.to_string();
+    /// Whether the panel is on screen right now — used to keep the run
+    /// loop's timer at full speed (50 ms) while it is, so the ellipsis
+    /// animates smoothly instead of stepping once every throttled tick.
+    pub fn is_visible(&self) -> bool {
+        self.shown.get()
     }
 
     pub fn set_dictating(&self, on: bool) {
@@ -387,9 +447,10 @@ impl Hud {
     }
 
     /// Reads what the listening loop last reported through
-    /// [`set_dictation_text`] and [`set_question_pending`], applies
-    /// "muestra/esconde lo que oyes" if one was said since the last call,
-    /// and shows or hides the panel — the one thing to call once a tick.
+    /// [`set_dictation_text`], [`set_question_pending`], [`note_speech_open`]
+    /// and [`push_update`], applies "muestra/esconde lo que oyes" if one was
+    /// said since the last call, and shows or hides the panel — the one
+    /// thing to call once a tick.
     pub fn tick(&self, now: Instant) {
         if let Some(show) = take_request() {
             let mut state = self.state.borrow_mut();
@@ -402,6 +463,16 @@ impl Hud {
         self.state.borrow_mut().set_question_pending(question_pending());
         self.state.borrow_mut().set_busy(busy());
 
+        if take_speech_open() {
+            self.content.borrow_mut().note_speech_open();
+            self.pending_since.set(Some(now));
+            self.state.borrow_mut().note_heard(now);
+        }
+        if let Some(update) = take_update() {
+            self.content.borrow_mut().push_update(update);
+            self.state.borrow_mut().note_heard(now);
+        }
+
         if self.dictating.get() {
             let text = dictation_text();
             if *self.last_dictation.borrow() != text {
@@ -411,7 +482,7 @@ impl Hud {
 
         let visible = self.state.borrow().visible(now);
         if visible {
-            self.repaint();
+            self.repaint(now);
             if !self.shown.get() {
                 self.window.orderFrontRegardless();
                 self.shown.set(true);
@@ -422,14 +493,22 @@ impl Hud {
         }
     }
 
-    fn repaint(&self) {
+    fn repaint(&self, now: Instant) {
         const CHARS_PER_LINE: usize = 44;
 
-        let heard = self.last_heard.borrow();
-        self.heard_label.setStringValue(&NSString::from_str(&format!(
-            "«{}»",
-            head(&heard, CHARS_PER_LINE)
-        )));
+        let elapsed_ms = self
+            .pending_since
+            .get()
+            .map(|since| now.saturating_duration_since(since).as_millis() as u64)
+            .unwrap_or(0);
+        let content = self.content.borrow();
+
+        let heard_line = if content.heard_pending {
+            ellipsis_frame(elapsed_ms).to_string()
+        } else {
+            format!("«{}»", head(&content.heard, CHARS_PER_LINE))
+        };
+        self.heard_label.setStringValue(&NSString::from_str(&heard_line));
 
         if self.dictating.get() {
             let text = self.last_dictation.borrow();
@@ -437,9 +516,12 @@ impl Hud {
             let shown = tail(&text, CHARS_PER_LINE * lines);
             self.outcome_label.setStringValue(&NSString::from_str(&shown));
         } else {
-            let outcome = self.last_outcome.borrow();
-            self.outcome_label
-                .setStringValue(&NSString::from_str(&format!("→ {}", head(&outcome, CHARS_PER_LINE))));
+            let outcome_line = if content.outcome_pending {
+                ellipsis_frame(elapsed_ms).to_string()
+            } else {
+                head(&content.outcome, CHARS_PER_LINE)
+            };
+            self.outcome_label.setStringValue(&NSString::from_str(&outcome_line));
         }
     }
 }
@@ -472,6 +554,54 @@ pub fn request(show: bool) {
 
 fn take_request() -> Option<bool> {
     REQUEST.lock().ok().and_then(|mut slot| slot.take())
+}
+
+/// Raised by the listening loop the moment Silero opens an utterance —
+/// before there is a transcript, let alone a decision — and cleared by
+/// [`Hud::tick`] once it has shown the panel and reset both lines to
+/// pending. A plain flag rather than a timestamp: [`Hud::tick`] stamps
+/// `pending_since` itself, on the main thread's own clock.
+static SPEECH_OPEN: Mutex<bool> = Mutex::new(false);
+
+/// Tells the HUD an utterance just opened — call this once per utterance,
+/// as soon as [`crate::audio::Listener::speech_open`] turns true.
+pub fn note_speech_open() {
+    if let Ok(mut slot) = SPEECH_OPEN.lock() {
+        *slot = true;
+    }
+}
+
+fn take_speech_open() -> bool {
+    SPEECH_OPEN.lock().map(|mut slot| std::mem::take(&mut *slot)).unwrap_or(false)
+}
+
+/// The transcript and/or the decision, queued here by the listening loop
+/// rather than parsed back out of the tooltip — see [`Update`]'s doc.
+/// Two pushes between ticks merge (each field keeps its latest `Some`)
+/// instead of the second overwriting the first outright, so a fast
+/// transcript-then-outcome pair is never lost to an unlucky tick.
+static UPDATE: Mutex<Option<Update>> = Mutex::new(None);
+
+/// Tells the HUD what was just found out — the transcript, the decision,
+/// or both. Call with only the field that is known; the other stays as it
+/// was (or pending, if nothing has supplied it yet).
+pub fn push_update(update: Update) {
+    let Ok(mut slot) = UPDATE.lock() else { return };
+    match slot.as_mut() {
+        Some(existing) => {
+            if update.heard.is_some() {
+                existing.heard = update.heard;
+            }
+            if update.outcome.is_some() {
+                existing.outcome = update.outcome;
+            }
+        }
+        None => *slot = Some(update),
+    }
+}
+
+fn take_update() -> Option<Update> {
+    UPDATE.lock().ok().and_then(|mut slot| slot.take())
 }
 
 /// The dictated text so far, for the HUD's second line.
@@ -666,6 +796,77 @@ mod tests {
         // covered by set_dictation_text/dictation_text round-tripping.
         set_dictation_text("hola");
         assert_eq!(dictation_text(), "hola");
+    }
+
+    #[test]
+    fn speech_opening_puts_both_lines_back_to_pending() {
+        let mut content = Content::default();
+        content.push_update(Update {
+            heard: Some("abre cromo".to_string()),
+            outcome: Some("abrir Chrome".to_string()),
+        });
+        assert!(!content.heard_pending);
+        assert!(!content.outcome_pending);
+
+        content.note_speech_open();
+        assert!(content.heard_pending);
+        assert!(content.outcome_pending);
+        assert_eq!(content.heard, "");
+        assert_eq!(content.outcome, "");
+    }
+
+    #[test]
+    fn transcript_fills_the_first_line_while_the_second_stays_pending() {
+        let mut content = Content::default();
+        content.note_speech_open();
+
+        content.push_update(Update { heard: Some("minion, abre cromo".to_string()), outcome: None });
+        assert!(!content.heard_pending);
+        assert_eq!(content.heard, "minion, abre cromo");
+        assert!(content.outcome_pending, "the decision has not arrived yet");
+    }
+
+    #[test]
+    fn the_decision_fills_the_second_line_without_touching_the_first() {
+        let mut content = Content::default();
+        content.note_speech_open();
+        content.push_update(Update { heard: Some("minion, abre cromo".to_string()), outcome: None });
+
+        content.push_update(Update { heard: None, outcome: Some("abrir Chrome".to_string()) });
+        assert_eq!(content.heard, "minion, abre cromo");
+        assert!(!content.outcome_pending);
+        assert_eq!(content.outcome, "abrir Chrome");
+    }
+
+    #[test]
+    fn ellipsis_cycles_every_300_ms() {
+        assert_eq!(ellipsis_frame(0), "·");
+        assert_eq!(ellipsis_frame(299), "·");
+        assert_eq!(ellipsis_frame(300), "··");
+        assert_eq!(ellipsis_frame(599), "··");
+        assert_eq!(ellipsis_frame(600), "···");
+        assert_eq!(ellipsis_frame(899), "···");
+        // And back to the first frame — it cycles, it does not stop.
+        assert_eq!(ellipsis_frame(900), "·");
+    }
+
+    #[test]
+    fn the_speech_open_and_update_wiring_points_round_trip() {
+        // Mirrors `the_dictation_wiring_points_are_readable_before_anything_
+        // writes_to_them` above: a fresh reader must get a sane default,
+        // and what is pushed is what comes back out exactly once.
+        assert!(!take_speech_open());
+        note_speech_open();
+        assert!(take_speech_open());
+        assert!(!take_speech_open(), "cleared once read");
+
+        assert!(take_update().is_none());
+        push_update(Update { heard: Some("hola".to_string()), outcome: None });
+        push_update(Update { heard: None, outcome: Some("saludo".to_string()) });
+        let merged = take_update().expect("two pushes between ticks must merge");
+        assert_eq!(merged.heard.as_deref(), Some("hola"));
+        assert_eq!(merged.outcome.as_deref(), Some("saludo"));
+        assert!(take_update().is_none(), "cleared once read");
     }
 
     #[test]
