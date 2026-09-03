@@ -20,6 +20,7 @@ mod journal;
 mod learn;
 mod models;
 mod preferences;
+mod session;
 mod spanish;
 mod speech;
 mod startup;
@@ -45,6 +46,7 @@ use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::TrayIconBuilder;
 
 use commands::Decision;
+use session::{Outcome, Session, Undoable};
 
 /// What the tooltip says when there is nothing more particular to report.
 const TOOLTIP_IDLE: &str = "Minion — control por voz";
@@ -244,18 +246,6 @@ struct Voice {
     threshold: f32,
 }
 
-/// Something Minion did that it knows how to take back.
-///
-/// Not every action can be undone — closing an application is gone — so
-/// only the ones with an honest reverse are recorded. Saying so beats a
-/// command that silently does nothing.
-enum Undoable {
-    /// Text that was typed: remove exactly that many characters.
-    Typed(usize),
-    /// An application that was brought forward: go back to the previous.
-    Launched { previous: Option<String> },
-}
-
 /// What the tooltip should say, written by whoever knows and applied by
 /// the run loop. The menu bar belongs to the main thread; the download and
 /// the recognition loop do not.
@@ -334,12 +324,10 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
     // as quick as the rest.
     let mut model = Some(load_model(&model_path)?);
     let mut last_used = Instant::now();
-    // What "otra vez" refers to.
-    let mut last_command: Option<Decision> = None;
-    // While dictating, everything heard is typed rather than obeyed.
-    let mut dictating = false;
-    // What "deshaz lo que has hecho" would undo.
-    let mut undoable: Option<Undoable> = None;
+    // Dictation, "otra vez" and "deshaz" all remember something from one
+    // utterance to the next. That memory, and the rules that go with it,
+    // are in `session`; what follows only carries them out.
+    let mut session = Session::new();
     note!("Model loaded. {}", resident_memory());
 
     // How long to stay deaf after speaking: the segmenter needs
@@ -529,48 +517,28 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
         let elapsed_ms = started.elapsed().as_millis();
 
         // One sentence can hold several instructions joined by "y luego".
-        for part in commands::split_chain(&transcript, dictating) {
+        for part in session.split(&transcript) {
             // Which application is in front decides what some phrases mean,
             // and it is read per instruction: the first of a chain may well
             // have changed which application that is.
             let context = actions::frontmost_app();
-            let (mut decision, confidence) = commands::decide_in(&part, context.as_deref());
+            let (decision, confidence) = commands::decide_in(&part, context.as_deref());
 
-            // Dictation is a mode: while it is on, everything is text,
-            // except the phrase that turns it off.
-            if dictating {
-                match decision {
-                    commands::Decision::StopDictation => {
-                        dictating = false;
-                        note!("dictation ended");
-                        continue;
-                    }
-                    _ => {
-                        let typed = part.trim().to_string();
-                        if !typed.is_empty() {
-                            let length = typed.chars().count() + 1;
-                            actions::type_text(&format!("{typed} "));
-                            note!("typed    «{typed}»");
-                            undoable = Some(Undoable::Typed(length));
-                            acted.store(true, Ordering::Relaxed);
-                        }
-                        continue;
-                    }
-                }
-            }
-
-            match decision {
-                commands::Decision::StartDictation => {
-                    dictating = true;
+            match session.interpret(&part, decision, context.as_deref()) {
+                Outcome::EnterDictation => {
                     note!("dictation started — say «deja de dictar» to stop");
                     acted.store(true, Ordering::Relaxed);
-                    continue;
                 }
-                commands::Decision::StopDictation => {
-                    note!("not dictating");
-                    continue;
+                Outcome::LeaveDictation => note!("dictation ended"),
+                Outcome::NotDictating => note!("not dictating"),
+                // Heard while dictating, with nothing in it to type.
+                Outcome::Nothing => {}
+                Outcome::Type(typed) => {
+                    actions::type_text(&format!("{typed} "));
+                    note!("typed    «{typed}»");
+                    acted.store(true, Ordering::Relaxed);
                 }
-                commands::Decision::Answer(question) => {
+                Outcome::Answer(question) => {
                     // "¿Qué puedes hacer?" is answered by showing the list.
                     if question == answers::Question::Help {
                         show_catalogue.store(true, Ordering::Relaxed);
@@ -597,161 +565,140 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                         }
                         None => actions::show_message(&reply),
                     }
-                    continue;
                 }
-                commands::Decision::UndoLast => {
-                    match undoable.take() {
-                        Some(Undoable::Typed(length)) => {
-                            for _ in 0..length {
-                                actions::press(actions::key::DELETE, actions::Mods::NONE);
-                            }
-                            note!("undid    typing ({length} characters)");
+                Outcome::Undo(taken) => match taken {
+                    Some(Undoable::Typed(length)) => {
+                        for _ in 0..length {
+                            actions::press(actions::key::DELETE, actions::Mods::NONE);
+                        }
+                        note!("undid    typing ({length} characters)");
+                        acted.store(true, Ordering::Relaxed);
+                    }
+                    Some(Undoable::Launched { previous }) => match previous {
+                        Some(bundle) => {
+                            actions::open_app(&bundle);
+                            note!("undid    going back to {bundle}");
                             acted.store(true, Ordering::Relaxed);
                         }
-                        Some(Undoable::Launched { previous }) => match previous {
-                            Some(bundle) => {
-                                actions::open_app(&bundle);
-                                note!("undid    going back to {bundle}");
-                                acted.store(true, Ordering::Relaxed);
-                            }
-                            None => note!("nothing to go back to"),
+                        None => note!("nothing to go back to"),
+                    },
+                    None => note!("nothing of mine to undo"),
+                },
+                Outcome::NothingToRepeat => {
+                    note!("unknown  «{part}»  ->  nothing to repeat yet");
+                }
+                Outcome::Perform { decision, repeats } => {
+                    report(
+                        &part,
+                        &decision,
+                        confidence,
+                        repeats,
+                        &Reporting {
+                            seconds,
+                            elapsed_ms,
+                            log_ignored_speech: log_ignored_speech.load(Ordering::Relaxed),
+                            play_sounds: play_sounds.load(Ordering::Relaxed),
+                            acted: &acted,
+                            status: &status,
                         },
-                        None => note!("nothing of mine to undo"),
-                    }
-                    continue;
-                }
-                _ => {}
-            }
+                    );
 
-            // "otra vez" means whatever was said before it.
-            let mut repeats = 1;
-            if let commands::Decision::Again(times) = decision {
-                match &last_command {
-                    Some(previous) => {
-                        repeats = times;
-                        decision = previous.clone();
-                    }
-                    None => {
-                        note!("unknown  «{part}»  ->  nothing to repeat yet");
-                        continue;
+                    if commands::is_sleep(&decision) {
+                        active.store(false, Ordering::Relaxed);
+                        note!("paused by voice — resume from the menu bar");
                     }
                 }
-            }
-
-            report(
-                &part,
-                &decision,
-                confidence,
-                repeats,
-                seconds,
-                elapsed_ms,
-                log_ignored_speech.load(Ordering::Relaxed),
-                play_sounds.load(Ordering::Relaxed),
-                &acted,
-                &status,
-            );
-
-            if commands::is_sleep(&decision) {
-                active.store(false, Ordering::Relaxed);
-                note!("paused by voice — resume from the menu bar");
-            }
-            // Remember what could be taken back.
-            match &decision {
-                commands::Decision::Type(text) => {
-                    undoable = Some(Undoable::Typed(text.chars().count()));
-                }
-                commands::Decision::Launch { .. } => {
-                    undoable = Some(Undoable::Launched { previous: context.clone() });
-                }
-                _ => {}
-            }
-
-            // Only real actions are worth repeating later.
-            if !matches!(
-                decision,
-                commands::Decision::Ignored | commands::Decision::Unrecognised
-            ) {
-                last_command = Some(decision);
             }
         }
     }
     Ok(())
 }
 
+/// Everything a report needs beyond the decision itself: what was heard,
+/// how long it took, and where to say so.
+///
+/// Gathered rather than passed one by one — the flags are read per part, as
+/// they were before, so a switch flipped in the preferences window applies
+/// to the very next instruction.
+struct Reporting<'a> {
+    seconds: f32,
+    elapsed_ms: u128,
+    log_ignored_speech: bool,
+    play_sounds: bool,
+    acted: &'a AtomicBool,
+    status: &'a Status,
+}
+
 /// Carries out a decision and writes down what happened.
-#[allow(clippy::too_many_arguments)]
 fn report(
     transcript: &str,
     decision: &Decision,
     confidence: f32,
     repeats: usize,
-    seconds: f32,
-    elapsed_ms: u128,
-    log_ignored_speech: bool,
-    play_sounds: bool,
-    acted: &AtomicBool,
-    status: &Status,
+    at: &Reporting,
 ) {
-        match decision {
-            Decision::Ignored => {
-                // Speech that was not for us. The wording is only written
-                // down when explicitly asked for: see log_ignored_speech.
-                if log_ignored_speech {
-                    note!("heard    «{transcript}»  (not addressed to me)");
-                } else {
-                    note!("heard    {seconds:.1}s of speech, not addressed to me");
-                }
-                set_status(status, &last_utterance_tooltip(transcript, "no era para mí"));
+    let seconds = at.seconds;
+    match decision {
+        Decision::Ignored => {
+            // Speech that was not for us. The wording is only written
+            // down when explicitly asked for: see log_ignored_speech.
+            if at.log_ignored_speech {
+                note!("heard    «{transcript}»  (not addressed to me)");
+            } else {
+                note!("heard    {seconds:.1}s of speech, not addressed to me");
             }
-            Decision::Unrecognised => {
-                note!("unknown  «{transcript}»  ->  not understood");
-                set_status(status, &last_utterance_tooltip(transcript, "no entendido"));
-                if play_sounds {
-                    actions::play_sound(sounds::UNSURE);
-                }
+            set_status(at.status, &last_utterance_tooltip(transcript, "no era para mí"));
+        }
+        Decision::Unrecognised => {
+            note!("unknown  «{transcript}»  ->  not understood");
+            set_status(at.status, &last_utterance_tooltip(transcript, "no entendido"));
+            if at.play_sounds {
+                actions::play_sound(sounds::UNSURE);
             }
-            _ => {
-                let mut outcome = None;
-                for _ in 0..repeats.max(1) {
-                    outcome = commands::perform(decision);
-                }
-                if let Some(done) = outcome {
-                    if done.succeeded {
-                        let again = if repeats > 1 {
-                            format!(" ×{repeats}")
-                        } else {
-                            String::new()
-                        };
-                        note!(
-                            "ran      «{transcript}»  ->  {}{again}  \
-                             [{:.0}% · {seconds:.1}s audio · {elapsed_ms} ms]",
-                            done.description,
-                            confidence * 100.0
-                        );
-                        acted.store(true, Ordering::Relaxed);
-                        set_status(status, &last_utterance_tooltip(transcript, &done.description));
-                        if play_sounds {
-                            actions::play_sound(sounds::DONE);
-                        }
+        }
+        _ => {
+            let mut outcome = None;
+            for _ in 0..repeats.max(1) {
+                outcome = commands::perform(decision);
+            }
+            if let Some(done) = outcome {
+                if done.succeeded {
+                    let again = if repeats > 1 {
+                        format!(" ×{repeats}")
                     } else {
-                        // Understood perfectly and refused by the system.
-                        // Almost always the Accessibility permission.
-                        note!(
-                            "BLOCKED  «{transcript}»  ->  {}  — macOS refused it. \
-                             Grant Accessibility in System Settings.",
-                            done.description
-                        );
-                        set_status(
-                            status,
-                            &last_utterance_tooltip(transcript, "bloqueado por macOS"),
-                        );
-                        if play_sounds {
-                            actions::play_sound(sounds::BLOCKED);
-                        }
+                        String::new()
+                    };
+                    let elapsed_ms = at.elapsed_ms;
+                    note!(
+                        "ran      «{transcript}»  ->  {}{again}  \
+                         [{:.0}% · {seconds:.1}s audio · {elapsed_ms} ms]",
+                        done.description,
+                        confidence * 100.0
+                    );
+                    at.acted.store(true, Ordering::Relaxed);
+                    set_status(at.status, &last_utterance_tooltip(transcript, &done.description));
+                    if at.play_sounds {
+                        actions::play_sound(sounds::DONE);
+                    }
+                } else {
+                    // Understood perfectly and refused by the system.
+                    // Almost always the Accessibility permission.
+                    note!(
+                        "BLOCKED  «{transcript}»  ->  {}  — macOS refused it. \
+                         Grant Accessibility in System Settings.",
+                        done.description
+                    );
+                    set_status(
+                        at.status,
+                        &last_utterance_tooltip(transcript, "bloqueado por macOS"),
+                    );
+                    if at.play_sounds {
+                        actions::play_sound(sounds::BLOCKED);
                     }
                 }
             }
         }
+    }
 }
 
 /// Builds the menu bar item and hands control to AppKit. Never returns.
