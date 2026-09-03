@@ -304,5 +304,5 @@ was considered and rejected on that data.
 
 - `blank` lines: voice matched, Parakeet returned no text. Seen a few times
   per round; if it grows, lengthen the preroll.
-- Not planned unless asked: Developer ID notarisation, Silero VAD, lowering
+- Not planned unless asked: lowering
   the 405 MB idle floor.
