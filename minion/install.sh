@@ -37,8 +37,10 @@ cat > "$AGENT" <<PLIST
     <key>KeepAlive</key>
     <dict><key>SuccessfulExit</key><false/></dict>
     <key>ThrottleInterval</key> <integer>10</integer>
-    <key>StandardOutPath</key>  <string>$HOME/Library/Logs/minion.log</string>
-    <key>StandardErrorPath</key><string>$HOME/Library/Logs/minion.log</string>
+    <!-- Not minion.log: Minion writes every line there itself, and
+         pointing stdout at the same file printed each line twice. -->
+    <key>StandardOutPath</key>  <string>$HOME/Library/Logs/minion-launch.log</string>
+    <key>StandardErrorPath</key><string>$HOME/Library/Logs/minion-launch.log</string>
 </dict>
 </plist>
 PLIST
