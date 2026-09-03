@@ -123,12 +123,18 @@ fn words_match(a: &str, b: &str, strict: bool) -> bool {
         return true;
     }
 
+    // A command of a single word has nothing around it to disambiguate,
+    // so it gets no slack at all: "contar" is one edit from "cortar" and
+    // used to run it at full confidence.
+    if strict {
+        return false;
+    }
+
     // Words shorter than four characters must match exactly: at that
     // length a single edit is a different word ("pon" and "son").
     if a.len().max(b.len()) < 4 {
         return false;
     }
-    let _ = strict;
     if edit_distance(a, b) <= 1 {
         return true;
     }
@@ -191,6 +197,19 @@ mod tests {
         assert!(!words_match("cortar", "copiar", false));
         assert!(!words_match("pestana", "ventana", false));
         assert!(!words_match("marcar", "marcadores", false));
+    }
+
+    #[test]
+    fn a_one_word_command_gets_no_slack() {
+        // A single word carries the whole instruction, so a slip in it
+        // changes what happens: "corta esto" reduces to one keyword.
+        assert!(!words_match("contar", "cortar", true));
+        assert!(words_match("contar", "cortar", false));
+        // Equality and a run-together word are still enough.
+        assert!(words_match("cortar", "cortar", true));
+        assert!(words_match("abrecrome", "crome", true));
+        // The command it used to run, at full confidence.
+        assert!(similarity("contar esto", "corta esto") < 0.7);
     }
 
     #[test]
