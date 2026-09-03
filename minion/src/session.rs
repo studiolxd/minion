@@ -60,6 +60,10 @@ pub enum Outcome {
     Nothing,
     /// A question to be answered aloud.
     Answer(answers::Question),
+    /// «pregunta a la IA …»: ask the AI layer this, and say the answer.
+    AskAi(String),
+    /// «olvida la conversación»: drop the AI layer's conversation history.
+    ForgetAiConversation,
     /// Take back what was last done, if there was anything.
     Undo(Option<Undoable>),
     /// «otra vez» with nothing said before it.
@@ -117,6 +121,20 @@ enum Asked {
     /// Two readings of a phrase that were too close to choose between.
     /// Neither has run, and neither will until one is picked.
     Between(Vec<Candidate>),
+    /// A command the AI layer matched to a phrase the vocabulary did not
+    /// recognise. Yes runs it; unlike [`Asked::Guess`], nothing is learned
+    /// from it — a model's guess is not the same as a nearby alias.
+    AiSuggestion(AiSuggestion),
+}
+
+/// A command the AI layer suggested for a phrase the vocabulary missed —
+/// [`crate::ai::Suggestion`], resolved against the catalogue into a
+/// [`Decision`] that can actually be carried out.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AiSuggestion {
+    pub decision: Decision,
+    /// What is said back: "¿Quieres que {description}?".
+    pub description: String,
 }
 
 /// A question Minion asked and has not had an answer to yet.
@@ -145,6 +163,8 @@ pub enum Reply {
     Yes { phrase: String, suggestion: learn::Suggestion },
     /// One of the readings that were offered, picked by the user.
     Chose { phrase: String, candidate: Candidate },
+    /// Yes to an AI-suggested command: run it, but do not learn it.
+    AiYes { phrase: String, suggestion: AiSuggestion },
     /// No, or something that was not an answer at all. `answered` tells
     /// the two apart, because only the first has used up the utterance —
     /// anything else still has to be listened to on its own terms.
@@ -348,6 +368,8 @@ impl Session {
             Decision::DictateInto { destination, recipient } => {
                 return Outcome::DictateInto { destination, recipient };
             }
+            Decision::AskAi(text) => return Outcome::AskAi(text),
+            Decision::ForgetAiConversation => return Outcome::ForgetAiConversation,
             _ => {}
         }
 
@@ -497,6 +519,29 @@ impl Session {
         })
     }
 
+    /// The question worth asking about a command the AI layer matched to a
+    /// phrase the vocabulary did not recognise, if there is one to ask.
+    ///
+    /// Mirrors [`Session::ask_about`] — same guard, same shape — except the
+    /// guess comes from the model rather than a nearby alias, and it never
+    /// checks `asks_before_learning`: offering an AI suggestion is a
+    /// different feature from active learning, on by default whenever the
+    /// AI layer itself is (see `[ai] use`, checked by the caller through
+    /// `ai::ask_for_command` before this is ever reached).
+    ///
+    /// Pure: asking it out loud, and opening the window for the answer,
+    /// are the caller's to do.
+    pub fn ask_ai_suggestion(&self, suggestion: AiSuggestion, now: Instant) -> Option<Question> {
+        if self.dictating || self.choosing(now) {
+            return None;
+        }
+        Some(Question {
+            text: format!("¿Quieres que {}?", suggestion.description),
+            description: suggestion.description.clone(),
+            asked: Asked::AiSuggestion(suggestion),
+        })
+    }
+
     /// Whether the question waiting is one that is holding a command back.
     fn choosing(&self, now: Instant) -> bool {
         self.question_open(now)
@@ -562,6 +607,11 @@ impl Session {
                 }
                 Choice::Declined => Reply::No { phrase, answered: true },
                 Choice::Elsewhere => Reply::No { phrase, answered: false },
+            },
+            Asked::AiSuggestion(suggestion) => match answer_in(part) {
+                Some(true) => Reply::AiYes { phrase, suggestion },
+                Some(false) => Reply::No { phrase, answered: true },
+                None => Reply::No { phrase, answered: false },
             },
         })
     }
@@ -838,6 +888,77 @@ mod tests {
         }
         // Asked once: the question is over either way.
         assert!(!session.question_open(now));
+    }
+
+    /// A suggestion the AI layer might have made for a phrase the
+    /// vocabulary did not recognise.
+    fn ai_suggestion() -> AiSuggestion {
+        AiSuggestion {
+            decision: Decision::Run("abrir Safari"),
+            description: "abrir Safari".to_string(),
+        }
+    }
+
+    #[test]
+    fn an_ai_suggestion_is_asked_about_and_yes_runs_it() {
+        let mut session = Session::new();
+        let now = Instant::now();
+        let question = session.ask_ai_suggestion(ai_suggestion(), now).expect("worth asking about");
+        assert_eq!(question.text, "¿Quieres que abrir Safari?");
+        session.open_question(NEARLY, question, now);
+
+        let reply = session
+            .answer_question("sí", now + Duration::from_secs(2))
+            .expect("an answer was expected");
+        match reply {
+            Reply::AiYes { phrase, suggestion } => {
+                assert_eq!(phrase, NEARLY);
+                assert_eq!(suggestion.decision, Decision::Run("abrir Safari"));
+            }
+            other => panic!("expected an AI yes, got {other:?}"),
+        }
+        assert!(!session.question_open(now));
+    }
+
+    #[test]
+    fn declining_an_ai_suggestion_runs_nothing() {
+        let mut session = Session::new();
+        let now = Instant::now();
+        let question = session.ask_ai_suggestion(ai_suggestion(), now).expect("worth asking about");
+        session.open_question(NEARLY, question, now);
+        assert!(matches!(
+            session.answer_question("no", now),
+            Some(Reply::No { answered: true, .. })
+        ));
+    }
+
+    #[test]
+    fn an_ai_suggestion_nobody_answers_times_out() {
+        let mut session = Session::new();
+        let now = Instant::now();
+        let question = session.ask_ai_suggestion(ai_suggestion(), now).expect("worth asking about");
+        session.open_question(NEARLY, question, now);
+
+        let later = now + Duration::from_secs(7);
+        assert!(!session.question_open(later));
+        assert_eq!(session.question_timed_out(later).as_deref(), Some(NEARLY));
+        assert!(session.answer_question("sí", later).is_none());
+    }
+
+    #[test]
+    fn an_ai_suggestion_is_never_offered_while_dictating() {
+        let mut session = Session::new();
+        say(&mut session, "minion empieza a dictar");
+        assert!(session.ask_ai_suggestion(ai_suggestion(), Instant::now()).is_none());
+    }
+
+    #[test]
+    fn an_ai_suggestion_never_displaces_a_choice_already_on_the_table() {
+        let mut session = choosing();
+        let now = Instant::now();
+        let question = between(&session, TIED).expect("a tie");
+        session.open_question(TIED, question, now);
+        assert!(session.ask_ai_suggestion(ai_suggestion(), now).is_none());
     }
 
     #[test]

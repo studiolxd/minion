@@ -477,6 +477,11 @@ pub enum Decision {
     UndoLast,
     /// A question, to be answered aloud.
     Answer(crate::answers::Question),
+    /// «pregunta a la IA …», «pregúntale a la IA …», «IA, …»: what to ask
+    /// the AI layer, verbatim.
+    AskAi(String),
+    /// «olvida la conversación»: drop the AI layer's conversation history.
+    ForgetAiConversation,
     /// Run a command from the table, identified by name.
     Run(&'static str),
     /// Run an installed Apple Shortcut, by its own name.
@@ -759,6 +764,65 @@ fn dictation_text(transcript: &str) -> Option<String> {
     // the verb list, which holds no verb that opens a command as well.
     // Any text at all is text: "minion escribe sí" means sí.
     (!text.trim().is_empty()).then_some(text)
+}
+
+/// Verbs that introduce a question for the AI layer: «pregunta a la IA
+/// …», «pregúntale a la IA …».
+const ASK_AI_VERBS: &[&str] = &["pregunta", "preguntale"];
+
+/// Extracts the question text from «pregunta a la IA …», «pregúntale a la
+/// IA …» or «IA, …», said with the wake word first.
+///
+/// Works on the original transcript, like [`dictation_text`]: everything
+/// after the trigger is content bound for the model, not the vocabulary,
+/// so it must keep its accents, capitals and punctuation.
+fn ask_ai_text(transcript: &str) -> Option<String> {
+    let words: Vec<&str> = transcript.split_whitespace().collect();
+    if words.len() < 2 {
+        return None;
+    }
+    if !wake_words().contains(&normalise(words[0]).as_str()) {
+        return None;
+    }
+    let second = normalise(words[1]);
+    // «IA, …»: the trigger word itself opens the sentence.
+    if second == "ia" {
+        let text = words[2..].join(" ");
+        return (!text.trim().is_empty()).then_some(text);
+    }
+    // «pregunta a la IA …» / «pregúntale a la IA …»: find "IA" among the
+    // words after the verb, and take everything that follows it.
+    if ASK_AI_VERBS.contains(&second.as_str()) {
+        let rest = &words[2..];
+        let ia_at = rest.iter().position(|w| normalise(w) == "ia")?;
+        let text = rest[ia_at + 1..].join(" ");
+        return (!text.trim().is_empty()).then_some(text);
+    }
+    None
+}
+
+/// The catalogue [`crate::ai::ask_for_command`] is shown when a phrase
+/// went unrecognised: every global command's name and first, canonical
+/// phrase.
+pub fn ai_catalogue() -> Vec<crate::ai::CommandSummary> {
+    vocabulary()
+        .commands
+        .iter()
+        .filter_map(|command| {
+            command.phrases.first().map(|phrase| crate::ai::CommandSummary {
+                name: command.name.to_string(),
+                phrase: (*phrase).to_string(),
+            })
+        })
+        .collect()
+}
+
+/// The decision an AI suggestion names, if the vocabulary still has a
+/// command by that name — see [`crate::ai::parse_suggestion`], which
+/// already refuses a name the catalogue does not contain, so this only
+/// has to find it again.
+pub fn decision_for_ai_suggestion(name: &str) -> Option<Decision> {
+    named_command(name).map(|command| Decision::Run(command.name))
 }
 
 /// Recognises «dicta …» aimed at one of [`vocabulary()`]'s destinations,
@@ -1192,6 +1256,13 @@ pub fn decide_in(transcript: &str, context: Option<&str>) -> (Decision, f32) {
         return (Decision::Ignored, 0.0);
     }
 
+    // «pregunta a la IA …», «IA, …»: before the dictation checks below,
+    // since everything after the trigger is a question for the model, not
+    // a command to match against the vocabulary.
+    if let Some(text) = ask_ai_text(transcript) {
+        return (Decision::AskAi(text), 1.0);
+    }
+
     // «dicta una nota», «dicta un correo a Ana»: before the literal
     // dictation text below, since both start with the same verb and only
     // the destination table tells them apart.
@@ -1209,10 +1280,11 @@ pub fn decide_in(transcript: &str, context: Option<&str>) -> (Decision, f32) {
     // they are answered by the caller, which is what holds the state.
     // Stopping is checked before starting: «fin del dictado» contains the
     // one-word way in, «dictado», and must not be taken for it.
-    let switches: [(&[&str], Decision); 3] = [
+    let switches: [(&[&str], Decision); 4] = [
         (&["deja de dictar", "fin del dictado"], Decision::StopDictation),
         (&["empieza a dictar", "modo dictado", "dictado"], Decision::StartDictation),
         (&["deshaz lo que has hecho", "anula eso"], Decision::UndoLast),
+        (&["olvida la conversacion", "olvida lo que hablamos"], Decision::ForgetAiConversation),
     ];
     for (phrases, decision) in switches {
         for phrase in phrases {
@@ -2538,6 +2610,28 @@ mod tests {
             decide("minion cuánta batería queda").0,
             Decision::Answer(Question::Battery)
         );
+    }
+
+    #[test]
+    fn every_way_of_asking_the_ai_is_understood() {
+        assert_eq!(
+            decide("minion pregunta a la IA cuánto es el 15 por ciento de 340").0,
+            Decision::AskAi("cuánto es el 15 por ciento de 340".to_string())
+        );
+        assert_eq!(
+            decide("minion pregúntale a la IA qué es la fotosíntesis").0,
+            Decision::AskAi("qué es la fotosíntesis".to_string())
+        );
+        assert_eq!(
+            decide("minion IA qué hora es en Tokio").0,
+            Decision::AskAi("qué hora es en Tokio".to_string())
+        );
+    }
+
+    #[test]
+    fn forgetting_the_ai_conversation_is_its_own_decision() {
+        assert_eq!(decide("minion olvida la conversación").0, Decision::ForgetAiConversation);
+        assert_eq!(decide("minion olvida lo que hablamos").0, Decision::ForgetAiConversation);
     }
 
     #[test]

@@ -99,6 +99,11 @@ struct Visibility {
     pinned: bool,
     dictating: bool,
     question_pending: bool,
+    /// Waiting on the AI layer — see [`crate::ai::ask`]. Can run several
+    /// times longer than an ordinary utterance, so it holds the panel open
+    /// the same way `question_pending` does rather than relying on
+    /// `activity_until`, which would expire long before an answer arrives.
+    busy: bool,
     activity_until: Option<Instant>,
     forced_hidden: bool,
 }
@@ -129,6 +134,13 @@ impl Visibility {
         }
     }
 
+    fn set_busy(&mut self, on: bool) {
+        self.busy = on;
+        if on {
+            self.forced_hidden = false;
+        }
+    }
+
     fn set_pinned(&mut self, on: bool) {
         self.pinned = on;
     }
@@ -153,6 +165,7 @@ impl Visibility {
         }
         self.dictating
             || self.question_pending
+            || self.busy
             || self.activity_until.is_some_and(|until| now < until)
     }
 }
@@ -383,6 +396,7 @@ impl Hud {
             }
         }
         self.state.borrow_mut().set_question_pending(question_pending());
+        self.state.borrow_mut().set_busy(busy());
 
         if self.dictating.get() {
             let text = dictation_text();
@@ -500,6 +514,21 @@ fn question_pending() -> bool {
     QUESTION_PENDING.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Whether the AI layer is being waited on right now.
+///
+/// **Wiring note for the listening loop:** call `hud::set_busy(true)`
+/// before `ai::ask` in `main.rs`'s `Outcome::AskAi` arm, and
+/// `hud::set_busy(false)` right after it returns.
+static BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_busy(busy: bool) {
+    BUSY.store(busy, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn busy() -> bool {
+    BUSY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,6 +562,16 @@ mod tests {
         state.set_dictating(true);
         assert!(state.visible(t(1000)));
         state.set_dictating(false);
+        assert!(!state.visible(t(1000)));
+    }
+
+    #[test]
+    fn stays_open_while_the_ai_layer_is_busy() {
+        let mut state = Visibility::new();
+        state.note_heard(t(0));
+        state.set_busy(true);
+        assert!(state.visible(t(1000)));
+        state.set_busy(false);
         assert!(!state.visible(t(1000)));
     }
 
