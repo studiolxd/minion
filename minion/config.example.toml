@@ -133,6 +133,23 @@
 # Safety cut, so continuous noise cannot buffer forever. Default 12000.
 # max_utterance_ms = 12000
 
+# Which detector decides that a sound is a voice.
+#
+#   "silero"  a small neural network (2 MB, downloaded with the models)
+#             asked after the energy gate, so dishes, television and the
+#             coffee machine no longer wake the recogniser. The default,
+#             and what is used whenever silero_vad.onnx is on disk.
+#   "energy"  loudness alone, as it worked before. Use this if something
+#             you say is being thrown away as noise.
+#
+# Either way the energy gate comes first, so a quiet room costs nothing.
+# vad = "silero"
+
+# Silero's score, 0 to 1, above which a frame counts as speech. The
+# model's own recommendation is 0.5. Lower it if quiet speech is being
+# dropped; raise it if the television still gets through.
+# vad_threshold = 0.5
+
 # Extra applications, added to the vocabulary.
 #
 # The vocabulary itself — every application, command and site Minion knows

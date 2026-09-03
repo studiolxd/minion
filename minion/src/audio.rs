@@ -12,6 +12,12 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
+/// The neural voice detector. Nested here rather than declared in `main`
+/// so it stays what it is: a part of how audio is segmented.
+#[path = "silero.rs"]
+mod silero;
+use silero::Silero;
+
 /// Sample rate the model expects.
 pub const TARGET_HZ: u32 = 16_000;
 
@@ -52,6 +58,29 @@ pub struct Settings {
     /// stays there. Eight seconds is longer than any command anyone
     /// speaks and keeps that ceiling well below where twelve put it.
     pub max_utterance_ms: usize,
+    /// Which detector decides that a sound is a voice.
+    pub vad: Vad,
+    /// Silero's score, from 0 to 1, above which a frame is speech.
+    ///
+    /// 0.5 is the model's own recommendation and what its published
+    /// examples use.
+    pub vad_threshold: f32,
+}
+
+/// What judges speech from noise.
+///
+/// Energy alone opens an utterance on anything louder than the room —
+/// dishes, a television, the coffee machine — and each of those wakes the
+/// speaker check and the recogniser to say no. Silero is asked the
+/// question energy cannot answer, after the energy gate rather than
+/// instead of it, so a quiet room still costs nothing at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Vad {
+    /// The adaptive energy detector on its own.
+    Energy,
+    /// Silero in front of it — falling back to energy if the model is
+    /// not on disk.
+    Silero,
 }
 
 impl Default for Settings {
@@ -61,6 +90,8 @@ impl Default for Settings {
             silence_end_ms: 700,
             min_speech_ms: 300,
             max_utterance_ms: 8_000,
+            vad: Vad::Silero,
+            vad_threshold: 0.5,
         }
     }
 }
@@ -447,10 +478,31 @@ struct Segmenter {
     noise: NoiseFloor,
     /// The most recent quiet blocks, kept in case speech starts.
     preroll: std::collections::VecDeque<Vec<f32>>,
+    /// The neural detector, when there is one. Without it the energy
+    /// gate decides on its own, exactly as it always did.
+    voice: Option<Silero>,
+    /// Silero's verdict on the most recent frame it completed, or `None`
+    /// when it has not heard a whole frame of this burst yet.
+    score: Option<f32>,
+    /// Blocks left of the window in which Silero may still veto an
+    /// utterance that energy opened. `None` once it has spoken up.
+    probation: Option<usize>,
+    /// Whether Silero has agreed that this utterance is speech.
+    approved: bool,
 }
 
+/// How long Silero gets to disagree with the energy gate.
+///
+/// The model needs a couple of frames of a sound before it commits, and a
+/// word's first consonant is the part it is least sure about — so the veto
+/// is not a single frame but the best score of the first 200 ms. Longer
+/// than that and the noises this exists to catch would already have woken
+/// the recogniser.
+const PROBATION_MS: usize = 200;
+const PROBATION_BLOCKS: usize = PROBATION_MS / BLOCK_MS;
+
 impl Segmenter {
-    fn new(settings: Settings) -> Self {
+    fn new(settings: Settings, voice: Option<Silero>) -> Self {
         Self {
             settings,
             current: Vec::new(),
@@ -461,18 +513,52 @@ impl Segmenter {
             speech_end: 0,
             noise: NoiseFloor::new(),
             preroll: std::collections::VecDeque::with_capacity(PREROLL_BLOCKS + 1),
+            voice,
+            score: None,
+            probation: None,
+            approved: false,
         }
+    }
+
+    /// Silero's answer for this block, or `true` when there is nobody to
+    /// ask and when it has not heard enough to answer yet.
+    ///
+    /// Only ever called for blocks the energy gate already passed, so
+    /// silence never costs an inference. The recurrent state is kept
+    /// across the quiet blocks inside a sentence — the gaps between words
+    /// are part of it — and dropped only when the utterance ends.
+    fn voice_agrees(&mut self, block: &[f32], energetic: bool) -> bool {
+        let Some(model) = self.voice.as_mut() else {
+            return energetic;
+        };
+        if !energetic {
+            return false;
+        }
+        if let Some(score) = model.push(block) {
+            self.score = Some(score);
+        }
+        // Before the first whole frame there is no verdict yet, and the
+        // benefit of the doubt goes to the speaker: the 200 ms window
+        // below is what actually settles it.
+        self.score.is_none_or(|score| score >= self.settings.vad_threshold)
     }
 
     /// Feeds one block. Returns a finished utterance when there is one.
     fn push(&mut self, block: &[f32]) -> Option<Utterance> {
         let level = rms(block);
         let threshold = self.noise.threshold(self.settings.speech_threshold);
-        let has_speech = level > threshold;
+        let energetic = level > threshold;
+        // Energy first, then the model: a block that is not louder than
+        // the room is not speech whatever Silero would have said, and
+        // asking would cost an inference per 20 ms of silence.
+        let has_speech = self.voice_agrees(block, energetic);
 
         // Only quiet blocks outside an utterance update the estimate: the
         // gaps between words are not the room, they are part of speech.
-        if !has_speech && !self.speaking {
+        // Judged on energy alone — a noise Silero threw out is still not
+        // the background level, and letting it in would raise the bar
+        // every time the kettle boiled.
+        if !energetic && !self.speaking {
             self.noise.observe_quiet(level);
         }
 
@@ -485,6 +571,9 @@ impl Segmenter {
                 // Everything replaced above is room tone: the speech proper
                 // starts here.
                 self.speech_start = self.current.len();
+                // Silero now has 200 ms to say this was not a voice.
+                self.probation = self.voice.is_some().then_some(PROBATION_BLOCKS);
+                self.approved = self.voice.is_none();
             }
             self.speaking = true;
             self.speech_blocks += 1;
@@ -506,6 +595,23 @@ impl Segmenter {
                 // is the hangover that closes the utterance.
                 self.speech_end = self.current.len();
             }
+        }
+
+        // Silero's veto: an utterance whose first 200 ms never scored as
+        // speech is the dishwasher, not an order. Dropped here rather
+        // than after the recogniser has been woken to transcribe it.
+        if let Some(left) = self.probation {
+            if self.score.is_some_and(|score| score >= self.settings.vad_threshold) {
+                self.approved = true;
+            }
+            self.probation = match (self.approved, left - 1) {
+                (true, _) => None,
+                (false, 0) => {
+                    self.reset();
+                    return None;
+                }
+                (false, left) => Some(left),
+            };
         }
 
         let max_samples = self.settings.max_utterance_ms * TARGET_HZ as usize / 1000;
@@ -538,6 +644,13 @@ impl Segmenter {
         self.speech_start = 0;
         self.speech_end = 0;
         self.preroll.clear();
+        self.probation = None;
+        self.approved = false;
+        self.score = None;
+        // The next utterance is not a continuation of this one.
+        if let Some(model) = self.voice.as_mut() {
+            model.reset();
+        }
     }
 
     /// Feeds one block unless Minion is talking.
@@ -648,11 +761,51 @@ fn open_default(
     Ok((stream, source_hz, channels, id))
 }
 
+/// Loads the neural detector, when it is wanted and it is there.
+///
+/// Missing model, unreadable model, a build of it this code cannot run:
+/// all of them fall back to the energy detector, which is what Minion did
+/// before Silero existed. Being slightly too eager to listen is a much
+/// smaller failure than being deaf.
+fn open_voice(settings: Settings, model_dir: Option<&str>) -> Option<Silero> {
+    if settings.vad != Vad::Silero {
+        crate::journal::write("Voice detector: energy only, by configuration.");
+        return None;
+    }
+    let directory = std::path::Path::new(model_dir?);
+    // An installation made before Silero existed has every other model
+    // and never asks for this one again, so fetch it here — 2 MB, once,
+    // pinned and hashed like the rest.
+    let path = match crate::models::fetch_vad(directory) {
+        Ok(path) => path,
+        Err(e) => {
+            crate::journal::write(&format!(
+                "Voice detector: silero_vad.onnx is not there and could not be \
+                 downloaded ({e}); using the energy detector."
+            ));
+            return None;
+        }
+    };
+    match Silero::load(&path) {
+        Ok(model) => {
+            crate::journal::write("Voice detector: Silero.");
+            Some(model)
+        }
+        Err(e) => {
+            crate::journal::write(&format!(
+                "Voice detector: cannot load Silero ({e}); using the energy detector."
+            ));
+            None
+        }
+    }
+}
+
 pub fn start(
     settings: Settings,
     active: Arc<AtomicBool>,
     preferred: Option<String>,
     deaf: Arc<AtomicBool>,
+    model_dir: Option<String>,
 ) -> Result<Listener> {
     let queue = Arc::new(Mutex::new(Vec::<f32>::new()));
     let watch = Arc::new(SilenceWatch::default());
@@ -715,7 +868,11 @@ pub fn start(
     let segment_started = Arc::clone(&speech_started);
 
     std::thread::spawn(move || {
-        let mut segmenter = Segmenter::new(settings);
+        // Loaded here, on the segmenter's own thread: the CoreAudio
+        // callback must never touch it, and this is the only thread that
+        // ever will.
+        let voice = open_voice(settings, model_dir.as_deref());
+        let mut segmenter = Segmenter::new(settings, voice);
         loop {
             let pending: Vec<f32> = {
                 let Ok(mut queued) = segment_queue.lock() else {
@@ -764,6 +921,12 @@ pub fn start(
 mod tests {
     use super::*;
 
+    /// A segmenter with no neural detector: the energy path, which is
+    /// what almost every test below is about.
+    fn plain(settings: Settings) -> Segmenter {
+        Segmenter::new(settings, None)
+    }
+
     fn blocks_of(level: f32, count: usize) -> Vec<Vec<f32>> {
         vec![vec![level; BLOCK_SAMPLES]; count]
     }
@@ -777,7 +940,7 @@ mod tests {
 
     #[test]
     fn emits_an_utterance_after_speech_then_silence() {
-        let mut segmenter = Segmenter::new(Settings::default());
+        let mut segmenter = plain(Settings::default());
         // 1 s of signal, then enough silence to close it.
         assert!(feed(&mut segmenter, blocks_of(0.2, 50)).is_empty());
         let done = feed(&mut segmenter, blocks_of(0.0, 40));
@@ -789,7 +952,7 @@ mod tests {
         // The level crosses the threshold partway into the first syllable,
         // so an utterance that begins exactly where the meter noticed is
         // already missing its opening consonant.
-        let mut segmenter = Segmenter::new(Settings::default());
+        let mut segmenter = plain(Settings::default());
         feed(&mut segmenter, blocks_of(0.0, 40)); // quiet room
         feed(&mut segmenter, blocks_of(0.2, 50)); // speech
         let done = feed(&mut segmenter, blocks_of(0.0, 80));
@@ -809,7 +972,7 @@ mod tests {
         // The recogniser wants the preroll and the hangover; the speaker
         // model does not — a second of room tone per phrase drags its mean
         // away from the voice.
-        let mut segmenter = Segmenter::new(Settings::default());
+        let mut segmenter = plain(Settings::default());
         feed(&mut segmenter, blocks_of(0.0, 40)); // quiet room
         feed(&mut segmenter, blocks_of(0.2, 50)); // 1 s of speech
         let done = feed(&mut segmenter, blocks_of(0.0, 80));
@@ -856,7 +1019,7 @@ mod tests {
     #[test]
     fn nothing_heard_while_minion_is_speaking_becomes_an_utterance() {
         // Its own voice, arriving through the microphone while it talks.
-        let mut segmenter = Segmenter::new(Settings::default());
+        let mut segmenter = plain(Settings::default());
         for block in blocks_of(0.2, 100) {
             assert!(segmenter.push_unless_deaf(&block, true).is_none());
         }
@@ -869,7 +1032,7 @@ mod tests {
     #[test]
     fn an_utterance_open_when_minion_starts_speaking_is_dropped() {
         // Half a sentence plus Minion's reply is not a sentence.
-        let mut segmenter = Segmenter::new(Settings::default());
+        let mut segmenter = plain(Settings::default());
         feed(&mut segmenter, blocks_of(0.2, 50));
         assert!(segmenter.push_unless_deaf(&vec![0.2; BLOCK_SAMPLES], true).is_none());
         let done = feed(&mut segmenter, blocks_of(0.0, 80));
@@ -879,13 +1042,13 @@ mod tests {
     #[test]
     fn silence_alone_never_becomes_an_utterance() {
         // The held-back blocks must not accumulate into one.
-        let mut segmenter = Segmenter::new(Settings::default());
+        let mut segmenter = plain(Settings::default());
         assert!(feed(&mut segmenter, blocks_of(0.0, 500)).is_empty());
     }
 
     #[test]
     fn discards_noises_too_short_to_be_speech() {
-        let mut segmenter = Segmenter::new(Settings::default());
+        let mut segmenter = plain(Settings::default());
         // A door slam: loud but brief.
         feed(&mut segmenter, blocks_of(0.5, 3));
         let done = feed(&mut segmenter, blocks_of(0.0, 40));
@@ -894,7 +1057,7 @@ mod tests {
 
     #[test]
     fn stays_quiet_through_silence() {
-        let mut segmenter = Segmenter::new(Settings::default());
+        let mut segmenter = plain(Settings::default());
         assert!(feed(&mut segmenter, blocks_of(0.0, 200)).is_empty());
     }
 
@@ -907,7 +1070,7 @@ mod tests {
             min_speech_ms: 200,
             ..Default::default()
         };
-        let mut segmenter = Segmenter::new(settings);
+        let mut segmenter = plain(settings);
         let done = feed(&mut segmenter, blocks_of(0.2, 200));
         assert!(!done.is_empty(), "continuous noise must still be cut");
         assert!(
@@ -918,7 +1081,7 @@ mod tests {
 
     #[test]
     fn quiet_rooms_keep_the_configured_floor() {
-        let mut segmenter = Segmenter::new(Settings::default());
+        let mut segmenter = plain(Settings::default());
         // Near-silence for a while: the floor should not move.
         feed(&mut segmenter, blocks_of(0.001, 100));
         let threshold = segmenter.noise.threshold(Settings::default().speech_threshold);
@@ -930,7 +1093,7 @@ mod tests {
 
     #[test]
     fn a_noisy_room_raises_the_bar() {
-        let mut segmenter = Segmenter::new(Settings::default());
+        let mut segmenter = plain(Settings::default());
         // Steady background hum, well under the speech threshold but not
         // silence — a fan, a café, a fridge.
         feed(&mut segmenter, blocks_of(0.012, 400));
@@ -947,7 +1110,7 @@ mod tests {
 
     #[test]
     fn speech_still_gets_through_a_noisy_room() {
-        let mut segmenter = Segmenter::new(Settings::default());
+        let mut segmenter = plain(Settings::default());
         feed(&mut segmenter, blocks_of(0.012, 400));
         // Speaking up over that background must still register.
         assert!(feed(&mut segmenter, blocks_of(0.2, 50)).is_empty());
@@ -959,7 +1122,7 @@ mod tests {
     fn pauses_between_words_do_not_deafen_it() {
         // The gaps inside a sentence are not the room; if they fed the
         // estimate, the threshold would climb mid-sentence and cut it off.
-        let mut segmenter = Segmenter::new(Settings::default());
+        let mut segmenter = plain(Settings::default());
         feed(&mut segmenter, blocks_of(0.001, 100));
         let before = segmenter.noise.threshold(0.015);
         feed(&mut segmenter, blocks_of(0.3, 20));
@@ -967,6 +1130,65 @@ mod tests {
         feed(&mut segmenter, blocks_of(0.3, 20));
         let after = segmenter.noise.threshold(0.015);
         assert!((before - after).abs() < 1e-6, "speech gaps must not move the floor");
+    }
+
+    /// The detector, if it has been downloaded. Absent, the tests that
+    /// need it are skipped rather than failed — it is not in git, same as
+    /// the speaker model.
+    fn voice_if_present() -> Option<Silero> {
+        let mut candidates = vec![std::path::PathBuf::from("model")];
+        if let Some(home) = std::env::var_os("HOME") {
+            candidates.push(
+                std::path::PathBuf::from(home).join("Library/Application Support/Minion/model"),
+            );
+        }
+        candidates
+            .into_iter()
+            .map(|dir| dir.join("silero_vad.onnx"))
+            .find(|path| path.exists())
+            .and_then(|path| Silero::load(&path).ok())
+    }
+
+    /// Cuts a signal into the 20 ms blocks the segmenter is fed.
+    fn as_blocks(samples: &[f32]) -> Vec<Vec<f32>> {
+        samples.chunks(BLOCK_SAMPLES).map(|b| b.to_vec()).collect()
+    }
+
+    /// Loud white noise: the extractor fan, the coffee machine, the tap.
+    fn hiss(level: f32, seconds: f32) -> Vec<Vec<f32>> {
+        as_blocks(&silero::sounds::noise(level, seconds))
+    }
+
+    #[test]
+    fn a_loud_noise_no_longer_becomes_an_utterance() {
+        // The whole point: energy alone opens on this, and then the
+        // speaker model and Parakeet are woken up to decide it was the
+        // kitchen.
+        let Some(voice) = voice_if_present() else { return };
+        let mut segmenter = Segmenter::new(Settings::default(), Some(voice));
+        assert!(feed(&mut segmenter, hiss(0.3, 2.0)).is_empty(), "noise is not an order");
+        assert!(feed(&mut segmenter, blocks_of(0.0, 40)).is_empty());
+    }
+
+    #[test]
+    fn a_voice_still_gets_through_silero() {
+        // And the other half: what Silero rejects must not include speech.
+        let Some(voice) = voice_if_present() else { return };
+        let Some(speech) = silero::sounds::spoken("Minion, abre Chrome.") else { return };
+        let mut segmenter = Segmenter::new(Settings::default(), Some(voice));
+        feed(&mut segmenter, as_blocks(&speech));
+        let done = feed(&mut segmenter, blocks_of(0.0, 60));
+        assert_eq!(done.len(), 1, "a spoken order must still be heard");
+    }
+
+    #[test]
+    fn without_the_model_the_energy_detector_decides_alone() {
+        // The fallback has to behave exactly as it did before, or a
+        // missing 2 MB file changes what Minion hears.
+        let mut segmenter = Segmenter::new(Settings::default(), None);
+        feed(&mut segmenter, hiss(0.3, 1.0));
+        let done = feed(&mut segmenter, blocks_of(0.0, 40));
+        assert_eq!(done.len(), 1, "energy alone still opens on noise");
     }
 
     #[test]

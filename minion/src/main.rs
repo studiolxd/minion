@@ -601,8 +601,14 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
     // shorter hands Minion its own answer just after the flag comes down.
     let speech_tail = Duration::from_millis(settings.silence_end_ms as u64 + 200);
     let listener =
-        audio::start(settings, Arc::clone(&active), microphone, Arc::clone(&deaf))
-            .context("opening the microphone")?;
+        audio::start(
+            settings,
+            Arc::clone(&active),
+            microphone,
+            Arc::clone(&deaf),
+            Some(model_path.clone()),
+        )
+        .context("opening the microphone")?;
     note!(
         "Microphone: {} Hz, {} channel(s). {} phrases understood.",
         listener.source_hz,
