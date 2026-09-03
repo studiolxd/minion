@@ -14,3 +14,7 @@ minion/Minion.app/
 *.log
 AUDITORIA.md
 MEJORAS.md
+
+# Corpus recordings are the user's own voice — see minion/corpus/README.md.
+# Only corpus.toml and baseline.toml are committed, never the WAVs.
+minion/corpus/*.wav

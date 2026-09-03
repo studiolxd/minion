@@ -13,6 +13,7 @@ mod api;
 mod audio;
 mod commands;
 mod config;
+mod corpus;
 mod dictation;
 mod enroll;
 mod fbank;
@@ -2324,6 +2325,13 @@ fn main() -> Result<()> {
                  minion mic                  qué apps usan ahora el micrófono\n  \
                  minion stats [--days N]     informe de reconocimiento (todo el \
                  registro, o los últimos N días)\n  \
+                 minion corpus <carpeta> [--save]\n\
+                 \x20                            mide el reconocimiento contra un\n\
+                 \x20                            corpus de grabaciones (ver\n\
+                 \x20                            minion/corpus/README.md)\n  \
+                 minion corpus --from-log <grabaciones> <destino>\n\
+                 \x20                            arranca un corpus.toml a partir de\n\
+                 \x20                            una carpeta de grabaciones y el registro\n  \
                  minion --help               esto\n\n\
                  «run» y «say» dejan un aviso para la copia que ya está en\n\
                  marcha y no hacen nada si no hay ninguna — útil para atajos\n\
@@ -2414,6 +2422,25 @@ fn main() -> Result<()> {
                 .and_then(|pair| pair[1].parse::<u32>().ok());
             println!("{}", metrics::report_text(days));
             return Ok(());
+        }
+        // Measures recognition rather than running Minion, so it is handled
+        // here alongside `learn` and `enroll`: no microphone, no instance
+        // lock, no menu bar.
+        if argument == "corpus" {
+            let rest: Vec<String> = std::env::args().skip(2).collect();
+            if rest.first().map(String::as_str) == Some("--from-log") {
+                let (Some(recordings_dir), Some(output_dir)) = (rest.get(1), rest.get(2)) else {
+                    eprintln!("Uso: minion corpus --from-log <carpeta-grabaciones> <carpeta-destino>");
+                    std::process::exit(1);
+                };
+                return corpus::bootstrap_from_log(Path::new(recordings_dir), Path::new(output_dir));
+            }
+            let save = rest.iter().any(|a| a == "--save");
+            let Some(dir) = rest.iter().find(|a| *a != "--save") else {
+                eprintln!("Uso: minion corpus <carpeta> [--save]");
+                std::process::exit(1);
+            };
+            return corpus::run(Path::new(dir), save);
         }
     }
 
