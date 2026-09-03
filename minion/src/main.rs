@@ -302,7 +302,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                             last_used = Instant::now();
                             note!("Speech starting — model reloaded. {}", resident_memory());
                         }
-                        Err(e) => eprintln!("could not reload the model: {e:#}"),
+                        Err(e) => note!("error    could not reload the model: {e:#}"),
                     }
                 }
                 if let Some(idle_for) = idle_unload {
@@ -410,7 +410,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                     note!("Speech heard — model reloaded. {}", resident_memory());
                 }
                 Err(e) => {
-                    eprintln!("could not reload the model: {e:#}");
+                    note!("error    could not reload the model: {e:#}");
                     continue;
                 }
             }
@@ -984,6 +984,24 @@ fn report_permissions() {
     actions::open_accessibility_settings();
 }
 
+/// Stops, having said why.
+///
+/// Everything that can go wrong before Minion is listening — no
+/// microphone, no model, a corrupt one — used to reach stderr alone, which
+/// under launchd goes to a file nobody opens: the user saw a menu bar with
+/// no icon, or an icon that never did anything. So it is written down, and
+/// shown.
+///
+/// Exits with 0 on purpose. The launch agent restarts on a non-zero exit,
+/// and a configuration problem does not fix itself between two tries: it
+/// would reopen this dialog every `ThrottleInterval` seconds until someone
+/// killed it.
+fn fatal(message: &str) -> ! {
+    note!("fatal    {message}");
+    actions::show_message(message);
+    std::process::exit(0)
+}
+
 fn main() -> Result<()> {
     // `minion learn` reads the log and turns its failures into vocabulary.
     // It touches neither the microphone nor the model, so it is handled
@@ -1014,7 +1032,13 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let model_path = locate_model(first_argument)?;
+    let model_path = match locate_model(first_argument) {
+        Ok(path) => path,
+        Err(e) => fatal(&format!(
+            "Minion no encuentra el modelo de reconocimiento y no ha podido \
+             descargarlo.\n\n{e:#}"
+        )),
+    };
 
     let config = config::load();
     commands::configure(&config);
@@ -1084,8 +1108,11 @@ fn main() -> Result<()> {
             show_catalogue: worker_catalogue,
             save_recordings,
         }) {
-            eprintln!("Error: {e:#}");
-            std::process::exit(1);
+            fatal(&format!(
+                "Minion no puede escuchar y va a cerrarse.\n\n{e:#}\n\nComprueba \
+                 el micrófono en Ajustes del Sistema → Privacidad y seguridad → \
+                 Micrófono."
+            ));
         }
     });
 
