@@ -898,9 +898,11 @@ pub fn decide_in(transcript: &str, context: Option<&str>) -> (Decision, f32) {
 
     // The dictation mode's own switches, and undo. Checked here because
     // they are answered by the caller, which is what holds the state.
+    // Stopping is checked before starting: «fin del dictado» contains the
+    // one-word way in, «dictado», and must not be taken for it.
     let switches: [(&[&str], Decision); 3] = [
-        (&["empieza a dictar", "modo dictado", "dictado"], Decision::StartDictation),
         (&["deja de dictar", "fin del dictado"], Decision::StopDictation),
+        (&["empieza a dictar", "modo dictado", "dictado"], Decision::StartDictation),
         (&["deshaz lo que has hecho", "anula eso"], Decision::UndoLast),
     ];
     for (phrases, decision) in switches {
