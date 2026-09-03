@@ -1085,9 +1085,55 @@ fn sounds_near(word: &str, alias: &str) -> f32 {
     if longest < 4 || edits > MOST_EDITS {
         return 0.0;
     }
+    // A word *longer* than the alias, with a different sound at the front,
+    // has something unexplained glued on ahead of it — a different word
+    // wearing the name's clothes, the same reasoning `near_alias` uses to
+    // keep "gmail" from being read as "mail" ("gmail" is two edits from
+    // "meil", one of Mail's own aliases: drop the "g", then "a" for "e").
+    // A word no longer than the alias just left something off the front,
+    // which is an ordinary mishearing — "fari" for "safari" is how Safari
+    // gets suggested at all — so only the first direction is refused.
+    if heard.chars().count() > wanted.chars().count() && heard.chars().next() != wanted.chars().next()
+    {
+        return 0.0;
+    }
     // Kept below every grade `find_app` acts on, so a guess can never
     // outrank a real match when the two are compared.
     (1.0 - edits as f32 / longest as f32).min(0.75)
+}
+
+/// Whether a spoken word could be a known verb or filler glued to
+/// something that only *sounds* like the alias.
+///
+/// "abrecron" is "abre" plus a mishearing of "chrome" ("cron", one edit
+/// from its phonetic form); "avrechrome" is "abre" itself misheard as
+/// "avre" — b and v are the same sound in Spanish, which is why the head
+/// is also tried with v turned back into b — plus "chrome" spelled right.
+/// Guessing only: [`run_together`] already covers the case where both
+/// halves are spelled exactly right, on every path including the strict
+/// one, and must stay that way.
+fn glued_verb_guess(word: &str, alias: &str) -> bool {
+    let alias_sound = crate::text::phonetic(alias);
+    if alias_sound.chars().count() < 4 {
+        return false;
+    }
+    let max_edits = if alias.chars().count() >= 5 { 2 } else { 1 };
+    let letters: Vec<char> = word.chars().collect();
+    for split in 1..letters.len() {
+        let head: String = letters[..split].iter().collect();
+        let tail: String = letters[split..].iter().collect();
+        let opener = spanish::is_known_verb(&head)
+            || spanish::is_known_verb(&head.replace('v', "b"))
+            || spanish::is_filler(&head)
+            || sounds_like_wake_word(&head);
+        if !opener {
+            continue;
+        }
+        if crate::text::edits_between(&crate::text::phonetic(&tail), &alias_sound) <= max_edits {
+            return true;
+        }
+    }
+    false
 }
 
 /// How well one spoken sentence matches one alias of an application.
@@ -1097,11 +1143,12 @@ fn sounds_near(word: &str, alias: &str) -> f32 {
 /// mangles stay in the alias lists — what the recogniser really writes
 /// ("shafari", "grum") is listed, which is explicit and cannot spread.
 ///
-/// `guessing` adds a fifth, softer grade below the other four: how much of
-/// the word sounds right, a spread rather than a step, so a guess can be
-/// ranked against the commands — "abre za fari" is worth mentioning and
-/// "abre cron" is not. It is never available to [`find_app`], because a
-/// word that mostly sounds right is not grounds for doing anything.
+/// `guessing` adds two softer grades below the other four, neither ever
+/// available to [`find_app`]: a word glued to a known verb that only sounds
+/// like the alias ([`glued_verb_guess`], "abrecron" for Chrome), and below
+/// that, how much of the word sounds right at all, a spread rather than a
+/// step, so a guess can be ranked against the commands — "abre za fari" is
+/// worth mentioning and "abre cron" on its own is not.
 fn alias_score(words: &[&str], alias: &str, guessing: bool) -> f32 {
     // A plain mention beats a run-together one, which beats one that only
     // sounds right, which beats a misheard one; longer aliases beat shorter
@@ -1114,6 +1161,8 @@ fn alias_score(words: &[&str], alias: &str, guessing: bool) -> f32 {
         0.85
     } else if words.iter().any(|word| near_alias(word, alias)) {
         0.8
+    } else if guessing && words.iter().any(|word| glued_verb_guess(word, alias)) {
+        0.75
     } else if guessing {
         words.iter().map(|word| sounds_near(word, alias)).fold(0.0, f32::max)
     } else {
@@ -2398,6 +2447,29 @@ mod tests {
         assert!(!near_alias("mallorca", "orca"));
         assert!(!near_alias("editorial", "editor"));
         assert_eq!(decision("minion abre el editorial"), Decision::Unrecognised);
+    }
+
+    #[test]
+    fn guessing_splits_a_run_together_word_to_find_the_app() {
+        // The real case: "Minion abrecron" glued "abre" and "cron", and
+        // "cron" is one phonetic edit from Chrome's "crom". The strict path
+        // must not act on it — only the guess used for questions and
+        // Aprender does.
+        assert_eq!(decision("minion abrecron"), Decision::Unrecognised);
+        let guess = closest_app("minion abrecron").expect("should guess Chrome");
+        assert_eq!(guess.app, "Chrome");
+
+        // "cromo" spelled right phonetically, and "avrechrome" where the
+        // verb itself is misheard ("avre" for "abre", a b/v slip) but the
+        // name is spelled correctly.
+        assert_eq!(closest_app("minion abrecromo").expect("should guess Chrome").app, "Chrome");
+        assert_eq!(closest_app("minion avrechrome").expect("should guess Chrome").app, "Chrome");
+
+        // Nothing built-in sounds like "casa": no guess at all.
+        assert!(closest_app("minion abrecasa").is_none());
+
+        // "gmail" must still not become "Mail", even as a guess.
+        assert_ne!(closest_app("minion gmail").map(|g| g.app), Some("Mail"));
     }
 
     #[test]
