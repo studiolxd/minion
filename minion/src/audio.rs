@@ -1021,6 +1021,333 @@ pub fn start(
     })
 }
 
+/// Measuring the room and the voice, to propose settings instead of
+/// leaving them at whatever the defaults happened to be.
+///
+/// «Calibrar…» in Ajustes drives this from its own thread: three seconds
+/// of silence, then a spoken command, each turned into a measurement and
+/// then a proposal. Deliberately outside `start()`'s segmenter — the sheet
+/// already knows which phase it is in from its own countdown, not from the
+/// VAD guessing where speech starts.
+pub mod calibration {
+    use super::{
+        open_default, open_voice, rms, silero::Silero, SilenceWatch, Settings, BLOCK_SAMPLES,
+    };
+    use anyhow::Result;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// How long the "guarda silencio" phase listens.
+    pub const QUIET_SECONDS: u64 = 3;
+    /// How long the "ahora di…" phase listens.
+    pub const SPEECH_SECONDS: u64 = 4;
+    /// The command the speech phase asks for — also what the speaker check
+    /// is measured against, since it is what will be said for real.
+    pub const SPEECH_PROMPT: &str = "minion, abre Chrome";
+
+    /// `vad_threshold` is never proposed outside this range: below 0.35 a
+    /// noisy room opens on everything, above 0.7 a real voice can fail to
+    /// clear it.
+    pub const VAD_THRESHOLD_MIN: f32 = 0.35;
+    pub const VAD_THRESHOLD_MAX: f32 = 0.7;
+
+    /// An open microphone that hands back raw 16 kHz mono audio on demand,
+    /// rather than segmented utterances — calibration decides for itself
+    /// when one phase ends and the next begins.
+    pub struct RawCapture {
+        _stream: cpal::platform::Stream,
+        queue: Arc<Mutex<Vec<f32>>>,
+    }
+
+    impl RawCapture {
+        /// Takes everything captured since the last drain (or since the
+        /// stream opened, the first time), leaving nothing behind.
+        pub fn drain(&self) -> Vec<f32> {
+            self.queue.lock().map(|mut queued| std::mem::take(&mut *queued)).unwrap_or_default()
+        }
+    }
+
+    /// Opens the microphone for calibration. Same device selection and
+    /// resampling as [`super::start`], without the segmenter thread.
+    pub fn start_capture(preferred: Option<String>) -> Result<RawCapture> {
+        let queue = Arc::new(Mutex::new(Vec::<f32>::new()));
+        let active = Arc::new(AtomicBool::new(true));
+        let watch = Arc::new(SilenceWatch::default());
+        let silent = Arc::new(AtomicBool::new(false));
+        let (stream, ..) = open_default(&queue, &active, preferred.as_deref(), &watch, &silent)?;
+        Ok(RawCapture { _stream: stream, queue })
+    }
+
+    /// What three seconds of room tone measured: the loudest moment of
+    /// both signals, since that is the worst case a noise floor has to
+    /// clear before the VAD opens on it by mistake.
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct RoomMeasurement {
+        pub energy_max: f32,
+        pub silero_max: f32,
+    }
+
+    /// What the spoken command measured: the quietest moment of both
+    /// signals — the worst case a real command has to clear to be heard
+    /// at all.
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct SpeechMeasurement {
+        pub energy_min: f32,
+        pub silero_min: f32,
+    }
+
+    /// Scores 16 kHz mono `samples` in the same 20 ms blocks the live
+    /// segmenter uses, keeping the loudest block of each signal.
+    pub fn measure_room(samples: &[f32], silero: &mut Option<Silero>) -> RoomMeasurement {
+        let mut result = RoomMeasurement::default();
+        for block in samples.chunks(BLOCK_SAMPLES) {
+            if block.len() < BLOCK_SAMPLES {
+                break;
+            }
+            result.energy_max = result.energy_max.max(rms(block));
+            if let Some(model) = silero.as_mut() {
+                if let Some(score) = model.push(block) {
+                    result.silero_max = result.silero_max.max(score);
+                }
+            }
+        }
+        result
+    }
+
+    /// Scores `samples` the same way, but keeps the quietest block that
+    /// still clears `room_floor` — the blocks louder than the room, which
+    /// is to say the ones that are actually the command rather than a
+    /// breath before or after it.
+    pub fn measure_speech(
+        samples: &[f32],
+        room_floor: f32,
+        silero: &mut Option<Silero>,
+    ) -> SpeechMeasurement {
+        let mut energy_min = f32::MAX;
+        let mut silero_min = f32::MAX;
+        for block in samples.chunks(BLOCK_SAMPLES) {
+            if block.len() < BLOCK_SAMPLES {
+                break;
+            }
+            let energy = rms(block);
+            let score = silero.as_mut().and_then(|model| model.push(block));
+            if energy <= room_floor {
+                continue;
+            }
+            energy_min = energy_min.min(energy);
+            if let Some(score) = score {
+                silero_min = silero_min.min(score);
+            }
+        }
+        SpeechMeasurement {
+            energy_min: if energy_min == f32::MAX { 0.0 } else { energy_min },
+            silero_min: if silero_min == f32::MAX { 0.0 } else { silero_min },
+        }
+    }
+
+    /// Proposes `(vad_threshold, speech_threshold)` from what was
+    /// measured: the midpoint between the worst of the room and the worst
+    /// of the command, on each signal — everything the room reached and
+    /// everything the command needs is on the right side of it.
+    pub fn propose_thresholds(room: RoomMeasurement, speech: SpeechMeasurement) -> (f32, f32) {
+        let vad_threshold = ((room.silero_max + speech.silero_min) / 2.0)
+            .clamp(VAD_THRESHOLD_MIN, VAD_THRESHOLD_MAX);
+        // No published range for the energy threshold — clamped only
+        // against zero and silence, since RMS on 16-bit-derived floats
+        // rarely exceeds a few tenths even shouting into the microphone.
+        let speech_threshold = ((room.energy_max + speech.energy_min) / 2.0).max(0.001);
+        (vad_threshold, speech_threshold)
+    }
+
+    /// A plain-language verdict for how the measured voice score compares
+    /// to the threshold that gates every command — Spanish, with the
+    /// comma decimal a Spanish reader expects.
+    pub fn voice_verdict(score: f32, threshold: f32) -> String {
+        let margin = score - threshold;
+        let judgement = if margin >= 0.2 {
+            "margen amplio"
+        } else if margin >= 0.05 {
+            "margen ajustado"
+        } else if margin >= 0.0 {
+            "justo por encima del umbral"
+        } else {
+            "por debajo del umbral"
+        };
+        format!(
+            "tu voz puntúa {}; el umbral es {}: {judgement}",
+            decimal_es(score),
+            decimal_es(threshold)
+        )
+    }
+
+    fn decimal_es(value: f32) -> String {
+        format!("{value:.2}").replace('.', ",")
+    }
+
+    /// What one calibration run measured and proposes.
+    pub struct Report {
+        pub room: RoomMeasurement,
+        pub speech: SpeechMeasurement,
+        pub speech_samples: Vec<f32>,
+        pub vad_threshold: f32,
+        pub speech_threshold: f32,
+    }
+
+    /// Runs both phases and returns the proposal. Blocking — sleeps
+    /// through each phase — so this belongs on its own thread, never the
+    /// run loop or the recognition thread.
+    ///
+    /// `on_phase` is called with what to show right now, so the caller's
+    /// status label can follow along without polling anything finer than
+    /// "is there a new message".
+    pub fn run(
+        preferred: Option<String>,
+        model_dir: Option<String>,
+        mut on_phase: impl FnMut(&str),
+    ) -> Result<Report> {
+        on_phase("Abriendo el micrófono…");
+        let capture = start_capture(preferred)?;
+        // The stream's opening moment can carry a click or a pop that
+        // belongs to no room and no voice; let it pass before measuring.
+        std::thread::sleep(Duration::from_millis(200));
+        capture.drain();
+
+        on_phase("Guarda silencio 3 s…");
+        std::thread::sleep(Duration::from_secs(QUIET_SECONDS));
+        let room_samples = capture.drain();
+
+        on_phase(&format!("Ahora di: «{SPEECH_PROMPT}»"));
+        std::thread::sleep(Duration::from_secs(SPEECH_SECONDS));
+        let speech_samples = capture.drain();
+        drop(capture);
+
+        on_phase("Midiendo…");
+        let mut room_silero = open_voice(Settings::default(), model_dir.as_deref());
+        let room = measure_room(&room_samples, &mut room_silero);
+        let mut speech_silero = open_voice(Settings::default(), model_dir.as_deref());
+        let speech = measure_speech(&speech_samples, room.energy_max, &mut speech_silero);
+        let (vad_threshold, speech_threshold) = propose_thresholds(room, speech);
+
+        Ok(Report { room, speech, speech_samples, vad_threshold, speech_threshold })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::audio::silero::sounds::spoken;
+
+        /// Uniform "noise" in `[-amplitude, amplitude]` — a normalised
+        /// amplitude comparable to real audio, unlike
+        /// `silero::sounds::noise`, whose `level` does not map linearly to
+        /// sample magnitude and is tuned for the segmenter tests that use
+        /// it, not for this module's room-vs-speech comparisons.
+        fn synthetic(amplitude: f32, seconds: f32) -> Vec<f32> {
+            let count = (crate::audio::TARGET_HZ as f32 * seconds) as usize;
+            let mut seed: u32 = 0x9e37_79b9;
+            (0..count)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    ((seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 2.0 * amplitude
+                })
+                .collect()
+        }
+
+        fn voice_if_present() -> Option<Silero> {
+            let mut candidates = vec![std::path::PathBuf::from("model")];
+            if let Some(home) = std::env::var_os("HOME") {
+                candidates.push(
+                    std::path::PathBuf::from(home)
+                        .join("Library/Application Support/Minion/model"),
+                );
+            }
+            candidates
+                .into_iter()
+                .map(|dir| dir.join("silero_vad.onnx"))
+                .find(|path| path.exists())
+                .and_then(|path| Silero::load(&path).ok())
+        }
+
+        #[test]
+        fn a_quiet_room_measures_low_and_a_loud_one_measures_higher() {
+            let mut none = None;
+            let quiet = measure_room(&synthetic(0.01, 1.0), &mut none);
+            let loud = measure_room(&synthetic(0.2, 1.0), &mut none);
+            assert!(quiet.energy_max < loud.energy_max);
+        }
+
+        #[test]
+        fn speech_below_the_room_floor_is_not_counted() {
+            // A whisper quieter than the measured room noise must not set
+            // the speech-min energy — it would propose a threshold under
+            // the room's own noise floor.
+            let mut none = None;
+            let whisper = synthetic(0.01, 1.0);
+            let result = measure_speech(&whisper, 0.5, &mut none);
+            assert_eq!(result.energy_min, 0.0);
+        }
+
+        #[test]
+        fn the_proposal_sits_between_room_and_speech() {
+            let room = RoomMeasurement { energy_max: 0.02, silero_max: 0.3 };
+            let speech = SpeechMeasurement { energy_min: 0.08, silero_min: 0.6 };
+            let (vad, energy) = propose_thresholds(room, speech);
+            assert!((vad - 0.45).abs() < 1e-6);
+            assert!((energy - 0.05).abs() < 1e-6);
+        }
+
+        #[test]
+        fn the_proposal_is_clamped_to_the_published_range() {
+            // A room as loud as the speech (a bad take) must not propose
+            // something that would never open on anything, or that would
+            // open on the room itself.
+            let quiet_room = RoomMeasurement { energy_max: 0.0, silero_max: 0.0 };
+            let strong_speech = SpeechMeasurement { energy_min: 0.5, silero_min: 0.95 };
+            let (vad, _) = propose_thresholds(quiet_room, strong_speech);
+            assert!(vad <= VAD_THRESHOLD_MAX);
+
+            let loud_room = RoomMeasurement { energy_max: 0.5, silero_max: 0.9 };
+            let faint_speech = SpeechMeasurement { energy_min: 0.01, silero_min: 0.1 };
+            let (vad, _) = propose_thresholds(loud_room, faint_speech);
+            assert!(vad >= VAD_THRESHOLD_MIN);
+        }
+
+        #[test]
+        fn the_verdict_reads_in_spanish_with_a_comma() {
+            let verdict = voice_verdict(0.71, 0.32);
+            assert_eq!(verdict, "tu voz puntúa 0,71; el umbral es 0,32: margen amplio");
+        }
+
+        #[test]
+        fn a_score_under_the_threshold_says_so() {
+            let verdict = voice_verdict(0.20, 0.32);
+            assert!(verdict.ends_with("por debajo del umbral"), "{verdict}");
+        }
+
+        #[test]
+        fn real_speech_scores_higher_than_noise_on_silero() {
+            // The one test that touches the real model, skipped where it
+            // is not on disk — same convention as the rest of this file.
+            // A fresh `Silero` per measurement: its state is meant to
+            // reset between separately-captured phases, same as the two
+            // `open_voice` calls `run()` makes for room and speech.
+            let (Some(room_voice), Some(speech_voice)) = (voice_if_present(), voice_if_present())
+            else {
+                return;
+            };
+            let Some(phrase) = spoken("Hola, esto es una prueba.") else { return };
+            let room = measure_room(&synthetic(0.01, 1.0), &mut Some(room_voice));
+            let speech = measure_speech(&phrase, room.energy_max, &mut Some(speech_voice));
+            assert!(
+                speech.silero_min > room.silero_max,
+                "speech {} should score above room noise {}",
+                speech.silero_min,
+                room.silero_max
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -738,6 +738,34 @@ pub struct Preferences {
     ai_base_url_field: Retained<NSTextField>,
     ai_base_url_hint: Retained<NSTextField>,
     last_ai_base_url: std::cell::RefCell<String>,
+    /// Starts a calibration run on its own thread — see
+    /// [`CalibrationOutcome`] and the section below `Layout::heading`
+    /// "Calibración".
+    calibrate: Press,
+    calibrate_status: Retained<NSTextField>,
+    calibrate_running: Cell<bool>,
+    /// Updated several times during one run (one per phase) so the status
+    /// label can follow along; drained on every poll.
+    calibrate_progress: Arc<Mutex<Option<String>>>,
+    /// Filled in once, when the run finishes, successfully or not.
+    calibrate_result: Arc<Mutex<Option<Result<CalibrationOutcome, String>>>>,
+    /// What «Aplicar» would write, kept from the moment a run finishes
+    /// until the button is clicked or another run starts.
+    calibrate_outcome: std::cell::RefCell<Option<CalibrationOutcome>>,
+    calibrate_apply: Press,
+}
+
+/// What one calibration run proposes, and what it found out about the
+/// enrolled voice — kept apart from `audio::calibration::Report` since this
+/// also carries the speaker-similarity check, which is `speaker.rs`'s
+/// concern rather than `audio.rs`'s.
+struct CalibrationOutcome {
+    vad_threshold: f32,
+    speech_threshold: f32,
+    /// The full message the status label shows once the run is done —
+    /// built once, on the worker thread, so `poll()` only ever copies a
+    /// string into a label rather than re-deriving it.
+    message: String,
 }
 
 /// A shortcut written the way macOS shows it: ⌥Space, ⇧⌘B.
@@ -1499,6 +1527,50 @@ impl Preferences {
             0.0,
         );
 
+        layout.heading("Calibración");
+        // Safety: no target and no action, so nothing is called back into.
+        let calibrate = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str("Calibrar…"),
+                None,
+                None,
+                mtm,
+            )
+        };
+        let calibrate_row = layout.place(spacing::BUTTON, 0.0);
+        calibrate.setFrame(narrow(calibrate_row, 170.0));
+        layout.add_control(&calibrate, "Calibrar");
+        // Safety: no target and no action, so nothing is called back into.
+        let calibrate_apply = unsafe {
+            NSButton::buttonWithTitle_target_action(&NSString::from_str("Aplicar"), None, None, mtm)
+        };
+        calibrate_apply.setFrame(beside(calibrate_row, 170.0, 110.0));
+        calibrate_apply.setAccessibilityLabel(Some(&NSString::from_str(
+            "Aplicar los umbrales calibrados",
+        )));
+        // Only means anything once a run has proposed something.
+        calibrate_apply.setHidden(true);
+        layout.add(&calibrate_apply);
+
+        let calibrate_status_frame = {
+            layout.gap(spacing::BEFORE_HINT);
+            layout.place(PROMPT_LINE * 5.0, 0.0)
+        };
+        let calibrate_status = plain_label(
+            mtm,
+            "Guarda tres segundos de silencio y luego di una orden; \
+             propone los umbrales de sensibilidad a partir de lo que mida.",
+            calibrate_status_frame,
+        );
+        calibrate_status.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+        layout.add(&calibrate_status);
+        layout.gap(spacing::SIBLING);
+        layout.hint(
+            "No cambia el umbral de voz — ese solo se ajusta escuchando \
+             grabaciones reales, no una calibración de un minuto.",
+            0.0,
+        );
+
         let (canvas, content_height) = layout.finish();
 
         let window = {
@@ -1633,6 +1705,13 @@ impl Preferences {
             ai_base_url_field,
             ai_base_url_hint,
             last_ai_base_url: std::cell::RefCell::new(ai_settings.base_url.clone()),
+            calibrate: Press::new(calibrate),
+            calibrate_status,
+            calibrate_running: Cell::new(false),
+            calibrate_progress: Arc::new(Mutex::new(None)),
+            calibrate_result: Arc::new(Mutex::new(None)),
+            calibrate_outcome: std::cell::RefCell::new(None),
+            calibrate_apply: Press::new(calibrate_apply),
         };
         preferences.update_readouts();
         preferences.sync_ai_provider_controls();
@@ -2157,6 +2236,112 @@ impl Preferences {
             if let Some(text) = slot.take() {
                 self.ai_status.setStringValue(&NSString::from_str(&text));
                 self.ai_probe_running.set(false);
+                changed = true;
+            }
+        }
+
+        if self.calibrate.clicked() && !self.calibrate_running.get() {
+            self.calibrate_running.set(true);
+            self.calibrate_apply.control.setHidden(true);
+            *self.calibrate_outcome.borrow_mut() = None;
+            self.calibrate_status
+                .setStringValue(&NSString::from_str("Abriendo el micrófono…"));
+            let live = config::load();
+            let microphone = live.microphone();
+            let voice_threshold = live.voice_threshold();
+            let model_dir =
+                crate::models::directory().map(|dir| dir.to_string_lossy().into_owned());
+            let progress = Arc::clone(&self.calibrate_progress);
+            let result = Arc::clone(&self.calibrate_result);
+            std::thread::spawn(move || {
+                let Some(model_dir) = model_dir else {
+                    if let Ok(mut slot) = result.lock() {
+                        *slot = Some(Err(
+                            "No se encuentra el modelo — ¿está instalado Minion?".to_string(),
+                        ));
+                    }
+                    return;
+                };
+                let phase_progress = Arc::clone(&progress);
+                let report = crate::audio::calibration::run(microphone, Some(model_dir.clone()), |text| {
+                    if let Ok(mut slot) = phase_progress.lock() {
+                        *slot = Some(text.to_string());
+                    }
+                });
+                let outcome = report.map(|report| {
+                    let voice_score = crate::speaker::Speaker::load(&model_dir).ok().and_then(
+                        |mut speaker| {
+                            let embedding = speaker.embed(&report.speech_samples)?;
+                            crate::speaker::load_profiles_for(&model_dir)
+                                .iter()
+                                .map(|profile| crate::speaker::similarity(&embedding, &profile.voice))
+                                .fold(None::<f32>, |best, score| {
+                                    Some(best.map_or(score, |b| b.max(score)))
+                                })
+                        },
+                    );
+                    let voice_line = voice_score.map_or_else(
+                        || "No hay ninguna voz registrada con la que comparar.".to_string(),
+                        |score| crate::audio::calibration::voice_verdict(score, voice_threshold),
+                    );
+                    let message = format!(
+                        "Sala: ruido {:.3}, Silero {:.2}. Orden: energía {:.3}, Silero {:.2}.\n\
+                         Propuesta: vad_threshold {:.2}, speech_threshold {:.3}. \
+                         Pulsa «Aplicar» para guardarla.\n{voice_line}",
+                        report.room.energy_max,
+                        report.room.silero_max,
+                        report.speech.energy_min,
+                        report.speech.silero_min,
+                        report.vad_threshold,
+                        report.speech_threshold
+                    );
+                    CalibrationOutcome {
+                        vad_threshold: report.vad_threshold,
+                        speech_threshold: report.speech_threshold,
+                        message,
+                    }
+                });
+                if let Ok(mut slot) = result.lock() {
+                    *slot = Some(outcome.map_err(|e| format!("No se pudo calibrar: {e:#}")));
+                }
+            });
+            changed = true;
+        }
+        if let Ok(mut slot) = self.calibrate_progress.lock() {
+            if let Some(text) = slot.take() {
+                self.calibrate_status.setStringValue(&NSString::from_str(&text));
+                changed = true;
+            }
+        }
+        if let Ok(mut slot) = self.calibrate_result.lock() {
+            if let Some(outcome) = slot.take() {
+                self.calibrate_running.set(false);
+                match outcome {
+                    Ok(outcome) => {
+                        self.calibrate_status
+                            .setStringValue(&NSString::from_str(&outcome.message));
+                        self.calibrate_apply.control.setHidden(false);
+                        *self.calibrate_outcome.borrow_mut() = Some(outcome);
+                    }
+                    Err(problem) => {
+                        self.calibrate_status.setStringValue(&NSString::from_str(&problem));
+                        self.calibrate_apply.control.setHidden(true);
+                        *self.calibrate_outcome.borrow_mut() = None;
+                    }
+                }
+                changed = true;
+            }
+        }
+        if self.calibrate_apply.clicked() {
+            if let Some(outcome) = self.calibrate_outcome.borrow_mut().take() {
+                save_audio("vad_threshold", &format!("{:.3}", outcome.vad_threshold));
+                save_audio("speech_threshold", &format!("{:.4}", outcome.speech_threshold));
+                self.calibrate_status.setStringValue(&NSString::from_str(&format!(
+                    "Aplicado — vad_threshold {:.2}, speech_threshold {:.3}. \
+                     Reinicia Minion para que se use.",
+                    outcome.vad_threshold, outcome.speech_threshold
+                )));
+                self.calibrate_apply.control.setHidden(true);
                 changed = true;
             }
         }
