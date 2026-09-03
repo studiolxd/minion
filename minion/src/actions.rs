@@ -183,26 +183,24 @@ impl Mods {
 /// Needs Accessibility permission. Without it this does not fail — the
 /// events are simply swallowed, which is macOS's most baffling failure
 /// mode. Check [`has_accessibility_permission`] at startup instead.
-pub fn press(code: u16, mods: Mods) -> bool {
+pub fn press(code: u16, mods: Mods) -> Result<(), String> {
     // Checked here rather than only at startup: the permission can be
     // granted while Minion is running and takes effect immediately, so a
     // one-off check at launch goes stale the moment the user turns it on.
     if !has_accessibility_permission() {
-        return false;
+        return Err("Accessibility not granted".to_string());
     }
-    let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
-        return false;
-    };
+    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+        .map_err(|()| "could not create an event source".to_string())?;
     let flags = mods.flags();
 
     for down in [true, false] {
-        let Ok(event) = CGEvent::new_keyboard_event(source.clone(), code, down) else {
-            return false;
-        };
+        let event = CGEvent::new_keyboard_event(source.clone(), code, down)
+            .map_err(|()| "could not create a keyboard event".to_string())?;
         event.set_flags(flags);
         event.post(CGEventTapLocation::HID);
     }
-    true
+    Ok(())
 }
 
 /// Launches the application, or brings it forward if already running.
@@ -212,12 +210,8 @@ pub fn press(code: u16, mods: Mods) -> bool {
 /// (activates it). The middle case is common on macOS, where closing the
 /// last window does not quit the app — and where `focus()` alone would
 /// swap the menu bar while showing nothing.
-pub fn open_app(bundle_id: &str) -> bool {
-    Command::new("/usr/bin/open")
-        .arg("-b")
-        .arg(bundle_id)
-        .spawn()
-        .is_ok()
+pub fn open_app(bundle_id: &str) -> Result<(), String> {
+    run(Command::new("/usr/bin/open").arg("-b").arg(bundle_id))
 }
 
 /// Asks an application to quit.
@@ -225,7 +219,7 @@ pub fn open_app(bundle_id: &str) -> bool {
 /// A polite quit, not a kill: if there is unsaved work the app puts up its
 /// own save dialog, exactly as ⌘Q would. Nothing is lost without being
 /// asked about first.
-pub fn quit_app(bundle_id: &str) -> bool {
+pub fn quit_app(bundle_id: &str) -> Result<(), String> {
     applescript(&format!("tell application id \"{bundle_id}\" to quit"))
 }
 
@@ -238,30 +232,28 @@ pub fn quit_app(bundle_id: &str) -> bool {
 ///
 /// Long text is sent in chunks: the event queue drops oversized payloads
 /// silently, which would lose the tail of a dictated sentence.
-pub fn type_text(text: &str) -> bool {
+pub fn type_text(text: &str) -> Result<(), String> {
     if text.is_empty() {
-        return true;
+        return Ok(());
     }
     if !has_accessibility_permission() {
-        return false;
+        return Err("Accessibility not granted".to_string());
     }
-    let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
-        return false;
-    };
+    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+        .map_err(|()| "could not create an event source".to_string())?;
 
     const CHUNK_CHARS: usize = 20;
     let chars: Vec<char> = text.chars().collect();
     for chunk in chars.chunks(CHUNK_CHARS) {
         let piece: String = chunk.iter().collect();
-        let Ok(event) = CGEvent::new_keyboard_event(source.clone(), 0, true) else {
-            return false;
-        };
+        let event = CGEvent::new_keyboard_event(source.clone(), 0, true)
+            .map_err(|()| "could not create a keyboard event".to_string())?;
         event.set_string(&piece);
         event.post(CGEventTapLocation::HID);
         // A short gap keeps the receiving app from dropping characters.
         std::thread::sleep(std::time::Duration::from_millis(6));
     }
-    true
+    Ok(())
 }
 
 /// Bundle identifier of the application currently in front.
@@ -280,12 +272,13 @@ pub fn frontmost_app() -> Option<String> {
 /// when a different browser is already in front: opening a link in the
 /// default browser while you are working in another is jarring, and leaves
 /// the page somewhere you were not looking.
-pub fn open_url(url: &str, browser_bundle_id: Option<&str>) -> bool {
+pub fn open_url(url: &str, browser_bundle_id: Option<&str>) -> Result<(), String> {
     let mut command = Command::new("/usr/bin/open");
     if let Some(bundle_id) = browser_bundle_id {
         command.arg("-b").arg(bundle_id);
     }
-    command.arg(url).spawn().is_ok()
+    command.arg(url);
+    run(&mut command)
 }
 
 /// Opens a search in Spotify.
@@ -293,7 +286,7 @@ pub fn open_url(url: &str, browser_bundle_id: Option<&str>) -> bool {
 /// Searching rather than playing: starting a specific track needs the Web
 /// API and an OAuth token, which is a different project. This lands on the
 /// results with the app in front, one click from playing.
-pub fn search_spotify(query: &str) -> bool {
+pub fn search_spotify(query: &str) -> Result<(), String> {
     let encoded: String = query
         .chars()
         .map(|c| {
@@ -398,34 +391,55 @@ fn alert(mtm: MainThreadMarker, text: &str, affirmative: Option<&str>) -> bool {
 }
 
 /// Shows a file in the Finder.
-pub fn reveal(path: &str) {
-    let _ = Command::new("/usr/bin/open").arg("-R").arg(path).spawn();
+pub fn reveal(path: &str) -> Result<(), String> {
+    Command::new("/usr/bin/open")
+        .arg("-R")
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 /// Runs an AppleScript snippet.
-pub fn applescript(script: &str) -> bool {
-    Command::new("/usr/bin/osascript")
-        .arg("-e")
-        .arg(script)
-        .spawn()
-        .is_ok()
+pub fn applescript(script: &str) -> Result<(), String> {
+    run(Command::new("/usr/bin/osascript").arg("-e").arg(script))
 }
 
 /// Adjusts system output volume by `delta` points on a 0-100 scale.
-pub fn adjust_volume(delta: i32) -> bool {
+pub fn adjust_volume(delta: i32) -> Result<(), String> {
     applescript(&format!(
         "set v to output volume of (get volume settings)\n\
          set volume output volume (v + {delta})"
     ))
 }
 
-pub fn set_muted(muted: bool) -> bool {
+pub fn set_muted(muted: bool) -> Result<(), String> {
     applescript(&format!("set volume output muted {muted}"))
 }
 
 /// Plays a short system sound as feedback.
-pub fn play_sound(path: &str) {
-    let _ = Command::new("/usr/bin/afplay").arg(path).spawn();
+pub fn play_sound(path: &str) -> Result<(), String> {
+    Command::new("/usr/bin/afplay")
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// Runs a command to completion and turns a non-zero exit into the reason
+/// why, taken from its stderr (or the exit status itself, when the process
+/// said nothing about why it failed).
+fn run(command: &mut Command) -> Result<(), String> {
+    let output = command.output().map_err(|e| e.to_string())?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if stderr.is_empty() {
+        Err(format!("exited with {}", output.status))
+    } else {
+        Err(stderr)
+    }
 }
 
 // Accessibility is granted per binary by macOS, and the only honest way to
@@ -469,7 +483,7 @@ pub fn request_accessibility_permission() -> bool {
 }
 
 /// Opens the Accessibility pane of System Settings.
-pub fn open_accessibility_settings() -> bool {
+pub fn open_accessibility_settings() -> Result<(), String> {
     applescript(
         "open location \"x-apple.systempreferences:com.apple.preference.security\
          ?Privacy_Accessibility\"",

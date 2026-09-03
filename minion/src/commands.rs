@@ -1052,9 +1052,10 @@ pub fn decide_in(transcript: &str, context: Option<&str>) -> (Decision, f32) {
 /// The result of carrying out a decision.
 pub struct Done {
     pub description: String,
-    /// False when the action was refused by the system — in practice, a
-    /// keystroke dropped for want of Accessibility permission.
-    pub succeeded: bool,
+    /// `Err` when the action was refused by the system — in practice, a
+    /// keystroke dropped for want of Accessibility permission — carrying
+    /// why, so the caller's BLOCKED line can say more than "no".
+    pub outcome: Result<(), String>,
 }
 
 /// Carries out a decision. Returns what was done, and whether it worked.
@@ -1062,11 +1063,11 @@ pub fn perform(decision: &Decision) -> Option<Done> {
     match decision {
         Decision::Launch { name, bundle_id } => Some(Done {
             description: format!("abrir {name}"),
-            succeeded: actions::open_app(bundle_id),
+            outcome: actions::open_app(bundle_id),
         }),
         Decision::Quit { name, bundle_id } => Some(Done {
             description: format!("cerrar {name}"),
-            succeeded: actions::quit_app(bundle_id),
+            outcome: actions::quit_app(bundle_id),
         }),
         Decision::Browse { url, in_browser } => Some(Done {
             description: match in_browser {
@@ -1079,7 +1080,7 @@ pub fn perform(decision: &Decision) -> Option<Done> {
                 }
                 None => format!("abrir {url}"),
             },
-            succeeded: actions::open_url(url, *in_browser),
+            outcome: actions::open_url(url, *in_browser),
         }),
         // Answered by the caller, which holds the state they need.
         Decision::StartDictation
@@ -1088,21 +1089,21 @@ pub fn perform(decision: &Decision) -> Option<Done> {
         | Decision::Answer(_) => None,
         Decision::Numbered { name, number, key } => Some(Done {
             description: format!("{name} {number}"),
-            succeeded: actions::press(key.0, key.1),
+            outcome: actions::press(key.0, key.1),
         }),
         Decision::SearchMusic(query) => Some(Done {
             description: format!("buscar «{query}» en Spotify"),
-            succeeded: actions::search_spotify(query),
+            outcome: actions::search_spotify(query),
         }),
         Decision::Type(text) => Some(Done {
             description: format!("escribir «{text}»"),
-            succeeded: actions::type_text(text),
+            outcome: actions::type_text(text),
         }),
         Decision::RunHere(name) => {
             let command = CONTEXTUAL_COMMANDS.iter().find(|c| c.name == *name)?;
             Some(Done {
                 description: (*name).to_string(),
-                succeeded: run_action(command.action),
+                outcome: run_action(command.action),
             })
         }
         Decision::Run(name) => {
@@ -1112,20 +1113,20 @@ pub fn perform(decision: &Decision) -> Option<Done> {
                 .find(|c| c.name == *name)?;
             Some(Done {
                 description: (*name).to_string(),
-                succeeded: run_action(command.action),
+                outcome: run_action(command.action),
             })
         }
         _ => None,
     }
 }
 
-fn run_action(action: Action) -> bool {
+fn run_action(action: Action) -> Result<(), String> {
     match action {
         Action::Key(code, mods) => actions::press(code, mods),
         Action::Volume(delta) => actions::adjust_volume(delta),
         Action::Mute(muted) => actions::set_muted(muted),
         Action::Script(script) => actions::applescript(script),
-        Action::Sleep => true,
+        Action::Sleep => Ok(()),
     }
 }
 
