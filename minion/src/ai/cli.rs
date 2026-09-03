@@ -390,7 +390,10 @@ pub fn codex(model: &str) -> OneShot {
 
 /// Builds the backend `[ai] backend = "gemini-cli"` selects.
 pub fn gemini_cli(model: &str) -> OneShot {
-    let mut arguments: Vec<String> = ["-o", "json", "--approval-mode", "plan"]
+    // «default» prompts before any tool runs, which a plain question never
+    // triggers; «plan» would be the read-only choice but needs Gemini's
+    // experimental.plan setting and fails loudly without it.
+    let mut arguments: Vec<String> = ["-o", "json", "--approval-mode", "default"]
         .iter()
         .map(|argument| (*argument).to_string())
         .collect();
