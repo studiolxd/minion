@@ -149,6 +149,15 @@ pub struct Config {
     /// while `resume_shortcut` is held down, and does not need the wake
     /// word while it is.
     pub listen_mode: Option<String>,
+
+    /// Bundle IDs of applications that pause listening while in front —
+    /// a video call is the one time an always-on microphone is unwelcome.
+    ///
+    /// `None` uses the built-in list (Zoom, Teams, FaceTime). Google Meet
+    /// in a browser tab has no bundle ID of its own to check — it is
+    /// Chrome, like every other tab — so it cannot be detected this way
+    /// and is not on the list.
+    pub pause_during: Option<Vec<String>>,
 }
 
 /// How Minion decides when to listen.
@@ -221,9 +230,14 @@ impl Default for Config {
             unload_after_minutes: None,
             conversation_seconds: None,
             listen_mode: None,
+            pause_during: None,
         }
     }
 }
+
+/// Bundle IDs paused for when the file says nothing.
+const DEFAULT_PAUSE_DURING: &[&str] =
+    &["us.zoom.xos", "com.microsoft.teams2", "com.apple.FaceTime"];
 
 /// Where the configuration file lives.
 pub fn path() -> Option<PathBuf> {
@@ -531,6 +545,13 @@ impl Config {
         }
     }
 
+    /// Bundle IDs that pause listening while in front.
+    pub fn pause_during(&self) -> Vec<String> {
+        self.pause_during
+            .clone()
+            .unwrap_or_else(|| DEFAULT_PAUSE_DURING.iter().map(|id| id.to_string()).collect())
+    }
+
     /// Commands defined in the file, as `'static` entries.
     ///
     /// Anything whose shortcut cannot be read is reported and skipped: one
@@ -767,6 +788,19 @@ mod tests {
 
         let typo: Config = toml::from_str(r#"listen_mode = "holf""#).expect("should parse");
         assert_eq!(typo.listen_mode(), ListenMode::Always);
+    }
+
+    #[test]
+    fn pause_during_defaults_to_the_built_in_conferencing_apps() {
+        let default: Config = toml::from_str("").expect("empty config should parse");
+        assert_eq!(
+            default.pause_during(),
+            vec!["us.zoom.xos", "com.microsoft.teams2", "com.apple.FaceTime"]
+        );
+
+        let custom: Config =
+            toml::from_str(r#"pause_during = ["com.example.calls"]"#).expect("should parse");
+        assert_eq!(custom.pause_during(), vec!["com.example.calls"]);
     }
 
     #[test]

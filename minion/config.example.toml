@@ -74,6 +74,18 @@
 # held). Anything other than "hold" behaves as "always". Default "always".
 # listen_mode = "always"
 
+# Bundle IDs of applications that pause listening while they are in front
+# — for a video call, where an always-on microphone is unwelcome. Also
+# paused automatically when the screen is locked or the Mac sleeps; that
+# part needs no configuration.
+#
+# Google Meet in a browser tab cannot be detected this way: it is Chrome,
+# like every other tab, with no bundle ID of its own. Quit or close it, or
+# pause Minion by hand, for that case.
+#
+# Default: Zoom, Microsoft Teams, FaceTime.
+# pause_during = ["us.zoom.xos", "com.microsoft.teams2", "com.apple.FaceTime"]
+
 # Keyboard shortcut that pauses and resumes from anywhere, written as it
 # appears on the menu: "ctrl-alt-m", "ctrl+shift+m". Empty disables it.
 # Default "ctrl-alt-m". (Not "alt-space": that collides with the remaps

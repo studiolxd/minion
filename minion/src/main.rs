@@ -123,6 +123,104 @@ const UI_THROTTLE_TICKS: u32 = 5;
 /// speaker never waits for. The wake-up itself is one atomic read.
 const IDLE_CHECK: Duration = Duration::from_millis(250);
 
+/// Smart auto-pause: checked on the same idle tick as everything else
+/// above, rather than through `NSWorkspace`/distributed-notification
+/// observers. Those need a run loop of their own to deliver blocks on, and
+/// the idle tick already polls a few times a second for other reasons —
+/// one more cheap check costs nothing extra.
+mod auto_pause {
+    use core_foundation::base::{CFType, TCFType};
+    use core_foundation::boolean::CFBoolean;
+    use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
+    use core_foundation::string::CFString;
+    use std::ffi::c_void;
+
+    /// Whether the login session is locked (password or Touch ID lock, the
+    /// screen saver locking the screen).
+    ///
+    /// `CGSessionCopyCurrentDictionary` is undocumented but has been the
+    /// standard way to ask this without a helper process for as long as
+    /// the alternative — watching `com.apple.screenIsLocked` — has existed;
+    /// both end up reading the same session dictionary.
+    pub fn screen_locked() -> bool {
+        #[link(name = "CoreGraphics", kind = "framework")]
+        extern "C" {
+            fn CGSessionCopyCurrentDictionary() -> CFDictionaryRef;
+        }
+        unsafe {
+            let raw = CGSessionCopyCurrentDictionary();
+            if raw.is_null() {
+                // No session at all, e.g. before anyone has logged in.
+                // Reading that as "locked forever" would leave nothing to
+                // resume it, so the safer answer is "not locked".
+                return false;
+            }
+            let dict: CFDictionary<*const c_void, *const c_void> =
+                TCFType::wrap_under_create_rule(raw);
+            let key = CFString::from_static_string("CGSSessionScreenIsLocked");
+            dict.find(key.as_CFTypeRef())
+                .and_then(|value| CFType::wrap_under_get_rule(*value).downcast::<CFBoolean>())
+                .map(bool::from)
+                .unwrap_or(false)
+        }
+    }
+
+    /// Whether the main display is asleep — the screen turned off, whether
+    /// because the whole Mac slept or only the display did.
+    pub fn display_asleep() -> bool {
+        core_graphics::display::CGDisplay::main().is_asleep()
+    }
+
+    /// Whether the application in front is one to pause listening for.
+    pub fn frontmost_matches(frontmost: Option<&str>, pause_during: &[String]) -> bool {
+        frontmost.is_some_and(|id| pause_during.iter().any(|paused| paused == id))
+    }
+
+    /// Why listening should be paused right now, if it should.
+    ///
+    /// Checked in order of how much it would cost to keep listening
+    /// wrongly: a locked or sleeping Mac hears nothing useful at all,
+    /// while an unwelcome app being in front is the milder case.
+    pub fn reason(frontmost: Option<&str>, pause_during: &[String]) -> Option<String> {
+        if screen_locked() {
+            return Some("the screen is locked".to_string());
+        }
+        if display_asleep() {
+            return Some("the display is asleep".to_string());
+        }
+        if frontmost_matches(frontmost, pause_during) {
+            return Some(format!("{} is in front", frontmost.unwrap_or_default()));
+        }
+        None
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn only_a_listed_bundle_id_matches() {
+            let listed = vec!["us.zoom.xos".to_string(), "com.apple.FaceTime".to_string()];
+            assert!(frontmost_matches(Some("us.zoom.xos"), &listed));
+            assert!(!frontmost_matches(Some("com.apple.Safari"), &listed));
+            assert!(!frontmost_matches(None, &listed));
+        }
+
+        #[test]
+        fn an_empty_list_matches_nothing() {
+            assert!(!frontmost_matches(Some("us.zoom.xos"), &[]));
+        }
+
+        #[test]
+        fn the_display_answers_something_either_way() {
+            // Whichever it is on the machine running the tests, it must not
+            // panic or hang — that is the only thing worth checking here.
+            let _ = display_asleep();
+            let _ = screen_locked();
+        }
+    }
+}
+
 /// Whether `executable` lives inside a `.app` bundle.
 ///
 /// Shared with [`relaunch_arguments`]'s bundle detection: same question,
@@ -333,6 +431,8 @@ struct Listening {
     /// `listen_mode = "hold"`: no wake word is needed while `active` is
     /// true, since that only happens while the shortcut is held.
     hold_mode: bool,
+    /// Bundle IDs of applications that pause listening while in front.
+    pause_during: Vec<String>,
     voice: Option<Voice>,
     training: Training,
     active: Arc<AtomicBool>,
@@ -374,6 +474,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
         conversation_window,
         window_open,
         hold_mode,
+        pause_during,
         mut voice,
         training,
         active,
@@ -400,6 +501,10 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
     // utterance to the next. That memory, and the rules that go with it,
     // are in `session`; what follows only carries them out.
     let mut session = Session::new();
+    // Set once smart auto-pause has paused listening on its own, so it
+    // knows the pause is its own to lift — a manual pause never sets this,
+    // and so never gets silently overridden once the reason clears.
+    let mut auto_paused = false;
     note!("Model loaded. {}", resident_memory());
 
     // How long to stay deaf after speaking: the segmenter needs
@@ -432,6 +537,34 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                 // open once `Instant::now()` passes its deadline — so this
                 // is where that becomes visible to the menu bar.
                 window_open.store(session.window_open(Instant::now()), Ordering::Relaxed);
+                // Smart auto-pause. Only in "always" mode: push-to-talk
+                // already gates listening on the key, and layering this on
+                // top of it would fight that — resuming on its own the
+                // moment a meeting ends, key or no key.
+                if !hold_mode {
+                    let listening = active.load(Ordering::Relaxed);
+                    if listening && auto_paused {
+                        // Turned back on by something other than this
+                        // check — the menu, the shortcut, a spoken order —
+                        // so the pause is no longer this feature's to lift.
+                        auto_paused = false;
+                    }
+                    let reason = auto_pause::reason(
+                        actions::frontmost_app().as_deref(),
+                        &pause_during,
+                    );
+                    if let Some(reason) = reason {
+                        if listening {
+                            active.store(false, Ordering::Relaxed);
+                            auto_paused = true;
+                            note!("paused automatically — {reason}");
+                        }
+                    } else if auto_paused {
+                        active.store(true, Ordering::Relaxed);
+                        auto_paused = false;
+                        note!("resumed automatically — the reason has gone away");
+                    }
+                }
                 // Someone has started talking. If the model was released
                 // while idle, load it now: the sentence and the silence
                 // that closes it take longer than the load, so this hides
@@ -1722,6 +1855,7 @@ fn main() -> Result<()> {
     let window_open = Arc::new(AtomicBool::new(false));
     let worker_window_open = Arc::clone(&window_open);
     let conversation_window = config.conversation_window();
+    let pause_during = config.pause_during();
 
     let worker_active = Arc::clone(&active);
     let worker_log_ignored = Arc::clone(&log_ignored);
@@ -1784,6 +1918,7 @@ fn main() -> Result<()> {
             conversation_window,
             window_open: worker_window_open,
             hold_mode: listen_mode == config::ListenMode::Hold,
+            pause_during,
             voice_reply,
             microphone,
             show_catalogue: worker_catalogue,
