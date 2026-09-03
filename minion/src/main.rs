@@ -24,6 +24,7 @@ mod metrics;
 mod microphone;
 mod models;
 mod notify;
+mod packs;
 mod preferences;
 mod session;
 mod shortcuts;
@@ -118,6 +119,15 @@ const HISTORY_LEN: usize = 5;
 struct HistorySlot {
     phrase: String,
     alias_phrase: Option<String>,
+}
+
+/// What the «Actualizar vocabulario…» worker thread leaves behind for the
+/// menu-bar timer to show — owned strings, not [`packs::Outcome`] or
+/// [`packs::Installed`] directly, so nothing about the thread that produced
+/// them has to cross into the dialog that reports them.
+enum PacksUpdateResult {
+    Installed { version: String, packs: usize },
+    Failed(String),
 }
 
 /// Where to send someone whose microphone Minion cannot use.
@@ -1359,6 +1369,9 @@ fn run_menu_bar(
     // at startup, so three different places tell the user to restart
     // Minion from the menu. Until now the menu had no such item.
     let restart = MenuItem::new("Reiniciar", true, None);
+    // An ellipsis, unlike "Reiniciar" beside it: this opens a download and
+    // a dialog, rather than acting outright.
+    let update_packs = MenuItem::new("Actualizar vocabulario…", true, None);
     let commands_item = MenuItem::new("Ayuda", true, None);
     let preferences = MenuItem::new("Ajustes…", true, None);
 
@@ -1407,6 +1420,7 @@ fn run_menu_bar(
     // Help sits with Quit rather than among the working items: it is where
     // you look when you do not know what to do, not part of the routine.
     menu.append(&restart)?;
+    menu.append(&update_packs)?;
     menu.append(&commands_item)?;
     menu.append(&quit)?;
 
@@ -1417,6 +1431,7 @@ fn run_menu_bar(
     let show_log_id = show_log.id().clone();
     let stats_id = stats_item.id().clone();
     let restart_id = restart.id().clone();
+    let update_packs_id = update_packs.id().clone();
     let quit_id = quit.id().clone();
 
     // Built once and reused: reopening should bring back the same window,
@@ -1545,6 +1560,18 @@ fn run_menu_bar(
     let quit_requested = Arc::new(AtomicBool::new(false));
     let restart_for_timer = Arc::clone(&restart_requested);
     let quit_for_timer = Arc::clone(&quit_requested);
+    // "Actualizar vocabulario…": the click is noticed here, but the
+    // download itself runs on its own worker thread — like the model
+    // download, it must not block the run loop this timer fires on.
+    // `packs_updating` stops a second click from starting a second
+    // download while one is already in flight; `packs_update_result` is
+    // where the worker leaves what happened for this timer to show.
+    let packs_update_requested = Arc::new(AtomicBool::new(false));
+    let packs_updating = Arc::new(AtomicBool::new(false));
+    let packs_update_result: Arc<Mutex<Option<PacksUpdateResult>>> = Arc::new(Mutex::new(None));
+    let packs_update_for_timer = Arc::clone(&packs_update_requested);
+    let packs_updating_for_timer = Arc::clone(&packs_updating);
+    let packs_update_result_for_timer = Arc::clone(&packs_update_result);
     // How many times the timer has fired since it started, kept apart from
     // the UI throttle's own counter so the two gates — "once a second" and
     // whatever the throttle needs — can be reasoned about, and changed,
@@ -1729,6 +1756,76 @@ fn run_menu_bar(
                 }
             }
         }
+        // «Actualizar vocabulario…»: start the download on a worker thread,
+        // once, and let it report progress through the same tooltip the
+        // model download already uses. Ignored while one is already
+        // running, rather than queued — a second click is someone
+        // impatient, not a second update to run.
+        if packs_update_for_timer.swap(false, Ordering::Relaxed)
+            && !packs_updating_for_timer.swap(true, Ordering::Relaxed)
+        {
+            note!("updating vocabulary packs from the menu");
+            let status_for_worker = Arc::clone(&status_for_timer);
+            let result_for_worker = Arc::clone(&packs_update_result_for_timer);
+            let updating_for_worker = Arc::clone(&packs_updating_for_timer);
+            std::thread::spawn(move || {
+                let status_for_report = Arc::clone(&status_for_worker);
+                let outcome = packs::update(|progress| {
+                    if let Ok(mut text) = status_for_report.lock() {
+                        *text = format!("Minion — {progress}");
+                    }
+                });
+                let result = match outcome {
+                    Ok(installed) => {
+                        PacksUpdateResult::Installed { version: installed.version, packs: installed.packs }
+                    }
+                    Err(reason) => PacksUpdateResult::Failed(reason.message()),
+                };
+                if let Ok(mut slot) = result_for_worker.lock() {
+                    *slot = Some(result);
+                }
+                updating_for_worker.store(false, Ordering::Relaxed);
+            });
+        }
+        // The worker above finished: show what happened and put the
+        // tooltip back to what it would say anyway, since the progress
+        // line it wrote is not something the natural refresh below ever
+        // overwrites by itself.
+        if let Some(result) = packs_update_result_for_timer.lock().ok().and_then(|mut r| r.take()) {
+            match result {
+                PacksUpdateResult::Installed { version, packs } => {
+                    note!("vocabulary {version} installed: {packs} packs");
+                    if actions::ask_choice(
+                        &format!(
+                            "Vocabulario {version} instalado: {packs} packs. \
+                             Reinicia para aplicarlo."
+                        ),
+                        "Reiniciar ahora",
+                        "Reiniciar más tarde",
+                    ) {
+                        restart_for_timer.store(true, Ordering::Relaxed);
+                    }
+                }
+                PacksUpdateResult::Failed(message) => {
+                    note!("vocabulary update failed: {message}");
+                    actions::show_message(&message);
+                }
+            }
+            if let Ok(mut text) = status_for_timer.lock() {
+                *text = if hold_mode {
+                    if active_for_timer.load(Ordering::Relaxed) {
+                        TOOLTIP_HOLD_ACTIVE
+                    } else {
+                        TOOLTIP_HOLD_IDLE
+                    }
+                } else if active_for_timer.load(Ordering::Relaxed) {
+                    TOOLTIP_LISTENING
+                } else {
+                    TOOLTIP_PAUSED
+                }
+                .to_string();
+            }
+        }
         // Controls report by being read: see preferences.rs for why.
         if panel_for_timer.poll() {
             sounds_for_timer.store(panel_for_timer.sounds_on(), Ordering::Relaxed);
@@ -1862,6 +1959,7 @@ fn run_menu_bar(
     let stats_from_menu = Arc::clone(&stats_requested);
     let history_slots_from_menu = Arc::clone(&history_slots);
     let forget_alias_from_menu = Arc::clone(&forget_alias_requested);
+    let update_packs_from_menu = Arc::clone(&packs_update_requested);
     std::thread::spawn(move || {
         let events = MenuEvent::receiver();
         while let Ok(event) = events.recv() {
@@ -1892,6 +1990,8 @@ fn run_menu_bar(
                 // first, and a word still being typed there was otherwise
                 // lost to the restart meant to apply it.
                 restart_from_menu.store(true, Ordering::Relaxed);
+            } else if event.id == update_packs_id {
+                update_packs_from_menu.store(true, Ordering::Relaxed);
             } else if event.id == quit_id {
                 note!("quit from the menu");
                 quit_from_menu.store(true, Ordering::Relaxed);
@@ -2220,6 +2320,7 @@ fn main() -> Result<()> {
                  minion run \"orden\"          la ejecuta, como si la hubieras dicho\n  \
                  minion say \"texto\"          lo dice en voz alta\n  \
                  minion status               si Minion está escuchando o en pausa\n  \
+                 minion packs update         descarga el vocabulario de la comunidad\n  \
                  minion mic                  qué apps usan ahora el micrófono\n  \
                  minion stats [--days N]     informe de reconocimiento (todo el \
                  registro, o los últimos N días)\n  \
@@ -2276,6 +2377,28 @@ fn main() -> Result<()> {
         if argument == "status" {
             api::print_status();
             return Ok(());
+        }
+        if argument == "packs" {
+            if std::env::args().nth(2).as_deref() != Some("update") {
+                eprintln!("Uso: minion packs update");
+                std::process::exit(1);
+            }
+            if let Some(current) = packs::installed_version() {
+                println!("Versión instalada actualmente: {current}");
+            }
+            match packs::update(|progress| println!("{progress}")) {
+                Ok(installed) => {
+                    println!(
+                        "Vocabulario {} instalado: {} packs. Reinicia Minion para aplicarlo.",
+                        installed.version, installed.packs
+                    );
+                    return Ok(());
+                }
+                Err(outcome) => {
+                    eprintln!("{}", outcome.message());
+                    std::process::exit(1);
+                }
+            }
         }
         // For checking the automatic pause by hand: pick up a call, run
         // this, and see the same thing Minion sees.
