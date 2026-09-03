@@ -278,6 +278,26 @@ fn narrow(frame: NSRect, width: f64) -> NSRect {
     NSRect::new(frame.origin, NSSize::new(width, frame.size.height))
 }
 
+/// A frame for a second control on the same row, after one `width` wide.
+fn beside(frame: NSRect, width: f64, own_width: f64) -> NSRect {
+    NSRect::new(
+        NSPoint::new(frame.origin.x + width + spacing::SIBLING, frame.origin.y),
+        NSSize::new(own_width, frame.size.height),
+    )
+}
+
+/// How long the button waits for a combination before giving up.
+const CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Escape, which cancels the capture rather than becoming the shortcut.
+const ESCAPE: u16 = 53;
+
+/// Whether a key code is F1-F12, the only keys usable without a modifier.
+fn is_function_key(code: u16) -> bool {
+    crate::actions::name_of_key(code)
+        .is_some_and(|name| name.starts_with('f') && name[1..].parse::<u8>().is_ok())
+}
+
 /// Return, and Return on the numeric keypad: both commit a field.
 const RETURN: u16 = 36;
 const KEYPAD_ENTER: u16 = 76;
@@ -349,6 +369,28 @@ impl Switch {
     }
 }
 
+/// A push button, and the state it had when it was last read.
+///
+/// AppKit only counts clicks for a button with a target, and this window
+/// deliberately has none — see the note at the top. A click shows up
+/// instead as a change in the button's state between two polls.
+struct Press {
+    control: Retained<NSButton>,
+    last: Cell<isize>,
+}
+
+impl Press {
+    fn new(control: Retained<NSButton>) -> Self {
+        let last = Cell::new(control.state());
+        Self { control, last }
+    }
+
+    fn clicked(&self) -> bool {
+        let now = self.control.state();
+        now != self.last.replace(now) && now != 0
+    }
+}
+
 pub struct Preferences {
     window: Retained<NSWindow>,
     sounds: Switch,
@@ -370,8 +412,12 @@ pub struct Preferences {
     shortcut: Retained<NSButton>,
     /// The shortcut as stored, e.g. "alt-space".
     shortcut_value: std::cell::RefCell<String>,
+    /// Clears the shortcut, leaving Minion with none.
+    clear_shortcut: Press,
     /// True while waiting for the user to press a combination.
     capturing: Cell<bool>,
+    /// When the wait started, so it can give up on its own.
+    capture_started: Cell<Option<std::time::Instant>>,
     /// Starts and reports voice training.
     train: Retained<NSButton>,
     train_clicks: Cell<isize>,
@@ -554,9 +600,25 @@ impl Preferences {
                 mtm,
             )
         };
-        shortcut.setFrame(narrow(layout.place(spacing::BUTTON, 0.0), 170.0));
+        let row = layout.place(spacing::BUTTON, 0.0);
+        shortcut.setFrame(narrow(row, 170.0));
         layout.add(&shortcut);
-        layout.hint("Pulsa el botón y luego la combinación que quieras.", 0.0);
+        // Safety: no target and no action, so nothing is called back into.
+        let clear = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str("Ninguno"),
+                None,
+                None,
+                mtm,
+            )
+        };
+        clear.setFrame(beside(row, 170.0, 100.0));
+        layout.add(&clear);
+        layout.hint(
+            "Pulsa el botón y luego la combinación, que debe llevar ⌘, ⌥ o ⌃. \
+             Escape cancela; «Ninguno» deja a Minion sin atajo.",
+            0.0,
+        );
 
         layout.heading("Dispositivos");
         layout.field_label("Micrófono");
@@ -665,7 +727,9 @@ impl Preferences {
             memory,
             shortcut,
             shortcut_value: std::cell::RefCell::new(current_shortcut),
+            clear_shortcut: Press::new(clear),
             capturing: Cell::new(false),
+            capture_started: Cell::new(None),
             button_clicks: Cell::new(0),
             train,
             train_clicks: Cell::new(0),
@@ -768,7 +832,7 @@ impl Preferences {
             if word == crate::commands::DEFAULT_WAKE_WORDS[0] {
                 save("wake_words", "[]");
             } else {
-                save("wake_words", &format!("[\"{word}\"]"));
+                save("wake_words", &format!("[{}]", config::toml_string(&word)));
             }
             *self.last_wake_word.borrow_mut() = typed_wake;
             needs_restart = true;
@@ -778,12 +842,12 @@ impl Preferences {
         // Devices need a restart to take effect: the stream is opened once
         // and the listening loop owns it.
         if let Some(chosen) = self.microphone.changed() {
-            save("microphone", &format!("\"{}\"", chosen.unwrap_or_default()));
+            save("microphone", &config::toml_string(&chosen.unwrap_or_default()));
             needs_restart = true;
             changed = true;
         }
         if let Some(chosen) = self.speaker.changed() {
-            save("speaker", &format!("\"{}\"", chosen.unwrap_or_default()));
+            save("speaker", &config::toml_string(&chosen.unwrap_or_default()));
             changed = true;
         }
         if let Some(step) = self.sensitivity.moved() {
@@ -811,6 +875,22 @@ impl Preferences {
                     self.begin_capture();
                 }
             }
+        } else if self
+            .capture_started
+            .get()
+            .is_some_and(|since| since.elapsed() >= CAPTURE_TIMEOUT)
+        {
+            // Nothing was pressed: a button reading «Pulsa la combinación…»
+            // for the rest of the session looks broken.
+            self.end_capture();
+        }
+
+        if self.clear_shortcut.clicked() {
+            self.end_capture();
+            save("resume_shortcut", &config::toml_string(""));
+            self.shortcut_value.borrow_mut().clear();
+            self.shortcut.setTitle(&NSString::from_str(&pretty("")));
+            changed = true;
         }
 
         if changed {
@@ -857,26 +937,52 @@ impl Preferences {
     /// also quit something.
     fn begin_capture(&self) {
         self.capturing.set(true);
+        self.capture_started.set(Some(std::time::Instant::now()));
         self.shortcut
             .setTitle(&NSString::from_str("Pulsa la combinación…"));
     }
 
+    /// Stops waiting and puts the shortcut in the button again.
+    fn end_capture(&self) {
+        self.capturing.set(false);
+        self.capture_started.set(None);
+        self.button_clicks.set(self.shortcut.state());
+        let current = self.shortcut_value.borrow().clone();
+        self.shortcut.setTitle(&NSString::from_str(&pretty(&current)));
+    }
+
     /// Called from the run loop with whatever key was pressed, if capturing.
+    ///
+    /// Escape gets out of it, and a bare key is refused: without a modifier
+    /// the shortcut is a letter, and then every «a» typed anywhere on the
+    /// machine pauses Minion. Function keys are the exception, since they
+    /// carry no character of their own.
     pub fn capture(&self, code: u16, mods: crate::actions::Mods) -> bool {
         if !self.capturing.get() {
             return false;
         }
-        self.capturing.set(false);
-        self.button_clicks.set(self.shortcut.state());
+        if code == ESCAPE && mods == crate::actions::Mods::NONE {
+            self.end_capture();
+            return true;
+        }
 
-        let Some(text) = crate::actions::shortcut_text(code, mods) else {
-            // A key with no name: leave what was there.
-            let current = self.shortcut_value.borrow().clone();
-            self.shortcut.setTitle(&NSString::from_str(&pretty(&current)));
+        let named = crate::actions::shortcut_text(code, mods);
+        let Some(text) = named else {
+            // A key with no name: keep waiting for one that has one.
             return true;
         };
+        if mods == crate::actions::Mods::NONE && !is_function_key(code) {
+            self.capture_started.set(Some(std::time::Instant::now()));
+            self.shortcut
+                .setTitle(&NSString::from_str("Añade ⌘, ⌥ o ⌃"));
+            return true;
+        }
+
+        self.capturing.set(false);
+        self.capture_started.set(None);
+        self.button_clicks.set(self.shortcut.state());
         self.shortcut.setTitle(&NSString::from_str(&pretty(&text)));
-        save("resume_shortcut", &format!("\"{text}\""));
+        save("resume_shortcut", &config::toml_string(&text));
         *self.shortcut_value.borrow_mut() = text;
         true
     }
@@ -1040,6 +1146,20 @@ mod tests {
     fn a_narrower_hint_needs_more_lines() {
         let text = "Toda orden empieza por ella. Elige algo que no digas por casualidad.";
         assert!(wrapped_lines(text, 200.0) > wrapped_lines(text, 400.0));
+    }
+
+    #[test]
+    fn only_function_keys_stand_alone() {
+        // Everything else needs a modifier, or typing pauses Minion.
+        assert!(is_function_key(crate::actions::parse_shortcut("f5").unwrap().0));
+        assert!(is_function_key(crate::actions::parse_shortcut("f12").unwrap().0));
+        assert!(!is_function_key(crate::actions::key::A));
+        assert!(!is_function_key(crate::actions::key::SPACE));
+    }
+
+    #[test]
+    fn no_shortcut_reads_as_none() {
+        assert_eq!(pretty(""), "Ninguno");
     }
 
     #[test]
