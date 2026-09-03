@@ -46,6 +46,10 @@ use tray_icon::TrayIconBuilder;
 
 use commands::Decision;
 
+/// Where to send someone whose microphone Minion cannot use.
+const MICROPHONE_SETTINGS: &str =
+    "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone";
+
 /// System sounds used as feedback. A command that runs produces no visible
 /// output, so without these you cannot tell whether you were heard.
 mod sounds {
@@ -308,6 +312,18 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                         }
                         Err(e) => note!("error    could not reload the model: {e:#}"),
                     }
+                }
+                // Nothing but exact zeros since the stream opened: macOS
+                // denied the microphone. Said once, with somewhere to go.
+                if listener.silent.swap(false, Ordering::Relaxed) {
+                    note!("deaf     the microphone delivers only silence — permission denied?");
+                    let _ = std::process::Command::new("/usr/bin/open")
+                        .arg(MICROPHONE_SETTINGS)
+                        .status();
+                    actions::show_message(
+                        "Minion no puede oír: activa el micrófono para Minion en \
+                         Ajustes del Sistema → Privacidad y seguridad → Micrófono",
+                    );
                 }
                 if let Some(idle_for) = idle_unload {
                     if model.is_some() && last_used.elapsed() >= idle_for {

@@ -4,7 +4,7 @@
 //! And since the recogniser works on whole utterances, something has to
 //! decide where one starts and ends — for now, signal energy does.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -100,6 +100,53 @@ impl Utterance {
     }
 }
 
+/// How much perfectly silent audio proves the microphone is not ours.
+///
+/// Five seconds: long enough that a quiet room cannot be mistaken for it
+/// — a real microphone always delivers some noise, never exact zeros —
+/// and short enough that the answer arrives while the person is still
+/// wondering why nothing happened.
+const SILENCE_PROOF_SECONDS: usize = 5;
+
+/// Watches the first seconds of capture for a microphone that was denied.
+///
+/// When macOS refuses the permission, cpal is not told: the stream opens,
+/// the callbacks arrive on time and every sample in them is exactly zero.
+/// So Minion says it is listening and hears nothing, for ever, with a
+/// perfectly healthy log. Exact zeros are the tell — a working microphone
+/// in a silent room still delivers its own noise floor.
+#[derive(Default)]
+struct SilenceWatch {
+    /// Samples seen since the stream opened, while they were all zero.
+    samples: AtomicUsize,
+    /// Set once the question is answered, either way.
+    settled: AtomicBool,
+}
+
+impl SilenceWatch {
+    /// Feeds one block, raising `silent` if the case is proven.
+    fn observe(&self, block: &[f32], silent: &AtomicBool) {
+        if self.settled.load(Ordering::Relaxed) {
+            return;
+        }
+        if block.iter().any(|sample| *sample != 0.0) {
+            self.settled.store(true, Ordering::Relaxed);
+            return;
+        }
+        let seen = self.samples.fetch_add(block.len(), Ordering::Relaxed) + block.len();
+        if seen >= TARGET_HZ as usize * SILENCE_PROOF_SECONDS {
+            self.settled.store(true, Ordering::Relaxed);
+            silent.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Starts the count again, for a microphone that has just been swapped.
+    fn restart(&self) {
+        self.samples.store(0, Ordering::Relaxed);
+        self.settled.store(false, Ordering::Relaxed);
+    }
+}
+
 /// A running microphone. Dropping it stops capture.
 pub struct Listener {
     /// Replaced when the system's default input changes, so the field is
@@ -114,6 +161,10 @@ pub struct Listener {
     pub speech_started: Arc<AtomicBool>,
     pub source_hz: u32,
     pub channels: usize,
+    /// Raised once when the microphone delivered nothing but exact zeros
+    /// for [`SILENCE_PROOF_SECONDS`], which on macOS means the permission
+    /// was denied. Cleared by whoever reads it.
+    pub silent: Arc<AtomicBool>,
 }
 
 /// How often to check whether the default microphone changed.
@@ -545,6 +596,8 @@ fn open_default(
     queue: &Arc<Mutex<Vec<f32>>>,
     active: &Arc<AtomicBool>,
     preferred: Option<&str>,
+    watch: &Arc<SilenceWatch>,
+    silent: &Arc<AtomicBool>,
 ) -> Result<(cpal::platform::Stream, u32, usize, cpal::DeviceId)> {
     let device = choose_input(preferred)?;
     let id = device.id()?;
@@ -554,6 +607,8 @@ fn open_default(
 
     let capture_queue = Arc::clone(queue);
     let capture_active = Arc::clone(active);
+    let capture_watch = Arc::clone(watch);
+    let capture_silent = Arc::clone(silent);
     // Built once per stream: the filter kernel and the scratch buffers are
     // kept between callbacks so nothing allocates in the hot path.
     let mut resampler = Resampler::new(source_hz);
@@ -567,6 +622,7 @@ fn open_default(
                 return;
             }
             let resampled = resampler.process(input, channels);
+            capture_watch.observe(resampled, &capture_silent);
             if let Ok(mut queued) = capture_queue.lock() {
                 queued.extend_from_slice(resampled);
                 let limit = TARGET_HZ as usize * QUEUE_LIMIT_SECONDS;
@@ -590,8 +646,10 @@ pub fn start(
     deaf: Arc<AtomicBool>,
 ) -> Result<Listener> {
     let queue = Arc::new(Mutex::new(Vec::<f32>::new()));
+    let watch = Arc::new(SilenceWatch::default());
+    let silent = Arc::new(AtomicBool::new(false));
     let (stream, source_hz, channels, device_id) =
-        open_default(&queue, &active, preferred.as_deref())?;
+        open_default(&queue, &active, preferred.as_deref(), &watch, &silent)?;
 
     // Held so it can be swapped when the default input changes.
     let stream = Arc::new(Mutex::new(Some(stream)));
@@ -600,6 +658,8 @@ pub fn start(
     let watch_stream = Arc::clone(&stream);
     let watch_queue = Arc::clone(&queue);
     let watch_active = Arc::clone(&active);
+    let watch_silence = Arc::clone(&watch);
+    let watch_silent = Arc::clone(&silent);
     // Only follows the system when no particular microphone was asked for:
     // choosing one is a decision, and following the default would undo it.
     let follows_system = preferred.as_ref().is_none_or(|name| name.trim().is_empty());
@@ -623,7 +683,9 @@ pub fn start(
             if let Ok(mut held) = watch_stream.lock() {
                 *held = None;
             }
-            match open_default(&watch_queue, &watch_active, None) {
+            // A different device deserves its own five seconds.
+            watch_silence.restart();
+            match open_default(&watch_queue, &watch_active, None, &watch_silence, &watch_silent) {
                 Ok((fresh, hz, channels, fresh_id)) => {
                     if let Ok(mut held) = watch_stream.lock() {
                         *held = Some(fresh);
@@ -685,6 +747,7 @@ pub fn start(
         speech_started,
         source_hz,
         channels,
+        silent,
     })
 }
 
@@ -895,6 +958,33 @@ mod tests {
         feed(&mut segmenter, blocks_of(0.3, 20));
         let after = segmenter.noise.threshold(0.015);
         assert!((before - after).abs() < 1e-6, "speech gaps must not move the floor");
+    }
+
+    #[test]
+    fn a_microphone_that_only_ever_delivers_zeros_is_reported() {
+        let watch = SilenceWatch::default();
+        let silent = AtomicBool::new(false);
+        let quiet = vec![0.0f32; BLOCK_SAMPLES];
+        let blocks = TARGET_HZ as usize * SILENCE_PROOF_SECONDS / BLOCK_SAMPLES;
+        for _ in 0..blocks - 1 {
+            watch.observe(&quiet, &silent);
+            assert!(!silent.load(Ordering::Relaxed), "not proven yet");
+        }
+        watch.observe(&quiet, &silent);
+        assert!(silent.load(Ordering::Relaxed), "five seconds of exact zeros");
+    }
+
+    #[test]
+    fn a_quiet_room_is_not_a_denied_microphone() {
+        // A working microphone delivers its own noise floor, never exact
+        // zeros — so anything at all settles the question for good.
+        let watch = SilenceWatch::default();
+        let silent = AtomicBool::new(false);
+        watch.observe(&[0.0, 0.0, 1e-7, 0.0], &silent);
+        for _ in 0..TARGET_HZ as usize * SILENCE_PROOF_SECONDS / BLOCK_SAMPLES + 10 {
+            watch.observe(&vec![0.0f32; BLOCK_SAMPLES], &silent);
+        }
+        assert!(!silent.load(Ordering::Relaxed), "silence after speech is just silence");
     }
 
     #[test]
