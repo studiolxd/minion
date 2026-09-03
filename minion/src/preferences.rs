@@ -18,7 +18,7 @@ use std::rc::Rc;
 use objc2::rc::Retained;
 use objc2::MainThreadMarker;
 use objc2_app_kit::{
-    NSAccessibility, NSAutoresizingMaskOptions, NSApplication, NSBackingStoreType, NSButton, NSColor, NSFont, NSLineBreakMode,
+    NSAccessibility, NSAutoresizingMaskOptions, NSApplication, NSBackingStoreType, NSBorderType, NSButton, NSColor, NSFont, NSLineBreakMode,
     NSPopUpButton, NSScrollView, NSSlider, NSTextField, NSTextView, NSView, NSWindow,
     NSWindowStyleMask,
 };
@@ -265,6 +265,72 @@ impl Layout {
         Dial { control, readout, last: Cell::new(settled) }
     }
 
+    /// A dropdown over a fixed set of named values, such as "always"/"hold"
+    /// — unlike [`Self::chooser`], every entry is one of `options` and
+    /// there is no "follow the system" sentinel.
+    fn popup(&mut self, options: &[(&str, &str)], current: &str) -> Popup {
+        let frame = self.place(spacing::BUTTON, 0.0);
+        let control = NSPopUpButton::new(self.mtm);
+        control.setFrame(frame);
+
+        let mut values = Vec::with_capacity(options.len());
+        for (label, value) in options {
+            control.addItemWithTitle(&NSString::from_str(label));
+            values.push((*value).to_string());
+        }
+        let selected = values.iter().position(|v| v == current).unwrap_or(0) as isize;
+        control.selectItemAtIndex(selected);
+        let name = self.borrowed_label();
+        self.add_control(&control, &name);
+        self.gap(spacing::SIBLING);
+
+        Popup { control, values, last: Cell::new(selected) }
+    }
+
+    /// A small, editable, multi-line text box — for a setting that is a
+    /// list, one entry per line, rather than a single value.
+    fn multiline_field(&mut self, initial: &str, lines: f64) -> MultilineField {
+        let height = spacing::HINT_LINE * lines + 8.0;
+        let frame = self.place(height, 0.0);
+
+        let scroll = NSScrollView::new(self.mtm);
+        scroll.setFrame(frame);
+        scroll.setHasVerticalScroller(true);
+        scroll.setBorderType(NSBorderType::BezelBorder);
+
+        let view = NSTextView::new(self.mtm);
+        view.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), frame.size));
+        view.setString(&NSString::from_str(initial));
+        view.setEditable(true);
+        view.setSelectable(true);
+        view.setRichText(false);
+        view.setFont(Some(&NSFont::systemFontOfSize(12.0)));
+        view.setVerticallyResizable(true);
+        view.setHorizontallyResizable(false);
+        view.setMinSize(NSSize::new(0.0, 0.0));
+        view.setMaxSize(NSSize::new(f64::MAX, f64::MAX));
+        view.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+        // Safety: reading the text view's own container, which exists for
+        // a view built the ordinary way.
+        if let Some(container) = unsafe { view.textContainer() } {
+            container.setWidthTracksTextView(true);
+            container.setContainerSize(NSSize::new(frame.size.width, f64::MAX));
+        }
+        scroll.setDocumentView(Some(&view));
+        self.add(&scroll);
+
+        // The label and hint belong to the text view itself, which is what
+        // actually takes the focus and the keystrokes — the scroll view
+        // around it is only a frame.
+        let name = self.borrowed_label();
+        let as_view: &NSView = &view;
+        as_view.setAccessibilityLabel(Some(&NSString::from_str(&name)));
+        self.last_control = Some(Retained::from(as_view));
+        self.gap(spacing::SIBLING);
+
+        MultilineField { view, last: std::cell::RefCell::new(initial.to_string()) }
+    }
+
     /// A dropdown of device names, with "follow the system" first.
     fn chooser(&mut self, names: Vec<String>, current: Option<String>) -> Chooser {
         let frame = self.place(spacing::BUTTON, 0.0);
@@ -407,6 +473,57 @@ impl Chooser {
     }
 }
 
+/// A dropdown over a fixed set of named values.
+struct Popup {
+    control: Retained<NSPopUpButton>,
+    /// The value behind each entry, in the same order.
+    values: Vec<String>,
+    last: Cell<isize>,
+}
+
+impl Popup {
+    fn value(&self) -> String {
+        let index = self.control.indexOfSelectedItem().max(0) as usize;
+        self.values.get(index).cloned().unwrap_or_default()
+    }
+
+    fn changed(&self) -> Option<String> {
+        let now = self.control.indexOfSelectedItem();
+        (now != self.last.get()).then(|| {
+            self.last.set(now);
+            self.value()
+        })
+    }
+}
+
+/// A small multi-line editable text box, one entry per line.
+struct MultilineField {
+    view: Retained<NSTextView>,
+    /// The text as last saved, so a still-unsettled edit is not written
+    /// through on every poll — see [`Preferences::poll`] for why that
+    /// matters, same reasoning as the wake word field.
+    last: std::cell::RefCell<String>,
+}
+
+impl MultilineField {
+    fn text(&self) -> String {
+        self.view.string().to_string()
+    }
+
+    /// Whether this is the view currently taking keystrokes.
+    ///
+    /// Unlike [`NSTextField`], which hands editing off to a shared field
+    /// editor read back through `currentEditor()`, an [`NSTextView`] is
+    /// itself the thing that becomes first responder — so identity is
+    /// checked directly against the window's first responder instead.
+    fn is_editing(&self, window: &NSWindow) -> bool {
+        window.firstResponder().is_some_and(|responder| {
+            Retained::as_ptr(&responder).cast::<std::ffi::c_void>()
+                == Retained::as_ptr(&self.view).cast::<std::ffi::c_void>()
+        })
+    }
+}
+
 /// A checkbox and the value it last had.
 struct Switch {
     control: Retained<NSButton>,
@@ -474,6 +591,13 @@ pub struct Preferences {
     sensitivity: Dial,
     pause: Dial,
     memory: Dial,
+    listen_mode: Popup,
+    conversation: Dial,
+    pause_during: MultilineField,
+    spoken_punctuation: Switch,
+    auto_capitalise: Switch,
+    notifications: Switch,
+    search_engine: Popup,
     shortcut: Retained<NSButton>,
     /// The shortcut as stored, e.g. "alt-space".
     shortcut_value: std::cell::RefCell<String>,
@@ -713,6 +837,20 @@ impl Preferences {
         );
 
         layout.heading("Escucha");
+        layout.field_label("Modo de escucha");
+        let listen_mode = layout.popup(
+            &[
+                ("Siempre", "always"),
+                ("Mientras se mantenga pulsado el atajo", "hold"),
+            ],
+            if settings.listen_mode() == config::ListenMode::Hold { "hold" } else { "always" },
+        );
+        layout.hint(
+            "Con el atajo, Minion solo escucha mientras lo mantienes pulsado \
+             y no hace falta decir la palabra clave.",
+            0.0,
+        );
+
         layout.field_label("Sensibilidad");
         let sensitivity = layout.slider(
             (0.0, (SENSITIVITY.len() - 1) as f64),
@@ -743,6 +881,57 @@ impl Preferences {
         layout.hint(
             "«Nunca» mantiene el modelo cargado: responde antes, usa ~900 MB.",
             0.0,
+        );
+
+        layout.heading("Conversación");
+        layout.field_label("Tras una orden, sigue escuchando durante");
+        let seconds = settings.conversation_window().as_secs() as f64;
+        let conversation = layout.slider((0.0, 15.0), seconds, 16);
+        layout.hint(
+            "Tras una orden, los siguientes segundos no hace falta decir la \
+             palabra clave.",
+            0.0,
+        );
+
+        layout.heading("Dictado");
+        let spoken_punctuation = layout.checkbox(
+            "Puntuación hablada: «coma», «punto», «abre interrogación»",
+            settings.spoken_punctuation,
+        );
+        let auto_capitalise =
+            layout.checkbox("Mayúscula al empezar una frase", settings.auto_capitalise);
+        layout.hint(
+            "Para nombres que el reconocedor no acierta, añade \
+             [[dictation_words]] en config.toml.",
+            INDENT,
+        );
+
+        layout.heading("Pausa automática");
+        layout.field_label("Aplicaciones delante de las que Minion se pausa");
+        let pause_during = layout.multiline_field(&settings.pause_during().join("\n"), 4.0);
+        layout.hint(
+            "Un identificador de aplicación (bundle ID) por línea. La \
+             pantalla bloqueada y el Mac dormido siempre pausan a Minion, \
+             se escriba aquí lo que se escriba.",
+            0.0,
+        );
+
+        layout.heading("Avisos");
+        let notifications = layout.checkbox(
+            "Notificaciones del sistema para respuestas y temporizadores",
+            settings.notifications,
+        );
+
+        layout.heading("Búsqueda");
+        layout.field_label("Motor para «busca X» sin nombrar uno");
+        let search_engine = layout.popup(
+            &[
+                ("Google", "google"),
+                ("YouTube", "youtube"),
+                ("Wikipedia", "wikipedia"),
+                ("Amazon", "amazon"),
+            ],
+            settings.search_engine().as_deref().unwrap_or("google"),
         );
 
         layout.heading("Atajo para pausar y reanudar");
@@ -853,6 +1042,13 @@ impl Preferences {
             sensitivity,
             pause,
             memory,
+            listen_mode,
+            conversation,
+            pause_during,
+            spoken_punctuation,
+            auto_capitalise,
+            notifications,
+            search_engine,
             shortcut,
             shortcut_value: std::cell::RefCell::new(current_shortcut),
             clear_shortcut: Press::new(clear),
@@ -926,6 +1122,15 @@ impl Preferences {
                 "Nunca".into()
             } else {
                 format!("{minutes:.0} min")
+            },
+        );
+        let seconds = self.conversation.control.doubleValue();
+        set(
+            &self.conversation.readout,
+            if seconds < 1.0 {
+                "Desactivada".into()
+            } else {
+                format!("{seconds:.0} s")
             },
         );
     }
@@ -1010,6 +1215,63 @@ impl Preferences {
         }
         if let Some(value) = self.memory.moved() {
             save("unload_after_minutes", &format!("{value:.0}"));
+            changed = true;
+        }
+        // Baked into a plain `bool` for the life of the process — see
+        // `hold_mode` in `main.rs` — so this one needs a restart.
+        if let Some(mode) = self.listen_mode.changed() {
+            save("listen_mode", &config::toml_string(&mode));
+            needs_restart = true;
+            changed = true;
+        }
+        // Also read once at startup (`conversation_window` in `main.rs`).
+        if let Some(value) = self.conversation.moved() {
+            save("conversation_seconds", &format!("{value:.0}"));
+            needs_restart = true;
+            changed = true;
+        }
+        // Read fresh every time dictation starts, so this takes effect on
+        // the next «minion, empieza a dictar» — no restart needed.
+        if let Some(on) = self.spoken_punctuation.toggled() {
+            save("spoken_punctuation", if on { "true" } else { "false" });
+            changed = true;
+        }
+        if let Some(on) = self.auto_capitalise.toggled() {
+            save("auto_capitalise", if on { "true" } else { "false" });
+            changed = true;
+        }
+        // Read fresh for every answer, timer and blocked command — live.
+        if let Some(on) = self.notifications.toggled() {
+            save("notifications", if on { "true" } else { "false" });
+            changed = true;
+        }
+        // Read once at startup into a `OnceLock` (`commands::configure`).
+        if let Some(engine) = self.search_engine.changed() {
+            save("search_engine", &config::toml_string(&engine));
+            needs_restart = true;
+            changed = true;
+        }
+        // Also read once at startup (`pause_during` in `main.rs`). Settled
+        // the same way as the wake word field: only once the text has
+        // stopped changing, so a bundle ID is not saved one keystroke at a
+        // time while it is still being typed.
+        let editing_pause_during = self.pause_during.is_editing(&self.window);
+        let settled_pause_during = !editing_pause_during || !self.window.isKeyWindow();
+        let current_pause_during = self.pause_during.text();
+        if settled_pause_during && current_pause_during.trim() != self.pause_during.last.borrow().trim() {
+            let lines: Vec<String> = current_pause_during
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_string)
+                .collect();
+            let value = format!(
+                "[{}]",
+                lines.iter().map(|id| config::toml_string(id)).collect::<Vec<_>>().join(", ")
+            );
+            save("pause_during", &value);
+            *self.pause_during.last.borrow_mut() = current_pause_during;
+            needs_restart = true;
             changed = true;
         }
 
