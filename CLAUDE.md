@@ -165,7 +165,8 @@ was considered and rejected on that data.
   its SHA-256 before keeping it. `icon.rs`, `startup.rs` are what their
   names say.
 - `assets/*.svg` — the face. Asleep keeps the **same smile**, only the eye
-  closes.
+  closes. Dictating is the head filled in with goggle, pupil and smile cut
+  out through an SVG mask (resvg renders masks; a pixel test guards it).
 
 ## Hard-won facts
 

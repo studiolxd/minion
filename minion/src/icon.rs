@@ -19,6 +19,7 @@ use tray_icon::Icon;
 const AWAKE: &str = include_str!("../assets/awake.svg");
 const ASLEEP: &str = include_str!("../assets/asleep.svg");
 const ACTING: &str = include_str!("../assets/acting.svg");
+const DICTATING: &str = include_str!("../assets/dictating.svg");
 
 /// Height in pixels: twice the menu bar's usable height, for Retina.
 ///
@@ -85,6 +86,13 @@ pub fn acting() -> Result<Icon> {
 ///
 /// Generated from the same drawing as the menu bar face, so the two cannot
 /// drift apart. Called by build-app.sh, which turns the result into .icns.
+/// The face while dictating: filled in, features cut out. Distinct at a
+/// glance, because in that mode everything said gets typed.
+pub fn dictating() -> Result<Icon> {
+    static DICTATING_ICON: OnceLock<Option<Icon>> = OnceLock::new();
+    cached(&DICTATING_ICON, DICTATING)
+}
+
 pub fn export_iconset(directory: &str) -> Result<()> {
     std::fs::create_dir_all(directory)?;
     let tree = Tree::from_str(AWAKE, &Options::default())
@@ -115,6 +123,47 @@ pub fn export_iconset(directory: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Renders one face to pixels, for looking at what is opaque where.
+    fn pixels(svg: &str) -> (Vec<u8>, u32) {
+        let tree = Tree::from_str(svg, &Options::default()).unwrap();
+        let scale = HEIGHT as f32 / tree.size().height();
+        let width = (tree.size().width() * scale).round() as u32;
+        let mut pixmap = Pixmap::new(width, HEIGHT).unwrap();
+        resvg::render(&tree, Transform::from_scale(scale, scale), &mut pixmap.as_mut());
+        (pixmap.take(), width)
+    }
+
+    fn alpha_at(pixels: &[u8], width: u32, x: f32, y: f32) -> u8 {
+        // SVG units: the viewBox is 3.0..21.0 by 1.7..22.3, scaled to HEIGHT.
+        let scale = HEIGHT as f32 / 20.6;
+        let px = ((x - 3.0) * scale) as usize;
+        let py = ((y - 1.7) * scale) as usize;
+        pixels[(py * width as usize + px) * 4 + 3]
+    }
+
+    #[test]
+    fn the_dictating_face_is_filled_with_the_features_cut_out() {
+        let (face, width) = pixels(DICTATING);
+        // Inside the head, away from any feature: solid.
+        assert!(alpha_at(&face, width, 6.0, 19.0) > 200, "the head must be filled");
+        // The pupil and the goggle ring and the smile: see-through.
+        assert!(alpha_at(&face, width, 12.0, 10.2) < 40, "the pupil must be cut out");
+        assert!(alpha_at(&face, width, 12.0, 5.9) < 40, "the goggle ring must be cut out");
+        assert!(alpha_at(&face, width, 12.0, 18.3) < 40, "the smile must be cut out");
+        // While the awake face is hollow at the same spot.
+        let (awake, width) = pixels(AWAKE);
+        assert!(alpha_at(&awake, width, 6.0, 19.0) < 40, "the awake head is an outline");
+    }
+
+    #[test]
+    #[ignore]
+    fn write_the_dictating_face_for_a_look() {
+        let (face, width) = pixels(DICTATING);
+        let mut pixmap = Pixmap::new(width, HEIGHT).unwrap();
+        pixmap.data_mut().copy_from_slice(&face);
+        pixmap.save_png(std::env::var("MINION_FACE_PNG").unwrap()).unwrap();
+    }
 
     #[test]
     fn every_face_renders() {

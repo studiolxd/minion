@@ -279,6 +279,8 @@ struct Listening {
     active: Arc<AtomicBool>,
     /// Raised when something runs, so the menu bar can acknowledge it.
     acted: Arc<AtomicBool>,
+    /// Set while in dictation mode, so the menu bar can show it.
+    dictating: Arc<AtomicBool>,
     /// How to answer questions aloud.
     voice_reply: Option<VoiceReply>,
     /// Which microphone to use, or none to follow the system.
@@ -309,6 +311,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
         training,
         active,
         acted,
+        dictating,
         voice_reply,
         microphone,
         show_catalogue,
@@ -527,9 +530,13 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
             match session.interpret(&part, decision, context.as_deref()) {
                 Outcome::EnterDictation => {
                     note!("dictation started — say «deja de dictar» to stop");
+                    dictating.store(true, Ordering::Relaxed);
                     acted.store(true, Ordering::Relaxed);
                 }
-                Outcome::LeaveDictation => note!("dictation ended"),
+                Outcome::LeaveDictation => {
+                    dictating.store(false, Ordering::Relaxed);
+                    note!("dictation ended");
+                }
                 Outcome::NotDictating => note!("not dictating"),
                 // Heard while dictating, with nothing in it to type.
                 Outcome::Nothing => {}
@@ -708,6 +715,16 @@ fn config_voice_threshold() -> f32 {
 }
 
 /// What the menu bar needs to know that is not a switch.
+/// Which face the menu bar is showing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Face {
+    Awake,
+    Asleep,
+    Dictating,
+    /// The blink after a command; never the resting state.
+    Acting,
+}
+
 struct Bar {
     /// Where the model is, or will be once it has been downloaded.
     model_path: String,
@@ -715,6 +732,8 @@ struct Bar {
     downloading: Arc<AtomicBool>,
     /// The tooltip, as the rest of the program would like it.
     status: Status,
+    /// Set while dictating: a different face.
+    dictating: Arc<AtomicBool>,
 }
 
 fn run_menu_bar(
@@ -727,7 +746,7 @@ fn run_menu_bar(
     // Raised when someone asks aloud what they can say.
     catalogue_asked: Arc<AtomicBool>,
 ) -> Result<()> {
-    let Bar { model_path, downloading, status } = bar;
+    let Bar { model_path, downloading, status, dictating } = bar;
     let mtm = MainThreadMarker::new()
         .ok_or_else(|| anyhow!("the menu bar must be built on the main thread"))?;
     let app = NSApplication::sharedApplication(mtm);
@@ -847,7 +866,8 @@ fn run_menu_bar(
     let tray_for_timer = Rc::clone(&tray);
     let toggle_for_timer = toggle.clone();
     let active_for_timer = Arc::clone(&active);
-    let shown_as_listening = Cell::new(!busy);
+    let shown_face = Cell::new(if busy { Face::Asleep } else { Face::Awake });
+    let dictating_for_timer = Arc::clone(&dictating);
     let shown_tooltip = std::cell::RefCell::new(opening_tooltip);
     let status_for_timer = Arc::clone(&status);
     let downloading_for_timer = Arc::clone(&downloading);
@@ -963,7 +983,7 @@ fn run_menu_bar(
         if let Some(since) = blink_until.get() {
             if since.elapsed().as_secs_f64() >= BLINK_SECONDS {
                 blink_until.set(None);
-                shown_as_listening.set(!active_for_timer.load(Ordering::Relaxed));
+                shown_face.set(Face::Acting); // whatever is right, repaint it
             } else {
                 return; // hold the acknowledgement
             }
@@ -981,19 +1001,29 @@ fn run_menu_bar(
         let listening = active_for_timer.load(Ordering::Relaxed);
         // Downloading is not listening, whatever the switch says.
         let awake = listening && !downloading_for_timer.load(Ordering::Relaxed);
-        if awake == shown_as_listening.get() {
+        let wanted = match (awake, dictating_for_timer.load(Ordering::Relaxed)) {
+            (false, _) => Face::Asleep,
+            (true, true) => Face::Dictating,
+            (true, false) => Face::Awake,
+        };
+        if wanted == shown_face.get() {
             return;
         }
-        shown_as_listening.set(awake);
+        let was_awake = shown_face.get() != Face::Asleep;
+        shown_face.set(wanted);
         // Pausing and resuming happen from three places — the menu, the
         // shortcut and a spoken order — and this is the one that sees all
         // three, because they all end up flipping the same flag.
-        if !downloading_for_timer.load(Ordering::Relaxed) {
+        if !downloading_for_timer.load(Ordering::Relaxed) && was_awake != awake {
             if let Ok(mut text) = status_for_timer.lock() {
                 *text = if awake { TOOLTIP_LISTENING } else { TOOLTIP_PAUSED }.to_string();
             }
         }
-        let face = if awake { icon::awake() } else { icon::asleep() };
+        let face = match wanted {
+            Face::Awake | Face::Acting => icon::awake(),
+            Face::Asleep => icon::asleep(),
+            Face::Dictating => icon::dictating(),
+        };
         if let Ok(face) = face {
             let _ = tray_for_timer.set_icon_with_as_template(Some(face), true);
         }
@@ -1381,6 +1411,10 @@ fn main() -> Result<()> {
     // Raised by the listening loop when a command runs, lowered by the run
     // loop once the icon has blinked.
     let acted = Arc::new(AtomicBool::new(false));
+    // Set by the listening loop while dictating, read by the run loop for
+    // the face in the menu bar.
+    let dictating = Arc::new(AtomicBool::new(false));
+    let worker_dictating = Arc::clone(&dictating);
 
     let worker_active = Arc::clone(&active);
     let worker_log_ignored = Arc::clone(&log_ignored);
@@ -1401,6 +1435,7 @@ fn main() -> Result<()> {
         model_path: model_path.clone(),
         downloading: Arc::clone(&downloading),
         status: Arc::clone(&status),
+        dictating: Arc::clone(&dictating),
     };
     std::thread::spawn(move || {
         // First run: 670 MB before anything can be heard. Reported through
@@ -1432,6 +1467,7 @@ fn main() -> Result<()> {
             training: worker_training,
             active: worker_active,
             acted: worker_acted,
+            dictating: worker_dictating,
             voice_reply,
             microphone,
             show_catalogue: worker_catalogue,

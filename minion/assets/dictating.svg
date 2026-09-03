@@ -1,0 +1,18 @@
+<svg viewBox="3.0 1.7 18.0 20.6" xmlns="http://www.w3.org/2000/svg"
+     fill="none" stroke="#000000" stroke-width="1.1"
+     stroke-linecap="round" stroke-linejoin="round">
+  <!-- Dictating: the same head, filled in, with the goggle, the pupil and
+       the smile cut out of it. Inverted, so the state reads from across
+       the room; as a template icon macOS tints the fill and leaves the
+       cut-outs showing the menu bar through. -->
+  <defs>
+    <mask id="cut" maskUnits="userSpaceOnUse" x="3.0" y="1.7" width="18.0" height="20.6">
+      <rect x="3.0" y="1.7" width="18.0" height="20.6" fill="#ffffff"/>
+      <circle cx="12" cy="10.2" r="4.3" fill="none" stroke="#000000"/>
+      <circle cx="12" cy="10.2" r="1.5" fill="#000000" stroke="none"/>
+      <path d="M9.1 17.1 a4 4 0 0 0 5.8 0" stroke="#000000"/>
+    </mask>
+  </defs>
+  <path d="M4.4 21.6 V10 a7.6 7.6 0 0 1 15.2 0 v11.6 Z" fill="#000000" mask="url(#cut)"/>
+  <path d="M3.7 21.6 H20.3"/>
+</svg>
