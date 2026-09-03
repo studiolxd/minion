@@ -70,19 +70,52 @@ const TOOLTIP_HOLD_IDLE: &str = "Minion — pulsa para hablar";
 /// stays one line. What was heard in full is in the log.
 const TOOLTIP_TRANSCRIPT: usize = 48;
 
+/// Cuts `text` to at most `max` characters, marking that it was cut.
+fn shorten(text: &str, max: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() > max {
+        trimmed.chars().take(max - 1).collect::<String>() + "…"
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// The tooltip line for an utterance and what came of it.
 ///
 /// This is the whole visible trace of what Minion just did: the sounds can
 /// be turned off, the icon only blinks, and the log is a file. Pure, so
 /// the shortening can be tested.
 fn last_utterance_tooltip(transcript: &str, outcome: &str) -> String {
-    let trimmed = transcript.trim();
-    let short: String = if trimmed.chars().count() > TOOLTIP_TRANSCRIPT {
-        trimmed.chars().take(TOOLTIP_TRANSCRIPT - 1).collect::<String>() + "…"
-    } else {
-        trimmed.to_string()
-    };
-    format!("Minion — última: “{short}” → {outcome}")
+    format!("Minion — última: “{}” → {outcome}", shorten(transcript, TOOLTIP_TRANSCRIPT))
+}
+
+/// Recovers `(transcript, outcome)` from a tooltip written by
+/// [`last_utterance_tooltip`] — the inverse, used to feed the "Últimas
+/// órdenes" menu without the listening loop having to know about it.
+///
+/// A first version, deliberately: the loop that decides what happened to
+/// an utterance is not this file's to change, and the tooltip is already
+/// everything it tells the rest of the program. A queue pushed to
+/// directly, from wherever `set_status` is called with
+/// `last_utterance_tooltip`, would not lose the truncation this goes
+/// through — see the report for that follow-up.
+fn parse_last_utterance(tooltip: &str) -> Option<(String, String)> {
+    let rest = tooltip.strip_prefix("Minion — última: “")?;
+    let (text, outcome) = rest.split_once("” → ")?;
+    Some((text.to_string(), outcome.to_string()))
+}
+
+/// How many recent utterances the "Últimas órdenes" menu keeps.
+const HISTORY_LEN: usize = 5;
+
+/// One entry in that menu: the phrase with the wake word already stripped
+/// — ready for [`api::request_run`] — and the alias it came from, if
+/// `[[aliases]]` in config.toml is what matched it (the only case
+/// "Olvidar alias" has anything to remove).
+#[derive(Clone)]
+struct HistorySlot {
+    phrase: String,
+    alias_phrase: Option<String>,
 }
 
 /// Where to send someone whose microphone Minion cannot use.
@@ -1025,6 +1058,48 @@ fn report(
     ran
 }
 
+/// Rewrites the "Últimas órdenes" submenu to show `history`, newest first,
+/// and refreshes `slots` — the copy of the same information the
+/// menu-event thread reads a click's phrase from — to match.
+///
+/// `items` has one `(slot submenu, "Repetir", "Crear alias…", "Olvidar
+/// alias")` per position; a position past the end of `history` is shown
+/// disabled rather than removed, since ids are meant to stay put across a
+/// rebuild — see where `items` is built, in `run_menu_bar`.
+fn refresh_history_menu(
+    history: &std::collections::VecDeque<(String, String)>,
+    items: &[(Submenu, MenuItem, MenuItem, MenuItem)],
+    slots: &Arc<Mutex<Vec<Option<HistorySlot>>>>,
+) {
+    let config = config::load();
+    let Ok(mut slots) = slots.lock() else { return };
+    for (n, (slot_menu, repeat, alias, forget)) in items.iter().enumerate() {
+        let Some((text, outcome)) = history.get(n) else {
+            slot_menu.set_text("(vacío)");
+            slot_menu.set_enabled(false);
+            repeat.set_enabled(false);
+            alias.set_enabled(false);
+            forget.set_enabled(false);
+            slots[n] = None;
+            continue;
+        };
+        let normalised = text::normalise(text);
+        let phrase = commands::strip_wake_word(&normalised).unwrap_or(&normalised).to_string();
+        let alias_phrase = config
+            .aliases
+            .iter()
+            .find(|entry| text::normalise(&entry.phrase) == phrase)
+            .map(|entry| text::normalise(&entry.phrase));
+
+        slot_menu.set_text(format!("{} → {}", shorten(text, 40), shorten(outcome, 24)));
+        slot_menu.set_enabled(true);
+        repeat.set_enabled(true);
+        alias.set_enabled(true);
+        forget.set_enabled(alias_phrase.is_some());
+        slots[n] = Some(HistorySlot { phrase, alias_phrase });
+    }
+}
+
 /// Builds the menu bar item and hands control to AppKit. Never returns.
 /// The voice threshold as configured, read fresh.
 fn config_voice_threshold() -> f32 {
@@ -1116,9 +1191,38 @@ fn run_menu_bar(
     log_menu.append(&learn)?;
     log_menu.append(&show_log)?;
 
+    // «Últimas órdenes»: fixed slots, updated in place, rather than menu
+    // items created and destroyed on every utterance — a slot with nothing
+    // in it yet just shows disabled. Ids stay the same across a rebuild, so
+    // the event thread below can address a slot by number without needing
+    // to know that a rebuild ever happened.
+    let history_menu = Submenu::new("Últimas órdenes", true);
+    let mut history_items: Vec<(Submenu, MenuItem, MenuItem, MenuItem)> =
+        Vec::with_capacity(HISTORY_LEN);
+    for n in 0..HISTORY_LEN {
+        let slot = Submenu::with_id(format!("history-slot-{n}"), "(vacío)", false);
+        let repeat = MenuItem::with_id(format!("history-repeat-{n}"), "Repetir", false, None);
+        let alias =
+            MenuItem::with_id(format!("history-alias-{n}"), "Crear alias…", false, None);
+        let forget =
+            MenuItem::with_id(format!("history-forget-{n}"), "Olvidar alias", false, None);
+        slot.append(&repeat)?;
+        slot.append(&alias)?;
+        slot.append(&forget)?;
+        history_menu.append(&slot)?;
+        history_items.push((slot, repeat, alias, forget));
+    }
+    let history_repeat_ids: Vec<_> =
+        history_items.iter().map(|(_, item, _, _)| item.id().clone()).collect();
+    let history_alias_ids: Vec<_> =
+        history_items.iter().map(|(_, _, item, _)| item.id().clone()).collect();
+    let history_forget_ids: Vec<_> =
+        history_items.iter().map(|(_, _, _, item)| item.id().clone()).collect();
+
     let quit = MenuItem::new("Salir", true, None);
     menu.append(&toggle)?;
     menu.append(&PredefinedMenuItem::separator())?;
+    menu.append(&history_menu)?;
     menu.append(&log_menu)?;
     menu.append(&preferences)?;
     menu.append(&PredefinedMenuItem::separator())?;
@@ -1176,6 +1280,19 @@ fn run_menu_bar(
     let learn_requested = Arc::new(AtomicBool::new(false));
     let catalogue_requested = Arc::new(AtomicBool::new(false));
 
+    // What each "Últimas órdenes" slot currently holds, so the menu-event
+    // thread — which owns no state of its own — can look one up by number
+    // when its "Repetir" or "Olvidar alias" is clicked. Written by the
+    // timer below, on the main thread, whenever the tooltip says something
+    // new happened.
+    let history_slots: Arc<Mutex<Vec<Option<HistorySlot>>>> =
+        Arc::new(Mutex::new(vec![None; HISTORY_LEN]));
+    // "Olvidar alias" cannot edit config.toml and ask about a restart from
+    // the menu-event thread itself — that means calling into AppKit, which
+    // only the main thread may do — so it leaves the phrase here instead,
+    // for the timer to act on.
+    let forget_alias_requested: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
     // Built before anything slow happens. On a first run the model has yet
     // to be downloaded — 670 MB, several minutes — and the icon used to
     // appear only afterwards: for all that time the menu bar showed
@@ -1224,6 +1341,15 @@ fn run_menu_bar(
     let catalogue_for_timer = Arc::clone(&catalogue_requested);
     let catalogue_window = Rc::clone(&catalogue);
     let catalogue_asked_aloud = Arc::clone(&catalogue_asked);
+    // The submenu is only ever touched from here — set_text/set_enabled are
+    // cheap, so it is simplest to just rebuild the visible slots whenever
+    // the parsed history changes, rather than diffing against what is
+    // already shown.
+    let history_items_for_timer = history_items.clone();
+    let history_slots_for_timer = Arc::clone(&history_slots);
+    let history: Rc<std::cell::RefCell<std::collections::VecDeque<(String, String)>>> =
+        Rc::new(std::cell::RefCell::new(std::collections::VecDeque::with_capacity(HISTORY_LEN)));
+    let forget_alias_for_timer = Arc::clone(&forget_alias_requested);
     let training_model_path = model_path;
     let report_for_timer = Rc::clone(&report);
     let sounds_for_timer = Arc::clone(&sounds_on);
@@ -1387,6 +1513,30 @@ fn run_menu_bar(
                 }
             }
         }
+        // "Olvidar alias", from the "Últimas órdenes" menu: routed through
+        // here rather than acted on directly by the menu-event thread,
+        // since removing it means asking a question and possibly a
+        // restart, both of which are AppKit calls.
+        if let Some(phrase) = forget_alias_for_timer.lock().ok().and_then(|mut p| p.take()) {
+            if actions::ask(
+                &format!("¿Olvidar el alias «{phrase}»?"),
+                "Olvidar",
+            ) {
+                match config::remove_alias(&phrase) {
+                    Ok(()) => {
+                        note!("alias «{phrase}» forgotten from the Últimas órdenes menu");
+                        if actions::ask_choice(
+                            "El cambio se aplica al reiniciar Minion.",
+                            "Reiniciar ahora",
+                            "Reiniciar más tarde",
+                        ) {
+                            restart_for_timer.store(true, Ordering::Relaxed);
+                        }
+                    }
+                    Err(e) => actions::show_message(&format!("No se pudo olvidar el alias: {e}")),
+                }
+            }
+        }
         // Controls report by being read: see preferences.rs for why.
         if panel_for_timer.poll() {
             sounds_for_timer.store(panel_for_timer.sounds_on(), Ordering::Relaxed);
@@ -1420,6 +1570,26 @@ fn run_menu_bar(
             if !wanted.is_empty() && *wanted != *shown_tooltip.borrow() {
                 let _ = tray_for_timer.set_tooltip(Some(&*wanted));
                 shown_tooltip.replace(wanted.clone());
+                // "Últimas órdenes" reads the same line — see
+                // `parse_last_utterance` for why this is a first version
+                // rather than a queue pushed to from the listening loop.
+                // "no era para mí" is speech Minion decided was not
+                // addressed to it at all, so it is not an order to keep.
+                if let Some((text, outcome)) = parse_last_utterance(&wanted) {
+                    if outcome != "no era para mí" {
+                        let mut queue = history.borrow_mut();
+                        if queue.len() == HISTORY_LEN {
+                            queue.pop_back();
+                        }
+                        queue.push_front((text, outcome));
+                        drop(queue);
+                        refresh_history_menu(
+                            &history.borrow(),
+                            &history_items_for_timer,
+                            &history_slots_for_timer,
+                        );
+                    }
+                }
             }
         }
 
@@ -1497,6 +1667,8 @@ fn run_menu_bar(
     let restart_from_menu = Arc::clone(&restart_requested);
     let quit_from_menu = Arc::clone(&quit_requested);
     let catalogue_from_menu = Arc::clone(&catalogue_requested);
+    let history_slots_from_menu = Arc::clone(&history_slots);
+    let forget_alias_from_menu = Arc::clone(&forget_alias_requested);
     std::thread::spawn(move || {
         let events = MenuEvent::receiver();
         while let Ok(event) = events.recv() {
@@ -1528,6 +1700,31 @@ fn run_menu_bar(
             } else if event.id == quit_id {
                 note!("quit from the menu");
                 quit_from_menu.store(true, Ordering::Relaxed);
+            } else if let Some(n) = history_repeat_ids.iter().position(|id| *id == event.id) {
+                let slot = history_slots_from_menu.lock().ok().and_then(|s| s[n].clone());
+                if let Some(slot) = slot {
+                    // No AppKit involved — a plain file write, exactly what
+                    // `minion run "…"` already does from a second process.
+                    if let Err(e) = api::request_run(&slot.phrase) {
+                        note!("could not repeat «{}»: {e}", slot.phrase);
+                    }
+                }
+            } else if history_alias_ids.contains(&event.id) {
+                // First version, per the report: this reopens the same
+                // "Aprender" dialog the menu already has, rather than
+                // offering an alias for this one phrase specifically.
+                learn_from_menu.store(true, Ordering::Relaxed);
+            } else if let Some(n) = history_forget_ids.iter().position(|id| *id == event.id) {
+                let alias_phrase = history_slots_from_menu
+                    .lock()
+                    .ok()
+                    .and_then(|s| s[n].clone())
+                    .and_then(|slot| slot.alias_phrase);
+                if let Some(phrase) = alias_phrase {
+                    if let Ok(mut pending) = forget_alias_from_menu.lock() {
+                        *pending = Some(phrase);
+                    }
+                }
             }
         }
     });
@@ -2086,6 +2283,21 @@ mod tests {
         let tooltip = last_utterance_tooltip(long, "escribir");
         assert!(tooltip.contains('…'), "should be cut: {tooltip}");
         assert!(!tooltip.contains("fontanero"), "and cut at the right place: {tooltip}");
+    }
+
+    #[test]
+    fn a_tooltip_round_trips_through_parse_last_utterance() {
+        let tooltip = last_utterance_tooltip("minion, abre Chrome", "abrir Chrome");
+        assert_eq!(
+            parse_last_utterance(&tooltip),
+            Some(("minion, abre Chrome".to_string(), "abrir Chrome".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_last_utterance_rejects_an_unrelated_tooltip() {
+        assert_eq!(parse_last_utterance(TOOLTIP_IDLE), None);
+        assert_eq!(parse_last_utterance(TOOLTIP_LISTENING), None);
     }
 
     #[test]

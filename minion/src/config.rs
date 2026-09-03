@@ -416,6 +416,73 @@ fn with_option(contents: &str, key: &str, value: &str) -> String {
     lines.join("\n") + "\n"
 }
 
+/// The `phrase` of one `[[aliases]]` block, read on its own so a block can
+/// be matched without deserialising the whole file — the block may sit
+/// between others that would fail `deny_unknown_fields` on their own (it
+/// never does, in practice, but nothing here needs to assume that).
+#[derive(Deserialize)]
+struct AliasPhrase {
+    phrase: String,
+}
+
+/// Removes the first `[[aliases]]` block whose `phrase` matches (after
+/// [`crate::text::normalise`]) the given phrase, from already-read file
+/// contents. Pure: takes and returns text, touches no file. Leaves the
+/// file untouched if nothing matches.
+///
+/// Used by the "Olvidar alias" item in the "Últimas órdenes" menu: an
+/// alias is only ever this file's own `[[aliases]]` entry, never something
+/// from the built-in vocabulary, so there is always exactly one block (or
+/// none) to remove.
+fn without_alias(contents: &str, phrase: &str) -> String {
+    let target = crate::text::normalise(phrase);
+    let lines: Vec<&str> = contents.lines().collect();
+
+    let mut blocks: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].trim() == "[[aliases]]" {
+            let start = i;
+            let end = lines
+                .iter()
+                .skip(i + 1)
+                .position(|l| l.trim_start().starts_with('['))
+                .map_or(lines.len(), |offset| i + 1 + offset);
+            blocks.push((start, end));
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+
+    let matching = blocks.into_iter().find(|(start, end)| {
+        toml::from_str::<AliasPhrase>(&lines[start + 1..*end].join("\n"))
+            .is_ok_and(|alias| crate::text::normalise(&alias.phrase) == target)
+    });
+
+    let Some((start, end)) = matching else {
+        return contents.to_string();
+    };
+
+    let mut kept: Vec<&str> = lines[..start].to_vec();
+    kept.extend(&lines[end..]);
+    // A blank line left where the block used to be, at the end of the
+    // file, would otherwise grow by one every time the last alias goes.
+    while kept.last().is_some_and(|l| l.trim().is_empty()) {
+        kept.pop();
+    }
+    kept.join("\n") + "\n"
+}
+
+/// Removes an alias by its phrase — see [`without_alias`]. Refuses to
+/// write if the result would not parse.
+pub fn remove_alias(phrase: &str) -> Result<(), String> {
+    let path = path().ok_or("no home directory")?;
+    let existing = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let updated = parse_checked(without_alias(&existing, phrase))?;
+    write_config(&path, updated)
+}
+
 /// Checks that edited contents still parse as a [`Config`], so a bug in
 /// [`with_option`] or [`with_table_option`] — or an unescaped value passed
 /// to them — cannot silently invalidate the whole file the next time it is
@@ -1120,5 +1187,46 @@ mod tests {
         // `commands::configure`'s job, not this one's.
         let config: Config = toml::from_str("search_engine = \"YouTube\"").expect("should parse");
         assert_eq!(config.search_engine().as_deref(), Some("YouTube"));
+    }
+
+    #[test]
+    fn removing_an_alias_keeps_the_others_and_the_comments() {
+        let before = "# my aliases\n\
+             [[aliases]]\n\
+             command = \"abrir Chrome\"\n\
+             phrase = \"abre cromo\"\n\
+             \n\
+             [[aliases]]\n\
+             command = \"cerrar ventana\"\n\
+             phrase = \"cierra la ventana\"\n";
+        let after = without_alias(before, "Abre Cromo");
+        assert!(after.contains("# my aliases"), "comments survive");
+        assert!(!after.contains("abre cromo"), "the matched alias is gone");
+        assert!(after.contains("cierra la ventana"), "the other alias survives");
+        assert_eq!(after.matches("[[aliases]]").count(), 1);
+    }
+
+    #[test]
+    fn removing_the_only_alias_leaves_no_trailing_blank_lines() {
+        let before = "sounds = true\n\n[[aliases]]\ncommand = \"abrir Chrome\"\nphrase = \"abre cromo\"\n";
+        let after = without_alias(before, "abre cromo");
+        assert!(!after.contains("[[aliases]]"));
+        assert!(after.contains("sounds = true"));
+        assert!(!after.ends_with("\n\n"), "no orphaned blank line: {after:?}");
+    }
+
+    #[test]
+    fn removing_an_unknown_phrase_changes_nothing() {
+        let before = "[[aliases]]\ncommand = \"abrir Chrome\"\nphrase = \"abre cromo\"\n";
+        assert_eq!(without_alias(before, "algo que no existe"), before);
+    }
+
+    #[test]
+    fn remove_alias_refuses_to_write_an_unparsable_result() {
+        // without_alias itself cannot produce broken TOML from valid input,
+        // so this exercises parse_checked directly, the same guard
+        // set_option relies on.
+        let broken = "[[aliases]]\ncommand = \"x\"\nphrase = \"y\"\n[audio\n";
+        assert!(parse_checked(without_alias(broken, "y")).is_err());
     }
 }
