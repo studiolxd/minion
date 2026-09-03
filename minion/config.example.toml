@@ -70,6 +70,15 @@
 # Alfred, Raycast and Spotlight commonly use.)
 # resume_shortcut = "ctrl-alt-m"
 
+# Whether dictation ("minion, empieza a dictar") turns spoken punctuation
+# ("coma", "punto", "abre interrogación"…) into signs. On by default; turn
+# off to type every such word verbatim instead.
+# spoken_punctuation = true
+
+# Whether dictation capitalises the start of a sentence and honours
+# «mayúscula»/«en mayúsculas». On by default.
+# auto_capitalise = true
+
 [audio]
 # RMS energy above which someone is considered to be speaking.
 # Too high clips the start of words; too low transcribes the fan.
@@ -140,3 +149,13 @@
 # name = "compilar"
 # phrases = ["compila el proyecto", "compila"]
 # keys = "cmd-shift-b"
+
+# Names and other words the recogniser reliably mangles while dictating —
+# the fix for a log line like:
+#   unknown  «Mir Ángel Sufire García»  ->  not understood
+# Matched against what was actually heard (accents and case do not matter),
+# longest phrase first, and applied before spoken punctuation.
+
+# [[dictation_words]]
+# heard = "mir angel sufire"
+# written = "Miguel Ángel Subir"
