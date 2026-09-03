@@ -491,6 +491,7 @@ pub struct Preferences {
     /// Stops a training session halfway through.
     cancel_train: Press,
     cancel_requested: Cell<bool>,
+    restart_requested: Cell<bool>,
     /// Deletes the voice profile, after asking.
     forget: Press,
     /// The button's state last time it was read, to notice a click without
@@ -864,6 +865,7 @@ impl Preferences {
             train_requested: Cell::new(false),
             cancel_train: Press::new(cancel_train),
             cancel_requested: Cell::new(false),
+            restart_requested: Cell::new(false),
             forget: Press::new(forget),
         };
         preferences.update_readouts();
@@ -1057,12 +1059,21 @@ impl Preferences {
         if changed {
             self.update_readouts();
         }
-        if needs_restart {
-            crate::actions::show_message(
-                "Reinicia Minion desde el menú para que el cambio surta efecto.",
-            );
+        if needs_restart
+            && crate::actions::ask_choice(
+                "El cambio se aplica al reiniciar Minion.",
+                "Reiniciar ahora",
+                "Reiniciar más tarde",
+            )
+        {
+            self.restart_requested.set(true);
         }
         changed
+    }
+
+    /// Whether «Reiniciar ahora» was chosen since the last call.
+    pub fn take_restart_request(&self) -> bool {
+        self.restart_requested.replace(false)
     }
 
     /// Whether the person just asked to train their voice.

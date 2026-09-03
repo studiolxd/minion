@@ -352,11 +352,20 @@ pub fn show_message_and_wait(text: &str) {
 /// there is no honest answer to give, so it says no rather than blocking
 /// the recognition loop behind a dialog nobody can see.
 pub fn ask(text: &str, affirmative: &str) -> bool {
+    ask_choice(text, affirmative, "Cancelar")
+}
+
+/// Asks a question with two named answers. True for the first one.
+///
+/// For choices where "no" is not a cancellation — «Reiniciar ahora» /
+/// «Reiniciar más tarde» — a button called «Cancelar» would misdescribe
+/// what happens when it is pressed.
+pub fn ask_choice(text: &str, affirmative: &str, negative: &str) -> bool {
     let Some(mtm) = MainThreadMarker::new() else {
         crate::journal::write("a question was asked off the main thread; answering no");
         return false;
     };
-    alert(mtm, text, Some(affirmative))
+    alert(mtm, text, Some((affirmative, negative)))
 }
 
 /// Puts up an alert and waits for it. True if the first button was used.
@@ -364,7 +373,7 @@ pub fn ask(text: &str, affirmative: &str) -> bool {
 /// An `NSAlert` rather than AppleScript's `display dialog`: the script had
 /// to have its quotes and backslashes filed off the message on the way in,
 /// so what the user read was not quite what the program meant to say.
-fn alert(mtm: MainThreadMarker, text: &str, affirmative: Option<&str>) -> bool {
+fn alert(mtm: MainThreadMarker, text: &str, choice: Option<(&str, &str)>) -> bool {
     // Minion is an accessory application and never the active one, so
     // without this the alert opens behind whatever is in front.
     let app = NSApplication::sharedApplication(mtm);
@@ -374,12 +383,12 @@ fn alert(mtm: MainThreadMarker, text: &str, affirmative: Option<&str>) -> bool {
     let alert = NSAlert::new(mtm);
     alert.setMessageText(&NSString::from_str("Minion"));
     alert.setInformativeText(&NSString::from_str(text));
-    match affirmative {
-        Some(yes) => {
+    match choice {
+        Some((yes, no)) => {
             // The first button added is the default one, and the one whose
             // return code is `NSAlertFirstButtonReturn`.
             alert.addButtonWithTitle(&NSString::from_str(yes));
-            alert.addButtonWithTitle(&NSString::from_str("Cancelar"));
+            alert.addButtonWithTitle(&NSString::from_str(no));
         }
         None => {
             alert.addButtonWithTitle(&NSString::from_str("Cerrar"));

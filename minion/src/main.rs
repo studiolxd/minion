@@ -1096,10 +1096,13 @@ fn run_menu_bar(
                 match learn::apply(&lesson) {
                     Ok(n) if n > 0 => {
                         note!("learned {n} alias(es) from the log");
-                        actions::show_message(&format!(
-                            "Añadidos {n}. Reinicia Minion desde el menú para que \
-                             se apliquen."
-                        ));
+                        if actions::ask_choice(
+                            &format!("Añadidos {n}. Se aplican al reiniciar Minion."),
+                            "Reiniciar ahora",
+                            "Reiniciar más tarde",
+                        ) {
+                            restart_for_timer.store(true, Ordering::Relaxed);
+                        }
                     }
                     Ok(_) => {}
                     Err(e) => actions::show_message(&e),
@@ -1110,6 +1113,10 @@ fn run_menu_bar(
         if panel_for_timer.poll() {
             sounds_for_timer.store(panel_for_timer.sounds_on(), Ordering::Relaxed);
             voices_for_timer.store(panel_for_timer.log_voices_on(), Ordering::Relaxed);
+        }
+        if panel_for_timer.take_restart_request() {
+            // Picked up on the next tick, after the window has saved.
+            restart_for_timer.store(true, Ordering::Relaxed);
         }
 
         // A command just ran: acknowledge it for a moment. Silent, which
