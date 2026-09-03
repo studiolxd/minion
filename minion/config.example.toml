@@ -140,3 +140,22 @@
 # name = "compilar"
 # phrases = ["compila el proyecto", "compila"]
 # keys = "cmd-shift-b"
+
+# Named macros: one phrase that runs several others in order, 300 ms
+# apart, stopping at the first step that is refused. Each step must be a
+# phrase Minion would understand said on its own — the wake word is added
+# back on for you, so write it exactly as you would say it. Only here,
+# never in a downloaded vocabulary pack: a macro presses keys and launches
+# applications on its own say-so, which a file that may have come from
+# elsewhere does not get to do. A macro cannot call another macro.
+
+# [[macros]]
+# name = "modo trabajo"
+# phrases = ["modo trabajo", "empieza a trabajar"]
+# steps = ["abre Slack", "abre Chrome", "abre la terminal", "sube el volumen"]
+
+# Which engine a bare "busca X" searches, with nothing after it naming
+# one: "google", "youtube", "wikipedia" or "amazon". "busca X en Google"
+# (or YouTube, Wikipedia, Amazon, or "el Finder") always names its own,
+# regardless of this setting. Default "google".
+# search_engine = "google"

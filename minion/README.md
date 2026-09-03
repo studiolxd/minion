@@ -224,6 +224,27 @@ not a search for it.
 front and it opens in Chrome, not in whichever browser the system considers
 default. Ask from anywhere else and the default applies.
 
+### Searching
+
+«minion, **busca** gatos **en** Google» — also YouTube, Wikipedia, Amazon,
+or "el Finder" for the folder already open in front. Say it with nothing
+after "en" and it goes to the default engine — "google" unless
+`search_engine` in `config.toml` says otherwise.
+
+### Apple Shortcuts
+
+«minion, **ejecuta el atajo** Modo Trabajo» — also *lanza el atajo* or just
+*atajo Modo Trabajo*. Runs an installed Shortcut by name, matched the same
+tolerant way an application's is. Minion starts it and moves on without
+waiting, since a shortcut can take anywhere from instant to tens of seconds.
+
+### Macros
+
+A macro is a name for several phrases, said one after another. Define one
+of your own in `config.toml` — see **Configuration** below — and Minion
+runs each step as if it had been said, 300 ms apart, stopping at the first
+one that is refused. A macro cannot call another macro.
+
 ### Dictating text
 
 «minion, **escribe** hola qué tal» types the words that follow —
