@@ -99,6 +99,17 @@ fn last_utterance_tooltip(transcript: &str, outcome: &str) -> String {
     format!("Minion — última: “{}” → {outcome}", shorten(transcript, TOOLTIP_TRANSCRIPT))
 }
 
+/// The first sentence of `text`, kept whole with its closing punctuation —
+/// what `brief_answers` speaks instead of the whole reply. What is logged,
+/// shown in the HUD and notified stays the full text; only the spoken
+/// version is cut short.
+fn first_sentence(text: &str) -> String {
+    match text.find(['.', '!', '?']) {
+        Some(at) => text[..=at].to_string(),
+        None => text.to_string(),
+    }
+}
+
 /// Recovers `(transcript, outcome)` from a tooltip written by
 /// [`last_utterance_tooltip`] — the inverse, used to feed the "Últimas
 /// órdenes" menu without the listening loop having to know about it.
@@ -165,6 +176,15 @@ mod sounds {
     /// UNSURE on purpose: "say it again" and "grant the permission" are
     /// different problems, and they used to be indistinguishable.
     pub const BLOCKED: &str = "/System/Library/Sounds/Basso.aiff";
+    /// An utterance was addressed to Minion and is about to be decided —
+    /// played before there is anything to say yet, so `[feedback]` in
+    /// "sounds" or "quiet" mode still has something to notice, since it
+    /// never speaks. Distinct from DONE: this fires whether or not
+    /// anything is understood.
+    pub const HEARD: &str = "/System/Library/Sounds/Morse.aiff";
+    /// A question was just asked — a confirmation, a guess, a choice —
+    /// and is waiting for its answer.
+    pub const QUESTION: &str = "/System/Library/Sounds/Ping.aiff";
 }
 
 /// The toggle's two faces. It names the action, not the state: a menu item
@@ -649,6 +669,12 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
     // And how sure a costly command has to be before it just runs instead
     // of being confirmed — see `commands::confirm_question`.
     session.confirms_below(startup.confirm_below());
+    // How to signal what is happening — earcons, speech, both or neither
+    // — and whether a spoken confirmation or answer is kept brief. Read
+    // once, the same as everything else above: none of it is live-
+    // reloaded mid-session.
+    let feedback_mode = startup.feedback();
+    let brief_answers = startup.brief_answers;
     // Built fresh each time dictation starts, so its state (the pending
     // capital, an open quote) never spans two dictation sessions, and a
     // vocabulary edited while Minion was running takes effect right away.
@@ -760,6 +786,15 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                 notify::post("Minion", text);
                 false
             }
+        }
+    };
+    // A short earcon for a question just asked — a confirmation, a guess,
+    // a choice — under `[feedback]`'s "sounds"/"both". Kept apart from
+    // `ask_aloud`: a confirmation in brief mode plays this instead of
+    // speaking, while every other question plays it alongside speech.
+    let sound_question = || {
+        if feedback_mode.sounds() && play_sounds.load(Ordering::Relaxed) {
+            let _ = actions::play_sound(sounds::QUESTION);
         }
     };
 
@@ -1116,7 +1151,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                             seconds,
                             elapsed_ms,
                             log_ignored_speech: log_ignored_speech.load(Ordering::Relaxed),
-                            play_sounds: play_sounds.load(Ordering::Relaxed),
+                            play_sounds: play_sounds.load(Ordering::Relaxed) && feedback_mode.sounds(),
                             acted: &acted,
                             status: &status,
                         },
@@ -1161,7 +1196,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                             seconds,
                             elapsed_ms,
                             log_ignored_speech: log_ignored_speech.load(Ordering::Relaxed),
-                            play_sounds: play_sounds.load(Ordering::Relaxed),
+                            play_sounds: play_sounds.load(Ordering::Relaxed) && feedback_mode.sounds(),
                             acted: &acted,
                             status: &status,
                         },
@@ -1196,7 +1231,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                             seconds,
                             elapsed_ms,
                             log_ignored_speech: log_ignored_speech.load(Ordering::Relaxed),
-                            play_sounds: play_sounds.load(Ordering::Relaxed),
+                            play_sounds: play_sounds.load(Ordering::Relaxed) && feedback_mode.sounds(),
                             acted: &acted,
                             status: &status,
                         },
@@ -1229,7 +1264,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                             seconds,
                             elapsed_ms,
                             log_ignored_speech: log_ignored_speech.load(Ordering::Relaxed),
-                            play_sounds: play_sounds.load(Ordering::Relaxed),
+                            play_sounds: play_sounds.load(Ordering::Relaxed) && feedback_mode.sounds(),
                             acted: &acted,
                             status: &status,
                         },
@@ -1272,6 +1307,18 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
             let (decision, confidence) = (resolved.decision, resolved.confidence);
             window_open.store(!hold_mode && session.window_open(now), Ordering::Relaxed);
 
+            // Addressed to Minion — a quick earcon before the (possibly
+            // slower) decision below produces its own done/unsure/blocked
+            // sound. Never for `Ignored`: that fires on every stray word
+            // said in the room, and beeping at all of it would be exactly
+            // the noise `[feedback]` is meant to cut down on.
+            if decision != Decision::Ignored
+                && feedback_mode.sounds()
+                && play_sounds.load(Ordering::Relaxed)
+            {
+                let _ = actions::play_sound(sounds::HEARD);
+            }
+
             // Two readings of the same sentence, neither of them clearly
             // ahead. Asked before anything is carried out, because the
             // point is that neither should be: doing the wrong one and
@@ -1288,6 +1335,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                 // after it spoke: the seconds are the ones the person has
                 // to answer in.
                 ask_aloud(&question.text);
+                sound_question();
                 session.open_question(&resolved.phrase, question, Instant::now());
                 hud::set_question_pending(true);
                 continue;
@@ -1299,7 +1347,14 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
             // same question machinery, rather than simply carried out.
             if let Some(question) = session.ask_confirm(&decision, confidence, 1) {
                 note!("asking   «{part}»  ->  {}?  (confirm)", question.description);
-                ask_aloud(&question.text);
+                // `brief_answers` makes a confirmation an earcon rather
+                // than a spoken question — the point of brief mode.
+                if brief_answers {
+                    let _ = actions::play_sound(sounds::QUESTION);
+                } else {
+                    ask_aloud(&question.text);
+                    sound_question();
+                }
                 session.open_question(&resolved.phrase, question, Instant::now());
                 hud::set_question_pending(true);
                 continue;
@@ -1427,8 +1482,10 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                     match &voice_reply {
                         Some(settings) => {
                             speaking.store(true, Ordering::Relaxed);
+                            let spoken =
+                                if brief_answers { first_sentence(&reply) } else { reply.clone() };
                             speech::say(
-                                &reply,
+                                &spoken,
                                 settings.voice.as_deref(),
                                 settings.rate,
                                 settings.device.as_deref(),
@@ -1549,8 +1606,10 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                     match &voice_reply {
                         Some(settings) => {
                             speaking.store(true, Ordering::Relaxed);
+                            let spoken =
+                                if brief_answers { first_sentence(&reply) } else { reply.clone() };
                             speech::say(
-                                &reply,
+                                &spoken,
                                 settings.voice.as_deref(),
                                 settings.rate,
                                 settings.device.as_deref(),
@@ -1615,7 +1674,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                             seconds,
                             elapsed_ms,
                             log_ignored_speech: log_ignored_speech.load(Ordering::Relaxed),
-                            play_sounds: play_sounds.load(Ordering::Relaxed),
+                            play_sounds: play_sounds.load(Ordering::Relaxed) && feedback_mode.sounds(),
                             acted: &acted,
                             status: &status,
                         },
@@ -1642,6 +1701,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                         if let Some(question) = session.ask_about(&part, Instant::now()) {
                             note!("asking   «{part}»  ->  {}?", question.description);
                             if ask_aloud(&question.text) {
+                                sound_question();
                                 // Timed from here, not from before it
                                 // spoke: the six seconds are the ones the
                                 // person has to answer in.
@@ -1679,6 +1739,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                                                 suggestion.confidence * 100.0
                                             );
                                             if ask_aloud(&question.text) {
+                                                sound_question();
                                                 session.open_question(
                                                     &part,
                                                     question,
@@ -3507,7 +3568,10 @@ fn main() -> Result<()> {
     let save_recordings = config.save_recordings;
     let catalogue_asked = Arc::new(AtomicBool::new(false));
     let worker_catalogue = Arc::clone(&catalogue_asked);
-    let voice_reply = config.speak.then(|| VoiceReply {
+    // `[feedback]`'s "sounds" and "quiet" modes silence spoken replies on
+    // top of whatever `speak` already says, the same way `feedback_mode`
+    // adds to `play_sounds` for earcons rather than replacing it.
+    let voice_reply = (config.speak && config.feedback().speaks()).then(|| VoiceReply {
         voice: config.voice(),
         rate: config.speech_rate(),
         device: config.speaker(),
@@ -3631,6 +3695,14 @@ mod tests {
         let tooltip = last_utterance_tooltip(long, "escribir");
         assert!(tooltip.contains('…'), "should be cut: {tooltip}");
         assert!(!tooltip.contains("fontanero"), "and cut at the right place: {tooltip}");
+    }
+
+    #[test]
+    fn first_sentence_keeps_only_the_first_and_its_punctuation() {
+        assert_eq!(first_sentence("Han pasado cinco minutos. ¿Cancelo el resto?"), "Han pasado cinco minutos.");
+        assert_eq!(first_sentence("Sin punto final"), "Sin punto final");
+        assert_eq!(first_sentence("¿Qué hora es?"), "¿Qué hora es?");
+        assert_eq!(first_sentence(""), "");
     }
 
     #[test]
