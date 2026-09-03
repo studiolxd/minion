@@ -10,7 +10,11 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP="$HERE/Minion.app"
-VERSION="1.0.0-beta.1"
+# One version, read from Cargo.toml — the crate version is the only place
+# it is written down, so `minion --version`, the bundle's Info.plist and a
+# release's tag cannot drift apart.
+VERSION=$(awk -F'"' '/^version[[:space:]]*=/ {print $2; exit}' "$HERE/Cargo.toml")
+[ -n "$VERSION" ] || { echo "Could not read the version from Cargo.toml" >&2; exit 1; }
 
 cd "$HERE"
 

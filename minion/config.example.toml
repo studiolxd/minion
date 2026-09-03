@@ -73,6 +73,10 @@
 # only around an utterance or while dictating. Off by default; also
 # toggled by voice — "muestra lo que oyes" / "esconde lo que oyes".
 # show_hud = false
+# Look once a day for a newer version of Minion and offer to install it.
+# On by default, and silent unless there is one. «Buscar
+# actualizaciones…» in the menu asks straight away either way.
+# check_updates = true
 
 # Which system voice to use. Empty picks a Spanish one automatically.
 # voice = "Mónica"

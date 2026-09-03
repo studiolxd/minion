@@ -10,6 +10,9 @@ minion/model/
 # Built application bundle: produced by minion/build-app.sh.
 minion/Minion.app/
 
+# Release artefacts: the zip and appcast.json minion/release.sh builds.
+minion/dist/
+
 # Logs and the local audit notes
 *.log
 AUDITORIA.md

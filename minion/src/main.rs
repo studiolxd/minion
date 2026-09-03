@@ -38,6 +38,7 @@ mod system;
 mod text;
 mod vocabulary;
 mod timers;
+mod updater;
 
 use std::cell::Cell;
 use std::path::Path;
@@ -61,7 +62,7 @@ use commands::Decision;
 use session::{Outcome, Reply, Session, Undoable};
 
 /// What the tooltip says when there is nothing more particular to report.
-const TOOLTIP_IDLE: &str = "Minion — control por voz";
+const TOOLTIP_IDLE: &str = concat!("Minion ", env!("CARGO_PKG_VERSION"), " — control por voz");
 const TOOLTIP_LISTENING: &str = "Minion — escuchando";
 const TOOLTIP_PAUSED: &str = "Minion — en pausa";
 /// Push-to-talk's own pair, used instead of the two above when
@@ -131,6 +132,21 @@ enum PacksUpdateResult {
     Installed { version: String, packs: usize },
     Failed(String),
 }
+
+/// What a worker thread found out about a new version of Minion itself,
+/// left for the UI timer to act on — see `updater.rs`. `asked` is true
+/// when a person chose «Buscar actualizaciones…»: the daily check keeps
+/// quiet about everything except an update that exists.
+enum UpdateResult {
+    Checked { check: updater::Check, asked: bool },
+    Installed(String),
+    Failed(String),
+}
+
+/// How often the daily check looks at its own timestamp file. The rule is
+/// once a day (`updater::daily_check_due`); this is only how often that
+/// question is asked, kept well away from once a second.
+const UPDATE_CHECK_SECONDS: f64 = 300.0;
 
 /// Where to send someone whose microphone Minion cannot use.
 const MICROPHONE_SETTINGS: &str =
@@ -1467,6 +1483,9 @@ fn run_menu_bar(
     // An ellipsis, unlike "Reiniciar" beside it: this opens a download and
     // a dialog, rather than acting outright.
     let update_packs = MenuItem::new("Actualizar vocabulario…", true, None);
+    // Minion itself, rather than its vocabulary. Same ellipsis, same
+    // reason: it opens a download and a question.
+    let check_update = MenuItem::new("Buscar actualizaciones…", true, None);
     let commands_item = MenuItem::new("Ayuda", true, None);
     let preferences = MenuItem::new("Ajustes…", true, None);
 
@@ -1515,6 +1534,7 @@ fn run_menu_bar(
     // Help sits with Quit rather than among the working items: it is where
     // you look when you do not know what to do, not part of the routine.
     menu.append(&restart)?;
+    menu.append(&check_update)?;
     menu.append(&update_packs)?;
     menu.append(&commands_item)?;
     menu.append(&quit)?;
@@ -1527,6 +1547,7 @@ fn run_menu_bar(
     let stats_id = stats_item.id().clone();
     let restart_id = restart.id().clone();
     let update_packs_id = update_packs.id().clone();
+    let check_update_id = check_update.id().clone();
     let quit_id = quit.id().clone();
 
     // Built once and reused: reopening should bring back the same window,
@@ -1672,6 +1693,25 @@ fn run_menu_bar(
     let packs_update_for_timer = Arc::clone(&packs_update_requested);
     let packs_updating_for_timer = Arc::clone(&packs_updating);
     let packs_update_result_for_timer = Arc::clone(&packs_update_result);
+    // «Buscar actualizaciones…» and the daily automatic check, which are
+    // the same work told apart by `update_check_asked`: both look, only
+    // the one someone asked for says so when there is nothing new.
+    // Network and unzipping happen on a worker thread, like the packs
+    // download above; everything with a dialog in it happens here.
+    let update_check_requested = Arc::new(AtomicBool::new(false));
+    let update_check_asked = Arc::new(AtomicBool::new(false));
+    let update_busy = Arc::new(AtomicBool::new(false));
+    let update_result: Arc<Mutex<Option<UpdateResult>>> = Arc::new(Mutex::new(None));
+    let update_check_for_timer = Arc::clone(&update_check_requested);
+    let update_asked_for_timer = Arc::clone(&update_check_asked);
+    let update_busy_for_timer = Arc::clone(&update_busy);
+    let update_result_for_timer = Arc::clone(&update_result);
+    // The copy the last update left behind is only thrown away once this
+    // version has started, which is the one proof the replacement works.
+    let previous_discarded: Cell<bool> = Cell::new(false);
+    let update_ticks: Cell<u32> = Cell::new(0);
+    let update_check_period =
+        ticks_per_second(UI_REFRESH_SECONDS).saturating_mul(UPDATE_CHECK_SECONDS as u32);
     // How many times the timer has fired since it started, kept apart from
     // the UI throttle's own counter so the two gates — "once a second" and
     // whatever the throttle needs — can be reasoned about, and changed,
@@ -1732,6 +1772,29 @@ fn run_menu_bar(
             let listening = active_for_timer.load(Ordering::Relaxed);
             let on_disk = api::read_status_file();
             api::write_status_if_changed(listening, on_disk.as_deref());
+        }
+
+        // Once this version is running, the copy the previous update
+        // kept has served its purpose. Done here rather than at startup
+        // so it happens on the run loop, with everything else that
+        // touches the disk outside the listening thread.
+        if !previous_discarded.replace(true) {
+            updater::discard_previous();
+        }
+
+        // The daily look for a new Minion. The rule itself is a day (see
+        // `updater::daily_check_due`); this only asks the question every
+        // few minutes, and never while a check or an install is already
+        // running.
+        let update_tick = update_ticks.get().wrapping_add(1);
+        update_ticks.set(update_tick);
+        if on_schedule(update_tick, update_check_period)
+            && !update_busy_for_timer.load(Ordering::Relaxed)
+            && updater::daily_check_due(&config::load())
+        {
+            updater::record_check();
+            update_asked_for_timer.store(false, Ordering::Relaxed);
+            update_check_for_timer.store(true, Ordering::Relaxed);
         }
 
         // The rest of this closure is the expensive part: reading every
@@ -1949,6 +2012,87 @@ fn run_menu_bar(
                 .to_string();
             }
         }
+        // A check for a new Minion, asked for from the menu or by the
+        // daily timer above. One at a time: `update_busy` covers the
+        // whole check-download-install run, so a second click while an
+        // update is downloading is ignored rather than starting it twice.
+        if update_check_for_timer.swap(false, Ordering::Relaxed)
+            && !update_busy_for_timer.swap(true, Ordering::Relaxed)
+        {
+            let asked = update_asked_for_timer.load(Ordering::Relaxed);
+            note!("updater  checking for a new version ({})", if asked { "asked" } else { "daily" });
+            let result_for_worker = Arc::clone(&update_result_for_timer);
+            let busy_for_worker = Arc::clone(&update_busy_for_timer);
+            std::thread::spawn(move || {
+                let check = updater::check();
+                if let Ok(mut slot) = result_for_worker.lock() {
+                    *slot = Some(UpdateResult::Checked { check, asked });
+                }
+                busy_for_worker.store(false, Ordering::Relaxed);
+            });
+        }
+        // What the worker found. Everything here is AppKit — a question,
+        // a message, a restart — which is why none of it is on the
+        // worker itself.
+        if let Some(result) = update_result_for_timer.lock().ok().and_then(|mut r| r.take()) {
+            match result {
+                UpdateResult::Checked { check: updater::Check::Available(release), .. } => {
+                    note!("updater  {} is available", release.version);
+                    if actions::ask_choice(
+                        &format!(
+                            "Minion {} disponible. ¿Instalar?\n\n{}",
+                            release.version, release.notes
+                        ),
+                        "Instalar",
+                        "Más tarde",
+                    ) && !update_busy_for_timer.swap(true, Ordering::Relaxed)
+                    {
+                        let status_for_worker = Arc::clone(&status_for_timer);
+                        let result_for_worker = Arc::clone(&update_result_for_timer);
+                        let busy_for_worker = Arc::clone(&update_busy_for_timer);
+                        std::thread::spawn(move || {
+                            let outcome = updater::install(&release, |progress| {
+                                if let Ok(mut text) = status_for_worker.lock() {
+                                    *text = format!("Minion — {progress}");
+                                }
+                            });
+                            let result = match outcome {
+                                Ok(_) => UpdateResult::Installed(release.version.clone()),
+                                Err(reason) => UpdateResult::Failed(reason),
+                            };
+                            if let Ok(mut slot) = result_for_worker.lock() {
+                                *slot = Some(result);
+                            }
+                            busy_for_worker.store(false, Ordering::Relaxed);
+                        });
+                    }
+                }
+                // Nothing new, still private, or a check that failed:
+                // said out loud only to whoever asked. The daily check is
+                // silent by design — it runs on a machine nobody is
+                // looking at.
+                UpdateResult::Checked { check, asked } => {
+                    note!("updater  {}", check.message());
+                    if asked {
+                        actions::show_message(&check.message());
+                    }
+                }
+                UpdateResult::Installed(version) => {
+                    note!("updater  installed {version}");
+                    if actions::ask_choice(
+                        &format!("Minion {version} instalado. Reinicia para usarlo."),
+                        "Reiniciar ahora",
+                        "Reiniciar más tarde",
+                    ) {
+                        restart_for_timer.store(true, Ordering::Relaxed);
+                    }
+                }
+                UpdateResult::Failed(reason) => {
+                    note!("updater  update failed: {reason}");
+                    actions::show_message(&format!("No se pudo actualizar Minion: {reason}"));
+                }
+            }
+        }
         // Controls report by being read: see preferences.rs for why.
         if panel_for_timer.poll() {
             sounds_for_timer.store(panel_for_timer.sounds_on(), Ordering::Relaxed);
@@ -2084,6 +2228,8 @@ fn run_menu_bar(
     let history_slots_from_menu = Arc::clone(&history_slots);
     let forget_alias_from_menu = Arc::clone(&forget_alias_requested);
     let update_packs_from_menu = Arc::clone(&packs_update_requested);
+    let update_check_from_menu = Arc::clone(&update_check_requested);
+    let update_asked_from_menu = Arc::clone(&update_check_asked);
     std::thread::spawn(move || {
         let events = MenuEvent::receiver();
         while let Ok(event) = events.recv() {
@@ -2116,6 +2262,11 @@ fn run_menu_bar(
                 restart_from_menu.store(true, Ordering::Relaxed);
             } else if event.id == update_packs_id {
                 update_packs_from_menu.store(true, Ordering::Relaxed);
+            } else if event.id == check_update_id {
+                // Asked for by hand, so it reports either way — including
+                // "está al día", which the daily check never says.
+                update_asked_from_menu.store(true, Ordering::Relaxed);
+                update_check_from_menu.store(true, Ordering::Relaxed);
             } else if event.id == quit_id {
                 note!("quit from the menu");
                 quit_from_menu.store(true, Ordering::Relaxed);
@@ -2429,12 +2580,19 @@ fn main() -> Result<()> {
     // before any of that is set up.
     let first_argument = std::env::args().nth(1);
     if let Some(argument) = first_argument.as_deref() {
+        // The version, from the crate metadata: `Cargo.toml` is the one
+        // place it is written down, and `build-app.sh` reads the same
+        // line for the bundle's Info.plist.
+        if matches!(argument, "--version" | "-V" | "version") {
+            println!("minion {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
         if matches!(argument, "--help" | "-h" | "help") {
             // Spanish: everything the person running this reads is in
             // Spanish, and this is read by nobody else. Without it,
             // `minion --help` went looking for a model called «--help».
             println!(
-                "Minion — control por voz en español.\n\n\
+                "Minion {version} — control por voz en español.\n\n\
                  Uso:\n  \
                  minion                      escucha y obedece (el uso normal)\n  \
                  minion <ruta-al-modelo>     igual, con el modelo de esa carpeta\n  \
@@ -2455,6 +2613,7 @@ fn main() -> Result<()> {
                  minion corpus --from-log <grabaciones> <destino>\n\
                  \x20                            arranca un corpus.toml a partir de\n\
                  \x20                            una carpeta de grabaciones y el registro\n  \
+                 minion --version            la versión instalada\n  \
                  minion --help               esto\n\n\
                  «run» y «say» dejan un aviso para la copia que ya está en\n\
                  marcha y no hacen nada si no hay ninguna — útil para atajos\n\
@@ -2463,7 +2622,8 @@ fn main() -> Result<()> {
                  Variables de entorno:\n  \
                  MINION_MODEL                carpeta del modelo de reconocimiento\n\n\
                  Registro: ~/Library/Logs/minion.log\n\
-                 Ajustes:  ~/Library/Application Support/Minion/config.toml"
+                 Ajustes:  ~/Library/Application Support/Minion/config.toml",
+                version = env!("CARGO_PKG_VERSION")
             );
             return Ok(());
         }
