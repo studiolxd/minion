@@ -14,6 +14,7 @@
 
 use std::cell::Cell;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use objc2::rc::Retained;
 use objc2::MainThreadMarker;
@@ -607,6 +608,19 @@ pub struct Preferences {
     /// `main.rs` owns that window, so this only records the click.
     edit_vocabulary: Press,
     edit_vocabulary_requested: Cell<bool>,
+    ai_enabled: Switch,
+    ai_backend: Popup,
+    ai_use: Popup,
+    ai_daily_limit: Retained<NSTextField>,
+    last_ai_daily_limit: std::cell::RefCell<String>,
+    ai_probe: Press,
+    ai_status: Retained<NSTextField>,
+    /// Filled in by the probe thread when it finishes; read and cleared on
+    /// the next poll. `Arc<Mutex<_>>` rather than a `Cell`: the probe runs
+    /// on its own thread, the same way a real question to the AI layer
+    /// does in `main.rs`, so this window is never blocked waiting on it.
+    ai_probe_result: Arc<Mutex<Option<String>>>,
+    ai_probe_running: Cell<bool>,
 }
 
 /// A shortcut written the way macOS shows it: ⌥Space, ⇧⌘B.
@@ -951,6 +965,93 @@ impl Preferences {
             settings.search_engine().as_deref().unwrap_or("google"),
         );
 
+        layout.heading("IA");
+        let ai_settings = crate::ai::Settings::from_config(&settings.ai);
+        let ai_enabled = layout.checkbox("Usar IA para preguntas y frases no entendidas", ai_settings.enabled());
+        layout.hint(
+            "Envía lo que se transcribe — nunca el audio — a un asistente cuando \
+             se lo pides o cuando una frase no se entiende. Apagado por defecto.",
+            INDENT,
+        );
+
+        let detected = crate::ai::detect();
+        let ai_backend_labels: Vec<String> = detected
+            .iter()
+            .map(|found| {
+                let state = if found.path.is_none() {
+                    "no instalado"
+                } else if found.authenticated {
+                    "listo"
+                } else {
+                    "no utilizable"
+                };
+                format!("{} — {state}", found.label)
+            })
+            .collect();
+        let ai_backend_options: Vec<(&str, &str)> = ai_backend_labels
+            .iter()
+            .zip(detected.iter())
+            .map(|(label, found)| (label.as_str(), found.backend))
+            .collect();
+        let current_backend = if ai_settings.backend.is_empty() {
+            detected.first().map_or("claude-code", |found| found.backend)
+        } else {
+            ai_settings.backend.as_str()
+        };
+        layout.field_label("Backend");
+        let ai_backend = layout.popup(&ai_backend_options, current_backend);
+        layout.hint(
+            "Las claves de API no se editan aquí: guárdalas con \
+             «minion ai set-key <backend>» en la terminal.",
+            0.0,
+        );
+
+        layout.field_label("Se usa para");
+        let ai_use = layout.popup(
+            &[
+                ("Solo preguntas", "[\"questions\"]"),
+                ("Preguntas y frases no entendidas", "[\"questions\", \"unknown\"]"),
+            ],
+            if ai_settings.allows(crate::ai::Purpose::Unknown) {
+                "[\"questions\", \"unknown\"]"
+            } else {
+                "[\"questions\"]"
+            },
+        );
+
+        layout.field_label("Límite de peticiones al día (0 = sin límite)");
+        let ai_daily_limit = NSTextField::new(mtm);
+        ai_daily_limit.setStringValue(&NSString::from_str(&ai_settings.daily_limit.to_string()));
+        ai_daily_limit.setFrame(narrow(layout.place(spacing::FIELD, 0.0), 100.0));
+        layout.add_control(&ai_daily_limit, "Límite de peticiones al día");
+        layout.gap(spacing::SIBLING);
+
+        let ai_probe_row = layout.place(spacing::BUTTON, 0.0);
+        // Safety: no target and no action, so nothing is called back into.
+        let ai_probe = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str("Probar"),
+                None,
+                None,
+                mtm,
+            )
+        };
+        ai_probe.setFrame(narrow(ai_probe_row, 90.0));
+        layout.add_control(&ai_probe, "Probar la IA");
+        let ai_status = plain_label(
+            mtm,
+            &format!("Peticiones hoy: {} de {}", crate::ai::requests_today(), ai_settings.daily_limit),
+            beside(ai_probe_row, 90.0, layout.content_width() - 90.0 - spacing::SIBLING),
+        );
+        layout.add(&ai_status);
+        layout.gap(spacing::SIBLING);
+        layout.hint(
+            "«Probar» pregunta «OK» al backend elegido y muestra cuánto ha \
+             tardado, sin contar como una de las peticiones de hoy salvo que \
+             de verdad llegue a él.",
+            0.0,
+        );
+
         layout.heading("Vocabulario");
         // Safety: no target and no action, so nothing is called back into.
         let edit_vocabulary = unsafe {
@@ -1102,6 +1203,15 @@ impl Preferences {
             profiles,
             edit_vocabulary: Press::new(edit_vocabulary),
             edit_vocabulary_requested: Cell::new(false),
+            ai_enabled,
+            ai_backend,
+            ai_use,
+            last_ai_daily_limit: std::cell::RefCell::new(ai_daily_limit.stringValue().to_string()),
+            ai_daily_limit,
+            ai_probe: Press::new(ai_probe),
+            ai_status,
+            ai_probe_result: Arc::new(Mutex::new(None)),
+            ai_probe_running: Cell::new(false),
         };
         preferences.update_readouts();
         preferences
@@ -1301,6 +1411,65 @@ impl Preferences {
             save("pause_when_microphone_busy", if on { "true" } else { "false" });
             needs_restart = true;
             changed = true;
+        }
+
+        // The AI layer reads its settings fresh from a `Mutex` on every
+        // question (`ai::configure`, called by `save_ai` above), so none
+        // of this needs a restart.
+        if let Some(on) = self.ai_enabled.toggled() {
+            let backend = if on { self.ai_backend.value() } else { String::new() };
+            save_ai("backend", &config::toml_string(&backend));
+            changed = true;
+        }
+        if let Some(backend) = self.ai_backend.changed() {
+            if self.ai_enabled.on() {
+                save_ai("backend", &config::toml_string(&backend));
+            }
+            changed = true;
+        }
+        if let Some(uses) = self.ai_use.changed() {
+            // Already a valid TOML array literal — see the popup's own
+            // values, both of them lists of purposes.
+            save_ai("use", &uses);
+            changed = true;
+        }
+        // Committed once the field is no longer being edited, the same way
+        // `search_engine`'s field would be if it had one — no restart, and
+        // no key-watcher: a limit typed wrong just does not parse yet.
+        if !self.is_editing(&self.ai_daily_limit) {
+            let typed = self.ai_daily_limit.stringValue().to_string();
+            if typed.trim() != self.last_ai_daily_limit.borrow().trim() {
+                if let Ok(limit) = typed.trim().parse::<u32>() {
+                    save_ai("daily_limit", &limit.to_string());
+                    *self.last_ai_daily_limit.borrow_mut() = typed;
+                    changed = true;
+                }
+            }
+        }
+        if self.ai_probe.clicked() && !self.ai_probe_running.get() {
+            self.ai_probe_running.set(true);
+            self.ai_status.setStringValue(&NSString::from_str("Probando…"));
+            let result = Arc::clone(&self.ai_probe_result);
+            std::thread::spawn(move || {
+                let started = std::time::Instant::now();
+                let outcome =
+                    crate::ai::ask("Responde solo con OK.", crate::ai::Purpose::Questions);
+                let text = match outcome {
+                    Ok(_) => format!("Responde correctamente ({} ms).", started.elapsed().as_millis()),
+                    Err(why) => why.to_string(),
+                };
+                if let Ok(mut slot) = result.lock() {
+                    *slot = Some(text);
+                }
+            });
+            changed = true;
+        }
+        if let Ok(mut slot) = self.ai_probe_result.lock() {
+            if let Some(text) = slot.take() {
+                self.ai_status.setStringValue(&NSString::from_str(&text));
+                self.ai_probe_running.set(false);
+                changed = true;
+            }
         }
 
         // A click on the shortcut button starts capture. NSButton counts
@@ -1655,6 +1824,19 @@ fn save_audio(key: &str, value: &str) {
         crate::journal::write(&format!("could not save audio.{key}: {e}"));
     } else {
         crate::journal::write(&format!("audio.{key} = {value}"));
+    }
+}
+
+/// Saves a key in `[ai]`, and reloads `ai::configure` so it takes effect
+/// on the very next question — the AI layer, unlike most of this window,
+/// reads its settings fresh from a `Mutex` rather than once at startup,
+/// which is exactly what `ai::configure`'s own doc comment says it is for.
+fn save_ai(key: &str, value: &str) {
+    if let Err(e) = config::set_table_option("ai", key, value) {
+        crate::journal::write(&format!("could not save ai.{key}: {e}"));
+    } else {
+        crate::journal::write(&format!("ai.{key} = {value}"));
+        crate::ai::configure(&config::load());
     }
 }
 

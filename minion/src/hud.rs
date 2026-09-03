@@ -43,9 +43,10 @@ const HEIGHT: f64 = 90.0;
 const MARGIN: f64 = 10.0;
 /// Corner radius of the panel itself, in points.
 const CORNER_RADIUS: f64 = 14.0;
-/// How long the panel stays up after the last thing it was told about,
-/// with nothing keeping it open (dictation, a pending question, being
-/// pinned).
+/// How long the panel stays up in tests, standing in for the configured
+/// `hud_seconds` — production code always gets a resolved value from
+/// `config::Config::hud_seconds`, via [`Hud::new`].
+#[cfg(test)]
 const HUD_SECONDS: f64 = 4.0;
 /// The face, drawn at this height in points — a third of the menu bar
 /// icon's pixel height, which is right for a panel this size.
@@ -112,10 +113,6 @@ struct Visibility {
 }
 
 impl Visibility {
-    fn new() -> Self {
-        Self::with_hud_seconds(HUD_SECONDS)
-    }
-
     fn with_hud_seconds(hud_seconds: f64) -> Self {
         Self { hud_seconds, ..Self::default() }
     }
@@ -548,13 +545,13 @@ mod tests {
 
     #[test]
     fn hidden_until_something_happens() {
-        let state = Visibility::new();
+        let state = Visibility::with_hud_seconds(HUD_SECONDS);
         assert!(!state.visible(t(0)));
     }
 
     #[test]
     fn showing_after_being_heard_and_hiding_again_later() {
-        let mut state = Visibility::new();
+        let mut state = Visibility::with_hud_seconds(HUD_SECONDS);
         let heard_at = t(0);
         state.note_heard(heard_at);
         assert!(state.visible(heard_at));
@@ -564,7 +561,7 @@ mod tests {
 
     #[test]
     fn stays_open_while_dictating_no_matter_how_long() {
-        let mut state = Visibility::new();
+        let mut state = Visibility::with_hud_seconds(HUD_SECONDS);
         state.note_heard(t(0));
         state.set_dictating(true);
         assert!(state.visible(t(1000)));
@@ -574,7 +571,7 @@ mod tests {
 
     #[test]
     fn stays_open_while_the_ai_layer_is_busy() {
-        let mut state = Visibility::new();
+        let mut state = Visibility::with_hud_seconds(HUD_SECONDS);
         state.note_heard(t(0));
         state.set_busy(true);
         assert!(state.visible(t(1000)));
@@ -584,7 +581,7 @@ mod tests {
 
     #[test]
     fn stays_open_while_a_question_is_pending() {
-        let mut state = Visibility::new();
+        let mut state = Visibility::with_hud_seconds(HUD_SECONDS);
         state.note_heard(t(0));
         state.set_question_pending(true);
         assert!(state.visible(t(1000)));
@@ -594,7 +591,7 @@ mod tests {
 
     #[test]
     fn pinned_from_settings_never_hides() {
-        let mut state = Visibility::new();
+        let mut state = Visibility::with_hud_seconds(HUD_SECONDS);
         state.set_pinned(true);
         assert!(state.visible(t(0)));
         assert!(state.visible(t(100_000)));
@@ -602,7 +599,7 @@ mod tests {
 
     #[test]
     fn hide_command_overrides_recent_activity() {
-        let mut state = Visibility::new();
+        let mut state = Visibility::with_hud_seconds(HUD_SECONDS);
         state.note_heard(t(0));
         state.hide_forced();
         assert!(!state.visible(t(0)));
@@ -610,7 +607,7 @@ mod tests {
 
     #[test]
     fn hide_command_does_not_survive_the_next_thing_heard() {
-        let mut state = Visibility::new();
+        let mut state = Visibility::with_hud_seconds(HUD_SECONDS);
         state.hide_forced();
         state.note_heard(t(1));
         assert!(state.visible(t(1)));
@@ -618,7 +615,7 @@ mod tests {
 
     #[test]
     fn show_command_behaves_like_something_was_heard() {
-        let mut state = Visibility::new();
+        let mut state = Visibility::with_hud_seconds(HUD_SECONDS);
         state.show_forced(t(0));
         assert!(state.visible(t(0)));
         assert!(!state.visible(t(HUD_SECONDS as u64 + 1)));
@@ -626,7 +623,7 @@ mod tests {
 
     #[test]
     fn hide_command_does_not_defeat_being_pinned() {
-        let mut state = Visibility::new();
+        let mut state = Visibility::with_hud_seconds(HUD_SECONDS);
         state.set_pinned(true);
         state.hide_forced();
         assert!(state.visible(t(0)));
