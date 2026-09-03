@@ -49,7 +49,7 @@ pub fn set(enabled: bool) -> Result<(), String> {
     <key>RunAtLoad</key>        <true/>
     <key>KeepAlive</key>
     <dict><key>SuccessfulExit</key><false/></dict>
-    <key>ThrottleInterval</key> <integer>10</integer>
+    <key>ThrottleInterval</key> <integer>30</integer>
     <key>StandardOutPath</key>  <string>{home}/Library/Logs/minion-launch.log</string>
     <key>StandardErrorPath</key><string>{home}/Library/Logs/minion-launch.log</string>
 </dict>

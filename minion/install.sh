@@ -36,7 +36,9 @@ cat > "$AGENT" <<PLIST
     <!-- Restart if it ever crashes, but not in a tight loop. -->
     <key>KeepAlive</key>
     <dict><key>SuccessfulExit</key><false/></dict>
-    <key>ThrottleInterval</key> <integer>10</integer>
+    <!-- 30 s: long enough that a start that fails on a problem only the
+         user can fix does not turn into a dialog every ten seconds. -->
+    <key>ThrottleInterval</key> <integer>30</integer>
     <!-- Not minion.log: Minion writes every line there itself, and
          pointing stdout at the same file printed each line twice. -->
     <key>StandardOutPath</key>  <string>$HOME/Library/Logs/minion-launch.log</string>

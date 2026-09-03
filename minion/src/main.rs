@@ -957,6 +957,60 @@ fn claim_sole_instance() -> bool {
     locked
 }
 
+/// When this Mac last started, in seconds since the epoch.
+///
+/// Used as the name of the current login session: it changes at every
+/// boot and at nothing else, so a marker carrying it says "already done
+/// this time round" without needing a timer or a file to clean up.
+fn boot_time() -> Option<i64> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_BOOTTIME];
+    let mut boot = libc::timeval { tv_sec: 0, tv_usec: 0 };
+    let mut size = std::mem::size_of::<libc::timeval>();
+    let read = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as u32,
+            std::ptr::addr_of_mut!(boot).cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (read == 0).then_some(boot.tv_sec)
+}
+
+/// Where the "I already opened the Accessibility pane" marker lives.
+fn accessibility_marker() -> Option<std::path::PathBuf> {
+    let mut path = config::path()?;
+    path.set_file_name("accessibility-prompted");
+    Some(path)
+}
+
+/// Whether the marker was written during this same boot.
+///
+/// Pure so the policy can be tested without a filesystem: an unreadable or
+/// missing marker, or one from a previous boot, means "not yet".
+fn prompted_this_boot(marker: Option<&str>, boot: Option<i64>) -> bool {
+    match (marker, boot) {
+        (Some(written), Some(now)) => written.trim().parse::<i64>() == Ok(now),
+        _ => false,
+    }
+}
+
+/// Records that the pane has been opened during this boot.
+fn remember_accessibility_prompt(boot: Option<i64>) {
+    if cfg!(test) {
+        return;
+    }
+    let (Some(path), Some(boot)) = (accessibility_marker(), boot) else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, boot.to_string());
+}
+
 /// Says plainly whether the key-pressing commands can work at all.
 ///
 /// Worth its own step because the failure is invisible: without the
@@ -981,7 +1035,17 @@ fn report_permissions() {
          Privacy & Security → Accessibility. Then restart Minion from the\n  \
          menu bar: the permission is only read at startup.\n"
     );
+    // Once per login, not once per start. The launch agent restarts Minion
+    // whenever it exits badly, and each restart used to throw System
+    // Settings in the user's face again.
+    let boot = boot_time();
+    let marker = accessibility_marker().and_then(|path| std::fs::read_to_string(path).ok());
+    if prompted_this_boot(marker.as_deref(), boot) {
+        note!("Accessibility pane already offered since this Mac started; not reopening it.");
+        return;
+    }
     actions::open_accessibility_settings();
+    remember_accessibility_prompt(boot);
 }
 
 /// Stops, having said why.
@@ -1126,4 +1190,36 @@ fn main() -> Result<()> {
     }
 
     run_menu_bar(active, play_sounds, log_ignored, training, acted, catalogue_asked)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_marker_from_this_boot_stops_the_pane_reopening() {
+        assert!(prompted_this_boot(Some("1725350400"), Some(1_725_350_400)));
+        assert!(prompted_this_boot(Some("1725350400\n"), Some(1_725_350_400)));
+    }
+
+    #[test]
+    fn a_marker_from_a_previous_boot_does_not_count() {
+        assert!(!prompted_this_boot(Some("1725350400"), Some(1_725_360_000)));
+    }
+
+    #[test]
+    fn no_marker_and_no_boot_time_mean_offer_it() {
+        assert!(!prompted_this_boot(None, Some(1_725_350_400)));
+        assert!(!prompted_this_boot(Some("1725350400"), None));
+        assert!(!prompted_this_boot(Some("not a number"), Some(1_725_350_400)));
+    }
+
+    #[test]
+    fn the_boot_time_is_a_plausible_moment_in_the_past() {
+        // It must be stable across calls, or it would be useless as the
+        // name of a login session.
+        let boot = boot_time().expect("macOS knows when it started");
+        assert!(boot > 1_000_000_000, "the epoch is not a boot time");
+        assert_eq!(Some(boot), boot_time(), "it must not move while running");
+    }
 }
