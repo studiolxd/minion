@@ -11,6 +11,15 @@ cd minion
 
 Then say «minion, abre Chrome».
 
+Runs applications, closes tabs, dictates text and lets you edit it by
+voice, sets timers and alarms, creates reminders and calendar events, reads
+your screen or clipboard aloud, runs Apple Shortcuts and your own named
+macros, searches the web with a named engine, snaps windows and toggles
+system settings, answers spoken questions, and can be driven from a
+terminal or a launcher with `minion run`/`minion say`. See
+[minion/README.md](minion/README.md) for all of it, in the exact phrases
+it understands.
+
 ## How it got here
 
 Three attempts, two of them retired. Their code is in the history rather
