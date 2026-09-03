@@ -746,6 +746,10 @@ fn run_menu_bar(
     let learn = MenuItem::new("Aprender", true, None);
     let show_log = MenuItem::new("Ver el registro", true, None);
 
+    // The wake word, a learned alias and a voice profile are all read once
+    // at startup, so three different places tell the user to restart
+    // Minion from the menu. Until now the menu had no such item.
+    let restart = MenuItem::new("Reiniciar", true, None);
     let commands_item = MenuItem::new("Ayuda", true, None);
     let preferences = MenuItem::new("Preferencias…", true, None);
 
@@ -763,6 +767,7 @@ fn run_menu_bar(
     menu.append(&PredefinedMenuItem::separator())?;
     // Help sits with Quit rather than among the working items: it is where
     // you look when you do not know what to do, not part of the routine.
+    menu.append(&restart)?;
     menu.append(&commands_item)?;
     menu.append(&quit)?;
 
@@ -771,6 +776,7 @@ fn run_menu_bar(
     let preferences_id = preferences.id().clone();
     let commands_id = commands_item.id().clone();
     let show_log_id = show_log.id().clone();
+    let restart_id = restart.id().clone();
     let quit_id = quit.id().clone();
 
     // Built once and reused: reopening should bring back the same window,
@@ -910,7 +916,8 @@ fn run_menu_bar(
                     Ok(n) if n > 0 => {
                         note!("learned {n} alias(es) from the log");
                         actions::show_message(&format!(
-                            "Añadidos {n}. Reinicia Minion para que se apliquen."
+                            "Añadidos {n}. Reinicia Minion desde el menú para que \
+                             se apliquen."
                         ));
                     }
                     Ok(_) => {}
@@ -1002,6 +1009,12 @@ fn run_menu_bar(
                 if let Some(path) = journal::path() {
                     actions::reveal(&path.to_string_lossy());
                 }
+            } else if event.id == restart_id {
+                note!("restarting from the menu");
+                relaunch();
+                // Zero: a restart asked for is not a crash, and the launch
+                // agent must not race the copy that was just started.
+                std::process::exit(0);
             } else if event.id == quit_id {
                 note!("quit from the menu");
                 std::process::exit(0);
@@ -1011,6 +1024,43 @@ fn run_menu_bar(
 
     app.run();
     Ok(())
+}
+
+/// How to start a fresh copy of Minion, as a command and its arguments.
+///
+/// Inside a bundle it has to be `open -n` on the `.app` rather than the
+/// binary: run directly, the executable loses its Info.plist, and with it
+/// the accessory activation policy — a Dock icon appears and the menu bar
+/// item does not.
+///
+/// Split out from [`relaunch`] so the shape can be checked without
+/// starting anything.
+fn relaunch_arguments(executable: &Path) -> Vec<std::path::PathBuf> {
+    let bundle = executable
+        .ancestors()
+        .find(|path| path.extension().is_some_and(|kind| kind == "app"));
+    match bundle {
+        Some(app) => vec!["/usr/bin/open".into(), "-n".into(), app.to_path_buf()],
+        None => vec![executable.to_path_buf()],
+    }
+}
+
+/// Starts a fresh copy, a moment after this one has gone.
+///
+/// The wait is not politeness: the single-instance lock is held by an open
+/// file descriptor and only released when the process ends, so a copy that
+/// starts too early finds the lock taken and quietly exits, leaving no
+/// Minion at all. The paths are passed as arguments rather than
+/// interpolated into the script, so nothing about them can be read as
+/// shell.
+fn relaunch() {
+    let Ok(executable) = std::env::current_exe() else {
+        return;
+    };
+    let mut command = std::process::Command::new("/bin/sh");
+    command.arg("-c").arg(r#"sleep 2; exec "$0" "$@""#);
+    command.args(relaunch_arguments(&executable));
+    let _ = command.spawn();
 }
 
 /// Refuses to start if another copy is already running.
@@ -1344,6 +1394,25 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bundled_minion_restarts_through_its_bundle() {
+        let inside = Path::new("/Applications/Minion.app/Contents/MacOS/minion");
+        assert_eq!(
+            relaunch_arguments(inside),
+            vec![
+                std::path::PathBuf::from("/usr/bin/open"),
+                std::path::PathBuf::from("-n"),
+                std::path::PathBuf::from("/Applications/Minion.app"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_bare_binary_restarts_itself() {
+        let built = Path::new("/Users/someone/minion/target/release/minion");
+        assert_eq!(relaunch_arguments(built), vec![built.to_path_buf()]);
+    }
 
     #[test]
     fn a_marker_from_this_boot_stops_the_pane_reopening() {
