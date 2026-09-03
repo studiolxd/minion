@@ -188,6 +188,14 @@ pub struct Config {
     /// reported in the log, at startup, the same as an alias with no
     /// command to point at.
     pub search_engine: Option<String>,
+
+    /// Post a Notification Center banner for answers, timers and blocked
+    /// commands — see `notify.rs`.
+    ///
+    /// On by default: with `speak = false` and the menu bar out of sight,
+    /// a timer or a "¿qué suena?" would otherwise have nowhere to land.
+    #[serde(default = "yes")]
+    pub notifications: bool,
 }
 
 /// How Minion decides when to listen.
@@ -294,6 +302,7 @@ impl Default for Config {
             pause_during: None,
             macros: Vec::new(),
             search_engine: None,
+            notifications: true,
         }
     }
 }
@@ -853,6 +862,14 @@ mod tests {
         assert!(default.sounds);
         let quiet: Config = toml::from_str("sounds = false").expect("should parse");
         assert!(!quiet.sounds);
+    }
+
+    #[test]
+    fn notifications_are_on_by_default_and_can_be_turned_off() {
+        let default: Config = toml::from_str("").expect("empty config should parse");
+        assert!(default.notifications);
+        let quiet: Config = toml::from_str("notifications = false").expect("should parse");
+        assert!(!quiet.notifications);
     }
 
     #[test]

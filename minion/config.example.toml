@@ -58,6 +58,10 @@
 # Stays quiet for commands either way. On by default.
 # speak = true
 
+# Post a Notification Center banner for answers (when speak = false),
+# finished timers and blocked commands. On by default.
+# notifications = true
+
 # Which system voice to use. Empty picks a Spanish one automatically.
 # voice = "Mónica"
 
