@@ -106,9 +106,10 @@ was considered and rejected on that data.
   is the only record of what killed it), tray-first model download (icon
   exists before the 670 MB fetch starts, so the menu bar is never empty),
   «Reiniciar», and a stateful tooltip (listening/paused, last utterance and
-  outcome). A `session.rs` module — the session state machine behind
-  `listen_and_obey`, pure and tested — is being extracted from it right now
-  in a parallel worktree; expect `listen_and_obey` to shrink around it.
+  outcome). The per-utterance state machine (dictation mode, undo, repeat,
+  chain splitting) lives in `session.rs` as `Session::interpret()` →
+  `Outcome`, pure and unit-tested; `main.rs` matches on the outcome and
+  does the IO.
 - `audio.rs` — cpal capture, resample through a windowed-sinc anti-alias
   filter before decimating to 16 kHz (the naive decimator folded 8–24 kHz
   into 0–8 kHz, which is where fricatives live — "Chrome" and "Safari"
