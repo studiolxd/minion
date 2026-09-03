@@ -956,8 +956,13 @@ impl Preferences {
         // Committed when the field is done being edited, not on every poll:
         // typing "casa" through a poll that fires between letters used to
         // save "c", "ca", "cas" and put up a restart dialog for each one.
+        // Also settled once the window is no longer the key one: closing it
+        // or clicking the menu bar with the field still focused leaves the
+        // field editor in place, and the word would otherwise never be
+        // saved — a restart from the menu then lost it entirely.
         let entered = self.entered.replace(false);
-        let settled = entered || !self.is_editing(&self.wake_word);
+        let settled =
+            entered || !self.is_editing(&self.wake_word) || !self.window.isKeyWindow();
         let typed_wake = self.wake_word.stringValue().to_string();
         let wake_changed = typed_wake.trim() != self.last_wake_word.borrow().trim();
         if settled && wake_changed && !typed_wake.trim().is_empty() {

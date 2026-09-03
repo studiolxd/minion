@@ -864,9 +864,27 @@ fn run_menu_bar(
     let report_for_timer = Rc::clone(&report);
     let sounds_for_timer = Arc::clone(&sounds_on);
     let voices_for_timer = Arc::clone(&log_voices_on);
+    let restart_requested = Arc::new(AtomicBool::new(false));
+    let quit_requested = Arc::new(AtomicBool::new(false));
+    let restart_for_timer = Arc::clone(&restart_requested);
+    let quit_for_timer = Arc::clone(&quit_requested);
     let repaint = RcBlock::new(move |_timer: NonNull<NSTimer>| {
         if open_for_timer.swap(false, Ordering::Relaxed) {
             panel_for_timer.show();
+        }
+        // Leaving, by restart or quit: let the settings window save what
+        // it still holds (a wake word typed but not yet committed) first.
+        let restarting = restart_for_timer.swap(false, Ordering::Relaxed);
+        let quitting = quit_for_timer.swap(false, Ordering::Relaxed);
+        if restarting || quitting {
+            panel_for_timer.poll();
+            if restarting {
+                note!("restarting from the menu");
+                relaunch();
+            }
+            // Zero: neither is a crash, and the launch agent must not race
+            // the copy that was just started.
+            std::process::exit(0);
         }
         // Voice training: the window asks, the listening loop answers.
         if panel_for_timer.take_training_request() {
@@ -998,6 +1016,8 @@ fn run_menu_bar(
     // and the item's text are repainted by the timer above, not from here.
     let open_from_menu = Arc::clone(&open_requested);
     let learn_from_menu = Arc::clone(&learn_requested);
+    let restart_from_menu = Arc::clone(&restart_requested);
+    let quit_from_menu = Arc::clone(&quit_requested);
     let catalogue_from_menu = Arc::clone(&catalogue_requested);
     std::thread::spawn(move || {
         let events = MenuEvent::receiver();
@@ -1021,14 +1041,13 @@ fn run_menu_bar(
                     actions::reveal(&path.to_string_lossy());
                 }
             } else if event.id == restart_id {
-                note!("restarting from the menu");
-                relaunch();
-                // Zero: a restart asked for is not a crash, and the launch
-                // agent must not race the copy that was just started.
-                std::process::exit(0);
+                // Handed to the timer: it can flush the settings window
+                // first, and a word still being typed there was otherwise
+                // lost to the restart meant to apply it.
+                restart_from_menu.store(true, Ordering::Relaxed);
             } else if event.id == quit_id {
                 note!("quit from the menu");
-                std::process::exit(0);
+                quit_from_menu.store(true, Ordering::Relaxed);
             }
         }
     });
