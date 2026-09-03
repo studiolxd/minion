@@ -19,8 +19,13 @@ use crate::text::{keywords, normalise, similarity};
 /// "miñón", "minial", "mini" — normalisation flattens the accents but not
 /// the rest. Anything close enough is accepted anyway; see
 /// [`sounds_like_wake_word`].
+///
+/// "minium" and "minial" are two edits from the name and are here rather
+/// than reachable by tolerance: at two edits "mínimo" and "mínima" come
+/// too. "minio" is gone for the same reason — it is one edit from
+/// "mínimo", and "minio" itself is still one edit from "minion".
 pub const DEFAULT_WAKE_WORDS: &[&str] =
-    &["minion", "minions", "minon", "miñon", "minial", "mini", "minio"];
+    &["minion", "minions", "minon", "minial", "mini", "minium"];
 
 /// Set once at startup from the configuration file. Absent means defaults.
 static USER_APPS: OnceLock<Vec<App>> = OnceLock::new();
@@ -41,6 +46,17 @@ pub fn configure(config: &Config) {
     }
     let aliases = config.extra_aliases();
     if !aliases.is_empty() {
+        // An alias whose command does not exist can never fire. Said now,
+        // once, rather than leaving the user to wonder in front of a
+        // microphone that answers nothing.
+        let own: &[Command] = USER_COMMANDS.get().map_or(&[], Vec::as_slice);
+        for (name, phrase) in &aliases {
+            if resolve_target(name, own) == Target::Unknown {
+                crate::journal::write(&format!(
+                    "Ignoring alias «{phrase}»: no command is called «{name}»"
+                ));
+            }
+        }
         let _ = USER_ALIASES.set(aliases);
     }
     if let Some(words) = config.wake_words() {
@@ -49,6 +65,45 @@ pub fn configure(config: &Config) {
     if let Some(threshold) = config.threshold {
         let _ = USER_THRESHOLD.set(threshold.clamp(0.3, 1.0));
     }
+}
+
+/// Where the command an alias points at lives, if it exists at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target {
+    /// One of the built-in commands.
+    Global,
+    /// One that only exists inside particular applications.
+    Contextual,
+    /// One the user declared in `[[commands]]`.
+    User,
+    /// Nothing of that name: the alias can never fire.
+    Unknown,
+}
+
+/// Resolves the name an alias points at.
+///
+/// Commands are identified by their name, spelled out in the log and
+/// copied into the configuration by hand, so a misspelling ("atras" for
+/// "atrás") produces an alias that silently never fires. Checked at
+/// startup instead, where it can be said out loud.
+pub fn resolve_target(name: &str, user_commands: &[Command]) -> Target {
+    if COMMANDS.iter().any(|c| c.name == name) {
+        Target::Global
+    } else if user_commands.iter().any(|c| c.name == name) {
+        Target::User
+    } else if CONTEXTUAL_COMMANDS.iter().any(|c| c.name == name) {
+        Target::Contextual
+    } else {
+        Target::Unknown
+    }
+}
+
+/// The command with this name, built in or the user's own.
+fn named_command(name: &str) -> Option<&'static Command> {
+    COMMANDS
+        .iter()
+        .chain(USER_COMMANDS.get().into_iter().flatten())
+        .find(|c| c.name == name)
 }
 
 /// Wake words in force: the user's if configured, otherwise the defaults.
@@ -486,25 +541,26 @@ pub enum Decision {
 /// often enough that whole sentences were being discarded after being
 /// understood perfectly.
 ///
-/// The tolerance is bounded — two edits at most, and the first two letters
-/// must agree — so an ordinary word cannot open a command by accident.
+/// The tolerance is bounded — one edit, and the first four letters must
+/// agree — so an ordinary word cannot open a command by accident. Two
+/// edits were tried and had to go: "mínimo", "mínima", "minie" and
+/// "minuto" all reached "minion" that way, and "Minuto abre Chrome"
+/// opened Chrome. What the recogniser really writes two edits away is
+/// listed above instead, which is explicit and cannot spread.
 fn sounds_like_wake_word(word: &str) -> bool {
     let words = wake_words();
     if words.contains(&word) {
         return true;
     }
     words.iter().any(|wake| {
-        let shortest = word.len().min(wake.len());
-        if shortest < 4 {
+        // Short wake words have no room for tolerance: "mini" is one edit
+        // from "mina", "mino" and "mixi", all of them ordinary speech.
+        if wake.chars().count() < 5 || word.chars().count() < 4 {
             return false;
         }
-        // Three letters of shared opening. Two was not enough: "millón"
-        // is two edits from "minion" and starts with "mi", so half of
-        // "un millón de gracias" would have opened a command.
-        let prefix = 3.min(wake.len().saturating_sub(1)).max(1);
-        let same_start = word.chars().take(prefix).eq(wake.chars().take(prefix));
-        let allowance = if shortest >= 5 { 2 } else { 1 };
-        same_start && crate::text::edits_between(word, wake) <= allowance
+        const PREFIX: usize = 4;
+        let same_start = word.chars().take(PREFIX).eq(wake.chars().take(PREFIX));
+        same_start && crate::text::edits_between(word, wake) <= 1
     })
 }
 
@@ -513,30 +569,27 @@ fn sounds_like_wake_word(word: &str) -> bool {
 /// Handles the wake word arriving as two words. The recogniser splits
 /// "Minion" into "Mini on" often enough to matter, and the stray half then
 /// sits at the front of the command and stops it matching anything.
-fn strip_wake_word(phrase: &str) -> Option<&str> {
+pub fn strip_wake_word(phrase: &str) -> Option<&str> {
     let mut words = phrase.split_whitespace();
     let first = words.next()?;
-    if !sounds_like_wake_word(first) {
-        return None;
-    }
     let rest = phrase[first.len()..].trim();
 
-    // If the first word was only part of the wake word, the next one may
-    // be the remainder rather than the start of the command.
-    let Some(second) = words.next() else {
-        return Some(rest);
-    };
-    let joined = format!("{first}{second}");
-    let split_wake = wake_words()
-        .iter()
-        .any(|wake| joined == *wake || crate::text::edits_between(&joined, wake) <= 1);
-
-    // Only when joining actually produces the wake word: "mini on" does,
-    // "minion abre" does not.
-    if split_wake {
-        return Some(rest[second.len()..].trim());
+    // The two halves of a split wake word are tried before the first word
+    // on its own: "mine" is not close enough to "minion" to be accepted by
+    // itself, and it should not be — only "mine on" is.
+    if let Some(second) = words.next() {
+        let joined = format!("{first}{second}");
+        let split_wake = wake_words()
+            .iter()
+            .any(|wake| joined == *wake || crate::text::edits_between(&joined, wake) <= 1);
+        // Only when joining actually produces the wake word: "mini on"
+        // does, "minion abre" does not.
+        if split_wake {
+            return Some(rest[second.len()..].trim());
+        }
     }
-    Some(rest)
+
+    sounds_like_wake_word(first).then_some(rest)
 }
 
 /// Reads "otra vez", "repite", "hazlo tres veces" and the like.
@@ -562,12 +615,36 @@ fn repeat_request(rest: &str) -> Option<usize> {
     Some(times.min(MAX_REPEATS))
 }
 
+/// Whether the sentence asks for what follows to be typed out.
+///
+/// Wake word, then a dictation verb. Everything after that is content, so
+/// nothing in it may be read as a command — chaining included.
+fn is_dictation_phrase(transcript: &str) -> bool {
+    let words: Vec<&str> = transcript.split_whitespace().collect();
+    let (Some(first), Some(second)) = (words.first(), words.get(1)) else {
+        return false;
+    };
+    if !wake_words().contains(&normalise(first).as_str()) {
+        return false;
+    }
+    let verb = spanish::canonical_verb(&normalise(second)).to_string();
+    DICTATION_VERBS.contains(&verb.as_str())
+}
+
 /// Splits a sentence that holds more than one instruction.
 ///
 /// The wake word is carried onto each part, since only the first was
 /// spoken with it: "minion cierra la pestaña y luego recarga" becomes
 /// two sentences that each stand on their own.
-pub fn split_chain(transcript: &str) -> Vec<String> {
+///
+/// Nothing is split while dictating, and nothing is split unless the first
+/// half is itself an instruction — it opens with the wake word and is not
+/// a dictation. Otherwise "escribe hola y luego adiós" lost its text and
+/// the words the user was dictating came back as commands.
+pub fn split_chain(transcript: &str, dictating: bool) -> Vec<String> {
+    if dictating {
+        return vec![transcript.to_string()];
+    }
     let lowered = transcript.to_lowercase();
     let Some(joiner) = CHAIN_JOINERS.iter().find(|j| lowered.contains(*j)) else {
         return vec![transcript.to_string()];
@@ -582,9 +659,14 @@ pub fn split_chain(transcript: &str) -> Vec<String> {
     let Some(wake) = head.split_whitespace().next() else {
         return vec![transcript.to_string()];
     };
+    // Only an instruction can be chained: the head has to be addressed to
+    // Minion, and must not be dictation.
+    if strip_wake_word(&normalise(&head)).is_none() || is_dictation_phrase(&head) {
+        return vec![transcript.to_string()];
+    }
     let mut parts = vec![head.clone()];
     // The rest may itself be a chain.
-    for piece in split_chain(&format!("{wake} {tail}")) {
+    for piece in split_chain(&format!("{wake} {tail}"), false) {
         parts.push(piece);
     }
     parts
@@ -617,20 +699,15 @@ fn music_query(transcript: &str) -> Option<String> {
 /// them is content, however much it looks like a command.
 fn dictation_text(transcript: &str) -> Option<String> {
     let words: Vec<&str> = transcript.split_whitespace().collect();
-    if words.len() < 3 {
-        return None;
-    }
-    if !wake_words().contains(&normalise(words[0]).as_str()) {
-        return None;
-    }
-    let verb = spanish::canonical_verb(&normalise(words[1])).to_string();
-    if !DICTATION_VERBS.contains(&verb.as_str()) {
+    if words.len() < 3 || !is_dictation_phrase(transcript) {
         return None;
     }
     let text = words[2..].join(" ");
-    // "pon la música" is a command, not a request to type "la música".
-    // Requiring some length keeps short phrases out of dictation.
-    (text.chars().count() >= 4).then_some(text)
+    // What the old four-character floor was guarding against — "pon la
+    // música" becoming a request to type "la música" — is now handled by
+    // the verb list, which holds no verb that opens a command as well.
+    // Any text at all is text: "minion escribe sí" means sí.
+    (!text.trim().is_empty()).then_some(text)
 }
 
 /// The browser in front, if the application in front is one.
@@ -688,17 +765,62 @@ fn find_website(transcript: &str, words: &[String]) -> Option<Website> {
         .map(|(_, url)| Website::Named((*url).to_string()))
 }
 
+/// Whether the words of `alias` appear, in order, as whole words of the
+/// sentence.
+///
+/// Whole words, not a substring: "mail" is inside "gmail" and "orca" is
+/// inside "mallorca", and both used to launch an application instead of
+/// opening the page that was asked for.
+fn names_alias(words: &[&str], alias: &str) -> bool {
+    let wanted: Vec<&str> = alias.split_whitespace().collect();
+    if wanted.is_empty() || wanted.len() > words.len() {
+        return false;
+    }
+    words.windows(wanted.len()).any(|window| window == wanted)
+}
+
+/// Whether `word` is the alias with another whole word stuck to it.
+///
+/// The recogniser runs words together — "abrecrome" is "abre" + "crome" —
+/// and the application name is still in there. The leftover has to be a
+/// word in its own right, which is what tells "abrecrome" apart from
+/// "editorial" ("editor" plus "ial") and "gmail" ("g" plus "mail").
+fn run_together(word: &str, alias: &str) -> bool {
+    if word.len() <= alias.len() {
+        return false;
+    }
+    let Some(at) = word.find(alias) else {
+        return false;
+    };
+    let head = &word[..at];
+    let tail = &word[at + alias.len()..];
+    let is_word = |part: &str| {
+        part.is_empty()
+            || spanish::is_known_verb(part)
+            || spanish::is_filler(part)
+            || sounds_like_wake_word(part)
+    };
+    is_word(head) && is_word(tail)
+}
+
 /// Finds an application named in the sentence, with its match score.
+///
+/// Only whole words count. Fuzziness lives in the alias lists instead:
+/// what the recogniser really writes ("shafari", "cromo") is listed, which
+/// is explicit and cannot reach a word that merely contains a name.
 fn find_app(rest: &str) -> Option<(&'static App, f32)> {
+    let words: Vec<&str> = rest.split_whitespace().collect();
     let mut best: Option<(&App, f32)> = None;
     for app in all_apps() {
         for alias in app.aliases {
-            // A literal mention beats a fuzzy one; longer aliases beat
+            // A plain mention beats a run-together one; longer aliases beat
             // shorter ones, so "vs code" wins over a stray "code".
-            let score = if rest.contains(alias) {
+            let score = if names_alias(&words, alias) {
                 0.9 + (alias.len() as f32 / 100.0).min(0.09)
+            } else if words.iter().any(|word| run_together(word, alias)) {
+                0.9
             } else {
-                similarity(rest, alias)
+                0.0
             };
             if score >= threshold() && best.is_none_or(|(_, b)| score > b) {
                 best = Some((app, score));
@@ -706,6 +828,16 @@ fn find_app(rest: &str) -> Option<(&'static App, f32)> {
         }
     }
     best
+}
+
+/// Whether the sentence names one of the known sites outright.
+///
+/// Checked before applications: a site's own name must not be eaten by an
+/// application alias that happens to be part of it.
+fn names_a_site(words: &[String]) -> bool {
+    words
+        .iter()
+        .any(|word| SITES.iter().any(|(name, _)| name == word))
 }
 
 /// Works out what a transcription means with no application context.
@@ -795,14 +927,24 @@ pub fn decide_in(transcript: &str, context: Option<&str>) -> (Decision, f32) {
         }
     }
 
-    // Phrasings the user added, or that were learned from the log.
+    // Phrasings the user added, or that were learned from the log. The
+    // target may be any command with that name, the user's own included.
     for (name, phrase) in USER_ALIASES.get().into_iter().flatten() {
         let score = similarity(rest, phrase);
         if score < threshold() || !best.is_none_or(|(_, b)| score > b) {
             continue;
         }
-        if let Some(command) = COMMANDS.iter().find(|c| c.name == *name) {
+        if let Some(command) = named_command(name) {
             best = Some((command, score));
+        } else if let Some(bundle) = context {
+            // A contextual command only exists where it applies, so this
+            // is the one place it can be reached by name.
+            if CONTEXTUAL_COMMANDS
+                .iter()
+                .any(|c| c.name == *name && c.bundles.contains(&bundle))
+            {
+                return (Decision::RunHere(name), score);
+            }
         }
     }
 
@@ -843,7 +985,15 @@ pub fn decide_in(transcript: &str, context: Option<&str>) -> (Decision, f32) {
     // A spelled-out domain does not need a verb in front. The recogniser
     // runs words together — "abremarca.com", "iramarca.com" — and there is
     // then no verb left to recognise, but the intent is unmistakable.
-    if find_app(rest).is_none() {
+    // Worked out once: the website route and the application route both
+    // need to know, and asking twice invites the two to disagree.
+    let app = if names_a_site(&spoken_words) {
+        None
+    } else {
+        find_app(rest)
+    };
+
+    if app.is_none() {
         match find_website(transcript, &spoken_words) {
             Some(Website::Domain(url)) => {
                 return (Decision::Browse { url, in_browser: browser_in_front(context) }, 0.9)
@@ -855,7 +1005,7 @@ pub fn decide_in(transcript: &str, context: Option<&str>) -> (Decision, f32) {
         }
     }
 
-    if let Some((app, score)) = find_app(rest) {
+    if let Some((app, score)) = app {
         let app_wins = best.is_none_or(|(_, b)| score > b);
         if asks_to_quit && app_wins {
             return (
@@ -982,11 +1132,6 @@ pub fn closest_command(phrase: &str) -> Option<(&'static str, f32)> {
         }
     }
     best
-}
-
-/// Whether a word is one of the wake words in force.
-pub fn is_wake_word(word: &str) -> bool {
-    sounds_like_wake_word(word)
 }
 
 /// The whole vocabulary, written out for someone to read.
@@ -1153,6 +1298,9 @@ mod tests {
             "Minión, ¿qué hora es?",
             "Minio abre chrome",
             "Miñón abre safari",
+            "Minions abre chrome",
+            "Minium abre chrome",
+            "Mine on abre chrome",
         ] {
             assert_ne!(
                 decide(spoken).0,
@@ -1181,12 +1329,21 @@ mod tests {
     #[test]
     fn an_ordinary_word_does_not_open_a_command() {
         // The tolerance has to stop somewhere, or conversation starts
-        // running things. Two edits and a shared opening is the limit.
+        // running things. One edit and four shared letters is the limit:
+        // everything in the second group used to open commands, and
+        // "minuto abre Chrome" really did open Chrome.
         for spoken in [
             "millón de gracias",
             "misión cumplida",
             "camión abre chrome",
             "opinión abre chrome",
+            "mínimo abre chrome",
+            "minuto abre chrome",
+            "mina abre chrome",
+            "minas abre chrome",
+            "minero abre chrome",
+            "mínima abre chrome",
+            "minie abre chrome",
         ] {
             assert_eq!(
                 decide(spoken).0,
@@ -1335,6 +1492,16 @@ mod tests {
     }
 
     #[test]
+    fn an_app_name_inside_a_word_is_not_that_app() {
+        // All three used to launch an application: "mail" is inside
+        // "gmail", "orca" inside "mallorca", "editor" inside "editorial".
+        browses("minion abre gmail", "https://mail.google.com");
+        browses("minion ve a gmail punto com", "https://gmail.com");
+        browses("minion ve a mallorca punto com", "https://mallorca.com");
+        assert_eq!(decision("minion abre el editorial"), Decision::Unrecognised);
+    }
+
+    #[test]
     fn applications_still_win_over_sites() {
         // Chrome is an app in the table; it must not become a web search.
         launches("minion abre chrome", "Chrome");
@@ -1439,6 +1606,16 @@ mod tests {
     }
 
     #[test]
+    fn a_short_dictation_is_still_a_dictation() {
+        // Four characters used to be the floor, so this was unrecognised.
+        types("Minion escribe sí", "sí");
+        types("Minion escribe no", "no");
+        // What that floor was guarding against still holds: a verb that
+        // also opens commands is not a dictation verb.
+        assert_eq!(decision("Minion pon la música."), Decision::Run("reproducir"));
+    }
+
+    #[test]
     fn dictated_text_is_never_matched_as_a_command() {
         // The whole point: everything after the verb is content, however
         // much it looks like something in the vocabulary.
@@ -1471,6 +1648,15 @@ mod tests {
             decision("Minion pon la siguiente canción."),
             Decision::Run("canción siguiente")
         );
+    }
+
+    #[test]
+    fn naming_the_music_opens_spotify() {
+        // "para" used to be dropped as a filler, which left "para la
+        // música" and "música" looking like the same thing.
+        launches("Minion música.", "Spotify");
+        launches("Minion la música.", "Spotify");
+        assert_eq!(decision("Minion para la música."), Decision::Run("pausar"));
     }
 
     #[test]
@@ -1582,12 +1768,12 @@ mod tests {
     #[test]
     fn splits_chained_instructions() {
         assert_eq!(
-            split_chain("Minion cierra la pestaña y luego recarga"),
+            split_chain("Minion cierra la pestaña y luego recarga", false),
             vec!["Minion cierra la pestaña", "Minion recarga"]
         );
         // Three in a row.
         assert_eq!(
-            split_chain("Minion copia esto y luego abre Chrome y después pega esto"),
+            split_chain("Minion copia esto y luego abre Chrome y después pega esto", false),
             vec![
                 "Minion copia esto",
                 "Minion abre Chrome",
@@ -1601,16 +1787,53 @@ mod tests {
         // Titles and dictated text are full of "y"; only explicit joiners
         // count, or "pon la canción tú y yo" would become two commands.
         assert_eq!(
-            split_chain("Minion pon la canción tú y yo"),
+            split_chain("Minion pon la canción tú y yo", false),
             vec!["Minion pon la canción tú y yo"]
         );
     }
 
     #[test]
+    fn dictated_text_is_never_chopped_into_commands() {
+        // The text is content: "y luego" belongs to it, not to Minion.
+        assert_eq!(
+            split_chain("Minion escribe hola y luego adiós", false),
+            vec!["Minion escribe hola y luego adiós"]
+        );
+        // And while dictating, nothing is a chain at all — this used to
+        // type "hola hola adiós".
+        assert_eq!(
+            split_chain("hola y luego adiós", true),
+            vec!["hola y luego adiós"]
+        );
+        // A sentence not addressed to Minion is left whole as well.
+        assert_eq!(
+            split_chain("quedamos y luego vemos", false),
+            vec!["quedamos y luego vemos"]
+        );
+    }
+
+    #[test]
     fn each_part_of_a_chain_still_resolves() {
-        let parts = split_chain("Minion cierra la pestaña y luego recarga");
+        let parts = split_chain("Minion cierra la pestaña y luego recarga", false);
         assert_eq!(decide(&parts[0]).0, Decision::Run("cerrar pestaña"));
         assert_eq!(decide(&parts[1]).0, Decision::Run("recargar"));
+    }
+
+    #[test]
+    fn an_alias_target_is_resolved_before_it_is_trusted() {
+        let own = [Command {
+            phrases: &["haz lo mio"],
+            name: "lo mío",
+            action: Action::Key(key::A, Mods::CMD),
+        }];
+        assert_eq!(resolve_target("guardar", &own), Target::Global);
+        assert_eq!(resolve_target("lo mío", &own), Target::User);
+        assert_eq!(resolve_target("interrumpir", &own), Target::Contextual);
+        // The whole point: a name that resolves to nothing is found now,
+        // not in silence at the microphone.
+        assert_eq!(resolve_target("atras", &own), Target::Unknown);
+        assert_eq!(resolve_target("atrás", &own), Target::Global);
+        assert_eq!(resolve_target("lo mio", &own), Target::Unknown);
     }
 
     #[test]

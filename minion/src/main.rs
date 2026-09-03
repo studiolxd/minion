@@ -437,7 +437,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
         let elapsed_ms = started.elapsed().as_millis();
 
         // One sentence can hold several instructions joined by "y luego".
-        for part in commands::split_chain(&transcript) {
+        for part in commands::split_chain(&transcript, dictating) {
             // Which application is in front decides what some phrases mean,
             // and it is read per instruction: the first of a chain may well
             // have changed which application that is.

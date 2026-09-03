@@ -35,11 +35,17 @@ pub fn normalise(input: &str) -> String {
 /// "cierra la ventana", "cerrar ventana" and "cierra ventana" all reduce to
 /// `[cerrar, ventana]`, which is what makes the table forgiving without
 /// listing every phrasing.
+///
+/// Verbs are canonicalised before fillers are dropped, because one word is
+/// both: "para" is a preposition and the imperative of "parar". Dropping
+/// first left "para la música" as just `[musica]`, so saying "minion,
+/// música" paused Spotify instead of opening it.
 pub fn keywords(phrase: &str) -> Vec<String> {
     phrase
         .split_whitespace()
+        .map(spanish::canonical_verb)
         .filter(|w| !spanish::is_filler(w))
-        .map(|w| spanish::canonical_verb(w).to_string())
+        .map(str::to_string)
         .collect()
 }
 
@@ -123,12 +129,18 @@ fn words_match(a: &str, b: &str, strict: bool) -> bool {
         return true;
     }
 
+    // A command of a single word has nothing around it to disambiguate,
+    // so it gets no slack at all: "contar" is one edit from "cortar" and
+    // used to run it at full confidence.
+    if strict {
+        return false;
+    }
+
     // Words shorter than four characters must match exactly: at that
     // length a single edit is a different word ("pon" and "son").
     if a.len().max(b.len()) < 4 {
         return false;
     }
-    let _ = strict;
     if edit_distance(a, b) <= 1 {
         return true;
     }
@@ -194,6 +206,19 @@ mod tests {
     }
 
     #[test]
+    fn a_one_word_command_gets_no_slack() {
+        // A single word carries the whole instruction, so a slip in it
+        // changes what happens: "corta esto" reduces to one keyword.
+        assert!(!words_match("contar", "cortar", true));
+        assert!(words_match("contar", "cortar", false));
+        // Equality and a run-together word are still enough.
+        assert!(words_match("cortar", "cortar", true));
+        assert!(words_match("abrecrome", "crome", true));
+        // The command it used to run, at full confidence.
+        assert!(similarity("contar esto", "corta esto") < 0.7);
+    }
+
+    #[test]
     fn normalises_recogniser_output() {
         assert_eq!(normalise("Ordenador, abre Chrome."), "ordenador abre chrome");
         assert_eq!(normalise("¿Qué tal estás?"), "que tal estas");
@@ -256,6 +281,8 @@ mod tests {
         assert_eq!(keywords("cierra la ventana"), vec!["cerrar", "ventana"]);
         assert_eq!(keywords("cerrar ventana"), vec!["cerrar", "ventana"]);
         assert_eq!(keywords("guarda esto"), vec!["guardar"]);
+        // "para" is a preposition and a verb; as a verb it must survive.
+        assert_eq!(keywords("para la musica"), vec!["parar", "musica"]);
     }
 
     #[test]
