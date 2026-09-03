@@ -117,14 +117,16 @@ impl Session {
 
         // Remember what could be taken back.
         //
-        // NOTE: a repeated command records only one repetition. "escribe
-        // hola" then "hazlo tres veces" types the text three times and
-        // "deshaz" removes the length of one. The same goes for a command
-        // macOS refused: it is recorded as undoable even though nothing
-        // happened. Both are the behaviour as it stands, kept on purpose.
+        // A repeated Type is typed once per repeat with nothing between
+        // the repeats (see the loop in main.rs's `report`, which calls
+        // `commands::perform` — and so `actions::type_text` — once per
+        // repeat with no separator), so undo must remove that many
+        // characters, not just one repeat's worth. A repeated Launch still
+        // only ever has one previous application to go back to, so it
+        // keeps a single undo regardless of `repeats`.
         match &decision {
             Decision::Type(text) => {
-                self.undoable = Some(Undoable::Typed(text.chars().count()));
+                self.undoable = Some(Undoable::Typed(text.chars().count() * repeats));
             }
             Decision::Launch { .. } => {
                 self.undoable = Some(Undoable::Launched {
@@ -140,6 +142,19 @@ impl Session {
         }
 
         Outcome::Perform { decision, repeats }
+    }
+
+    /// Discards whatever "deshaz lo que has hecho" would currently undo.
+    ///
+    /// `interpret` records a command as undoable the moment it is decided,
+    /// before it is carried out — it cannot know whether macOS will refuse
+    /// it. The caller finds that out afterwards, from `Done::succeeded`,
+    /// and should call this then so a refused command is not offered as
+    /// something to undo. `main.rs` should call `session.forget_undo()`
+    /// wherever it currently checks `!done.succeeded` in `report`.
+    #[allow(dead_code, reason = "called from main.rs, not yet wired in")]
+    pub fn forget_undo(&mut self) {
+        self.undoable = None;
     }
 
     /// Splits an utterance into the instructions it holds.
@@ -263,6 +278,46 @@ mod tests {
             Outcome::Undo(Some(Undoable::Launched {
                 previous: Some("com.apple.Safari".to_string())
             }))
+        );
+    }
+
+    #[test]
+    fn undo_after_a_repeated_type_removes_every_repeat() {
+        let mut session = Session::new();
+        let decision = decide("minion escribe hola");
+        session.interpret("minion escribe hola", decision, None);
+        session.interpret(
+            "minion hazlo tres veces",
+            Decision::Again(3),
+            None,
+        );
+        // "hola" is 4 characters, typed three times, with nothing typed
+        // between the repeats.
+        assert_eq!(
+            session.interpret("minion deshaz lo que has hecho", Decision::UndoLast, None),
+            Outcome::Undo(Some(Undoable::Typed(12)))
+        );
+    }
+
+    #[test]
+    fn forget_undo_clears_what_deshaz_would_take_back() {
+        let mut session = Session::new();
+        let decision = decide("minion abre Chrome");
+        session.interpret("minion abre Chrome", decision, Some("com.apple.Safari"));
+        session.forget_undo();
+        assert_eq!(
+            session.interpret("minion deshaz lo que has hecho", Decision::UndoLast, None),
+            Outcome::Undo(None)
+        );
+    }
+
+    #[test]
+    fn forget_undo_on_an_empty_session_does_nothing_harmful() {
+        let mut session = Session::new();
+        session.forget_undo();
+        assert_eq!(
+            session.interpret("minion deshaz lo que has hecho", Decision::UndoLast, None),
+            Outcome::Undo(None)
         );
     }
 
