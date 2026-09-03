@@ -125,13 +125,22 @@ fn finish(model_path: &str, collected: &[crate::speaker::Embedding]) -> Result<f
 pub fn run(model_path: &str) -> Result<()> {
     let mut model = speaker::Speaker::load(model_path)?;
 
+    // The profile must be built from the same device Minion will listen
+    // through at runtime, not whatever the system default happens to be
+    // while this command runs.
+    let microphone = crate::config::load().microphone();
+    match &microphone {
+        Some(name) => println!("Micrófono: «{name}» (configurado)."),
+        None => println!("Micrófono: el predeterminado del sistema."),
+    }
+
     println!("\nVamos a aprender tu voz. Di estas cinco frases,");
     println!("con tu tono normal y a la distancia a la que sueles hablarle.\n");
 
     let active = Arc::new(AtomicBool::new(true));
     // Nothing speaks during enrolment, so nothing ever goes deaf.
     let deaf = Arc::new(AtomicBool::new(false));
-    let listener = audio::start(audio::Settings::default(), Arc::clone(&active), None, deaf)?;
+    let listener = audio::start(audio::Settings::default(), Arc::clone(&active), microphone, deaf)?;
 
     let mut collected = Vec::new();
     for (number, prompt) in PROMPTS.iter().enumerate().take(SENTENCES) {
