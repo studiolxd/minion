@@ -20,6 +20,8 @@ const AWAKE: &str = include_str!("../assets/awake.svg");
 const ASLEEP: &str = include_str!("../assets/asleep.svg");
 const ACTING: &str = include_str!("../assets/acting.svg");
 const DICTATING: &str = include_str!("../assets/dictating.svg");
+const THINKING: &str = include_str!("../assets/thinking.svg");
+const SPEAKING: &str = include_str!("../assets/speaking.svg");
 
 /// Height in pixels: twice the menu bar's usable height, for Retina.
 ///
@@ -91,6 +93,20 @@ pub fn acting() -> Result<Icon> {
 pub fn dictating() -> Result<Icon> {
     static DICTATING_ICON: OnceLock<Option<Icon>> = OnceLock::new();
     cached(&DICTATING_ICON, DICTATING)
+}
+
+/// Shown from the end of an utterance until a decision is reached, but only
+/// when that takes long enough to notice — a model reload, not the usual
+/// 150–300 ms of transcription and the speaker check.
+pub fn thinking() -> Result<Icon> {
+    static THINKING_ICON: OnceLock<Option<Icon>> = OnceLock::new();
+    cached(&THINKING_ICON, THINKING)
+}
+
+/// Shown while `speech::say` is talking back.
+pub fn speaking() -> Result<Icon> {
+    static SPEAKING_ICON: OnceLock<Option<Icon>> = OnceLock::new();
+    cached(&SPEAKING_ICON, SPEAKING)
 }
 
 pub fn export_iconset(directory: &str) -> Result<()> {
@@ -170,6 +186,9 @@ mod tests {
         assert!(awake().is_ok(), "the awake face should draw");
         assert!(asleep().is_ok(), "the sleeping face should draw");
         assert!(acting().is_ok(), "the acting face should draw");
+        assert!(dictating().is_ok(), "the dictating face should draw");
+        assert!(thinking().is_ok(), "the thinking face should draw");
+        assert!(speaking().is_ok(), "the speaking face should draw");
     }
 
     #[test]
@@ -181,7 +200,28 @@ mod tests {
             assert!(awake().is_ok());
             assert!(asleep().is_ok());
             assert!(acting().is_ok());
+            assert!(thinking().is_ok());
+            assert!(speaking().is_ok());
         }
+    }
+
+    #[test]
+    fn the_thinking_face_looks_up_and_the_speaking_face_opens_its_mouth() {
+        // Same head, tiny changes: the pupil moves in one, the mouth in the
+        // other. Check the spots that must have changed from the awake face.
+        let (awake, width) = pixels(AWAKE);
+        let (thinking, tw) = pixels(THINKING);
+        assert_eq!(width, tw);
+        // Where the awake pupil sits, the thinking face has moved it away.
+        assert!(alpha_at(&awake, width, 12.0, 10.2) > 200, "awake pupil is there");
+        assert!(alpha_at(&thinking, width, 12.0, 10.2) < 40, "thinking pupil has moved");
+        // And it now sits higher, toward the top of the goggle.
+        assert!(alpha_at(&thinking, width, 12.0, 8.4) > 200, "thinking pupil looks up");
+
+        let (speaking, sw) = pixels(SPEAKING);
+        assert_eq!(width, sw);
+        // The closed-mouth smile line is gone; the open mouth is filled in.
+        assert!(alpha_at(&speaking, width, 12.0, 17.6) > 200, "the mouth is open");
     }
 
     fn draw(svg: &str) -> Vec<u8> {
@@ -199,6 +239,9 @@ mod tests {
         // identical, or a change of state would show nothing at all.
         assert_ne!(draw(AWAKE), draw(ASLEEP));
         assert_ne!(draw(AWAKE), draw(ACTING));
+        assert_ne!(draw(AWAKE), draw(THINKING));
+        assert_ne!(draw(AWAKE), draw(SPEAKING));
+        assert_ne!(draw(THINKING), draw(SPEAKING));
     }
 
     #[test]

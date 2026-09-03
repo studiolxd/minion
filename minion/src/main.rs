@@ -327,6 +327,11 @@ struct Listening {
     acted: Arc<AtomicBool>,
     /// Set while in dictation mode, so the menu bar can show it.
     dictating: Arc<AtomicBool>,
+    /// Set while the model is being reloaded after a decision is needed —
+    /// the one delay long enough (~1 s) to be worth showing a face for.
+    thinking: Arc<AtomicBool>,
+    /// Set while `speech::say` is talking back.
+    speaking: Arc<AtomicBool>,
     /// How to answer questions aloud.
     voice_reply: Option<VoiceReply>,
     /// Which microphone to use, or none to follow the system.
@@ -358,6 +363,8 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
         active,
         acted,
         dictating,
+        thinking,
+        speaking,
         voice_reply,
         microphone,
         show_catalogue,
@@ -531,9 +538,15 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
             }
         }
 
-        // Reload if it was released while idle. Costs about a second, once.
+        // Reload if it was released while idle. Costs about a second, once —
+        // long enough that it is the only case worth a "thinking" face for;
+        // the usual 150–300 ms of transcription and the speaker check is a
+        // flicker not worth showing.
         if model.is_none() {
-            match load_model(&model_path) {
+            thinking.store(true, Ordering::Relaxed);
+            let reloaded = load_model(&model_path);
+            thinking.store(false, Ordering::Relaxed);
+            match reloaded {
                 Ok(loaded) => {
                     model = Some(loaded);
                     note!("Speech heard — model reloaded. {}", resident_memory());
@@ -605,6 +618,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                     acted.store(true, Ordering::Relaxed);
                     match &voice_reply {
                         Some(settings) => {
+                            speaking.store(true, Ordering::Relaxed);
                             speech::say(
                                 &reply,
                                 settings.voice.as_deref(),
@@ -613,6 +627,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                                 &deaf,
                                 speech_tail,
                             );
+                            speaking.store(false, Ordering::Relaxed);
                             // Whatever arrived while it was talking is its
                             // own voice, or was said over it. Either way it
                             // was not meant as an instruction.
@@ -793,6 +808,10 @@ enum Face {
     Awake,
     Asleep,
     Dictating,
+    /// From the end of an utterance until a slow decision (a model reload).
+    Thinking,
+    /// While `speech::say` is talking back.
+    Speaking,
     /// The blink after a command; never the resting state.
     Acting,
 }
@@ -806,6 +825,10 @@ struct Bar {
     status: Status,
     /// Set while dictating: a different face.
     dictating: Arc<AtomicBool>,
+    /// Set while the model is reloading after an utterance: a different face.
+    thinking: Arc<AtomicBool>,
+    /// Set while speaking a reply aloud: a different face.
+    speaking: Arc<AtomicBool>,
 }
 
 fn run_menu_bar(
@@ -818,7 +841,7 @@ fn run_menu_bar(
     // Raised when someone asks aloud what they can say.
     catalogue_asked: Arc<AtomicBool>,
 ) -> Result<()> {
-    let Bar { model_path, downloading, status, dictating } = bar;
+    let Bar { model_path, downloading, status, dictating, thinking, speaking } = bar;
     let mtm = MainThreadMarker::new()
         .ok_or_else(|| anyhow!("the menu bar must be built on the main thread"))?;
     let app = NSApplication::sharedApplication(mtm);
@@ -940,6 +963,8 @@ fn run_menu_bar(
     let active_for_timer = Arc::clone(&active);
     let shown_face = Cell::new(if busy { Face::Asleep } else { Face::Awake });
     let dictating_for_timer = Arc::clone(&dictating);
+    let thinking_for_timer = Arc::clone(&thinking);
+    let speaking_for_timer = Arc::clone(&speaking);
     let shown_tooltip = std::cell::RefCell::new(opening_tooltip);
     let status_for_timer = Arc::clone(&status);
     let downloading_for_timer = Arc::clone(&downloading);
@@ -1111,10 +1136,17 @@ fn run_menu_bar(
         let listening = active_for_timer.load(Ordering::Relaxed);
         // Downloading is not listening, whatever the switch says.
         let awake = listening && !downloading_for_timer.load(Ordering::Relaxed);
-        let wanted = match (awake, dictating_for_timer.load(Ordering::Relaxed)) {
-            (false, _) => Face::Asleep,
-            (true, true) => Face::Dictating,
-            (true, false) => Face::Awake,
+        let wanted = match (
+            awake,
+            speaking_for_timer.load(Ordering::Relaxed),
+            thinking_for_timer.load(Ordering::Relaxed),
+            dictating_for_timer.load(Ordering::Relaxed),
+        ) {
+            (false, _, _, _) => Face::Asleep,
+            (true, true, _, _) => Face::Speaking,
+            (true, false, true, _) => Face::Thinking,
+            (true, false, false, true) => Face::Dictating,
+            (true, false, false, false) => Face::Awake,
         };
         if wanted == shown_face.get() {
             return;
@@ -1133,6 +1165,8 @@ fn run_menu_bar(
             Face::Awake | Face::Acting => icon::awake(),
             Face::Asleep => icon::asleep(),
             Face::Dictating => icon::dictating(),
+            Face::Thinking => icon::thinking(),
+            Face::Speaking => icon::speaking(),
         };
         if let Ok(face) = face {
             let _ = tray_for_timer.set_icon_with_as_template(Some(face), true);
@@ -1583,6 +1617,11 @@ fn main() -> Result<()> {
     // the face in the menu bar.
     let dictating = Arc::new(AtomicBool::new(false));
     let worker_dictating = Arc::clone(&dictating);
+    // Same idea, for the "thinking" and "speaking" faces.
+    let thinking = Arc::new(AtomicBool::new(false));
+    let worker_thinking = Arc::clone(&thinking);
+    let speaking = Arc::new(AtomicBool::new(false));
+    let worker_speaking = Arc::clone(&speaking);
 
     let worker_active = Arc::clone(&active);
     let worker_log_ignored = Arc::clone(&log_ignored);
@@ -1604,6 +1643,8 @@ fn main() -> Result<()> {
         downloading: Arc::clone(&downloading),
         status: Arc::clone(&status),
         dictating: Arc::clone(&dictating),
+        thinking: Arc::clone(&thinking),
+        speaking: Arc::clone(&speaking),
     };
     std::thread::spawn(move || {
         // First run: 670 MB before anything can be heard. Reported through
@@ -1636,6 +1677,8 @@ fn main() -> Result<()> {
             active: worker_active,
             acted: worker_acted,
             dictating: worker_dictating,
+            thinking: worker_thinking,
+            speaking: worker_speaking,
             voice_reply,
             microphone,
             show_catalogue: worker_catalogue,
