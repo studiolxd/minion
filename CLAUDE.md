@@ -30,7 +30,9 @@ Do not resurrect 1 or 2. The user chose Rust deliberately over Python/Go.
   wrote** in the log (`unknown  «…»`). That is what `minion learn` is for.
 - Preferences UI: use the `spacing` module + `Layout` in
   `src/preferences.rs`; never hand-tune coordinates.
-- Menu: "Escuchar/Pausar" is one toggle; "Ayuda" sits above "Salir".
+- Menu: "Escuchar/Pausar" is one toggle at the top; "Asistente…" and
+  "Ayuda" are grouped together above the last group, which is "Reiniciar"
+  and "Salir".
 - Commit with clear messages (imperative, say why). The user asks for commits
   explicitly ("haz commits"); do them after each working change.
 - Dictated text is logged verbatim, on purpose: `minion learn` needs to see

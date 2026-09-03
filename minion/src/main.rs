@@ -1938,13 +1938,14 @@ fn run_menu_bar(
     menu.append(&preferences)?;
     menu.append(&vocabulary_item)?;
     menu.append(&PredefinedMenuItem::separator())?;
-    // Help sits with Quit rather than among the working items: it is where
-    // you look when you do not know what to do, not part of the routine.
-    menu.append(&restart)?;
     menu.append(&check_update)?;
     menu.append(&update_packs)?;
-    menu.append(&commands_item)?;
+    menu.append(&PredefinedMenuItem::separator())?;
+    // Help lives together, above the two ways out.
     menu.append(&assistant_item)?;
+    menu.append(&commands_item)?;
+    menu.append(&PredefinedMenuItem::separator())?;
+    menu.append(&restart)?;
     menu.append(&quit)?;
 
     let toggle_id = toggle.id().clone();
