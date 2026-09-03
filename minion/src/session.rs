@@ -152,7 +152,6 @@ impl Session {
     /// and should call this then so a refused command is not offered as
     /// something to undo. `main.rs` should call `session.forget_undo()`
     /// wherever it currently checks `!done.succeeded` in `report`.
-    #[allow(dead_code, reason = "called from main.rs, not yet wired in")]
     pub fn forget_undo(&mut self) {
         self.undoable = None;
     }

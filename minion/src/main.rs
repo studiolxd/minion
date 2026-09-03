@@ -614,7 +614,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                     note!("unknown  «{part}»  ->  nothing to repeat yet");
                 }
                 Outcome::Perform { decision, repeats } => {
-                    report(
+                    let refused = report(
                         &part,
                         &decision,
                         confidence,
@@ -628,6 +628,10 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                             status: &status,
                         },
                     );
+                    if refused {
+                        // Nothing happened, so there is nothing to undo.
+                        session.forget_undo();
+                    }
 
                     if commands::is_sleep(&decision) {
                         active.store(false, Ordering::Relaxed);
@@ -662,8 +666,9 @@ fn report(
     confidence: f32,
     repeats: usize,
     at: &Reporting,
-) {
+) -> bool {
     let seconds = at.seconds;
+    let mut refused = false;
     match decision {
         Decision::Ignored => {
             // Speech that was not for us. The wording is only written
@@ -688,6 +693,7 @@ fn report(
                 outcome = commands::perform(decision);
             }
             if let Some(done) = outcome {
+                refused = done.outcome.is_err();
                 if let Err(reason) = &done.outcome {
                     // Understood perfectly and refused by the system.
                     // Almost always the Accessibility permission.
@@ -725,6 +731,7 @@ fn report(
             }
         }
     }
+    refused
 }
 
 /// Builds the menu bar item and hands control to AppKit. Never returns.
