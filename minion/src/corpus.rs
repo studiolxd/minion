@@ -292,6 +292,7 @@ fn describe(decision: &Decision) -> String {
         },
         Decision::StopDictation => "dejar de dictar".to_string(),
         Decision::UndoLast => "deshacer".to_string(),
+        Decision::Cancel => "cancelar".to_string(),
         Decision::Answer(question) => format!("responder {question:?}"),
         Decision::AskAi(text) => format!("preguntar a la IA «{text}»"),
         Decision::ForgetAiConversation => "olvidar la conversación con la IA".to_string(),

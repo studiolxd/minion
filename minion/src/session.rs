@@ -66,6 +66,11 @@ pub enum Outcome {
     ForgetAiConversation,
     /// Take back what was last done, if there was anything.
     Undo(Option<Undoable>),
+    /// «cancela», «para», «basta»: stop whatever Minion itself is doing.
+    /// `main.rs` still has to stop the speech and the macro that may be
+    /// running — this only carries what `Session` itself knows was
+    /// cancelled, for the log line.
+    Cancel { cancelled_question: bool, closed_window: bool },
     /// «otra vez» with nothing said before it.
     NothingToRepeat,
     /// Carry this out, this many times.
@@ -370,6 +375,12 @@ impl Session {
             }
             Decision::AskAi(text) => return Outcome::AskAi(text),
             Decision::ForgetAiConversation => return Outcome::ForgetAiConversation,
+            Decision::Cancel => {
+                let cancelled_question = self.pending.take().is_some();
+                let closed_window = self.window_opened_at.is_some();
+                self.close_window();
+                return Outcome::Cancel { cancelled_question, closed_window };
+            }
             _ => {}
         }
 
@@ -1421,5 +1432,51 @@ mod tests {
             say(&mut session, "minion otra vez"),
             vec![Outcome::Perform { decision: last, repeats: 1 }]
         );
+    }
+
+    #[test]
+    fn cancel_clears_a_pending_question_and_the_conversation_window() {
+        let mut session = asking();
+        let now = Instant::now();
+        let question = session.ask_about(NEARLY, now).expect("worth asking about");
+        session.open_question(NEARLY, question, now);
+        assert!(session.question_open(now));
+
+        // A question already closes the window when it opens, so this
+        // exercises the pending-question half of cancel; the window half
+        // is checked below, on its own.
+        assert_eq!(
+            session.interpret("minion cancela", Decision::Cancel, None),
+            Outcome::Cancel { cancelled_question: true, closed_window: false }
+        );
+        assert!(!session.question_open(now));
+        // Answering "sí" now is just an ordinary phrase: there is nothing
+        // left to answer.
+        assert!(session.answer_question("si", now).is_none());
+
+        session.open_window(now, Duration::from_secs(5));
+        assert_eq!(
+            session.interpret("minion cancela", Decision::Cancel, None),
+            Outcome::Cancel { cancelled_question: false, closed_window: true }
+        );
+        assert!(!session.window_open(now));
+    }
+
+    #[test]
+    fn cancel_with_nothing_pending_says_so() {
+        let mut session = Session::new();
+        assert_eq!(
+            session.interpret("minion cancela", Decision::Cancel, None),
+            Outcome::Cancel { cancelled_question: false, closed_window: false }
+        );
+    }
+
+    #[test]
+    fn cancel_bare_word_is_decided_as_cancel() {
+        for phrase in ["minion cancela", "minion para", "minion basta"] {
+            assert_eq!(decide(phrase), Decision::Cancel, "«{phrase}»");
+        }
+        // With an object, "cancela" keeps its old meaning (escape).
+        assert_eq!(decide("minion cancela esto"), Decision::Run("cancelar"));
     }
 }

@@ -1430,6 +1430,36 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                         None => actions::show_message(reply),
                     }
                 }
+                Outcome::Cancel { cancelled_question, closed_window } => {
+                    // Stops speech mid-sentence and marks a running macro
+                    // to stop at its next step boundary — both are no-ops
+                    // when there is nothing to stop. What `Session` itself
+                    // held (a pending question, the conversation window)
+                    // is already gone by the time this runs.
+                    let was_speaking = speaking.load(Ordering::Relaxed);
+                    speech::stop();
+                    commands::request_cancel();
+                    hud::set_question_pending(false);
+                    window_open.store(false, Ordering::Relaxed);
+                    let mut cancelled = Vec::new();
+                    if was_speaking {
+                        cancelled.push("speech");
+                    }
+                    if cancelled_question {
+                        cancelled.push("a pending question");
+                    }
+                    if closed_window {
+                        cancelled.push("the conversation window");
+                    }
+                    let what =
+                        if cancelled.is_empty() { "nothing pending".to_string() } else { cancelled.join(", ") };
+                    note!("cancel   «{part}»  ->  {what}");
+                    acted.store(true, Ordering::Relaxed);
+                    hud::push_update(hud::Update {
+                        heard: Some(part.clone()),
+                        outcome: Some("cancelado".to_string()),
+                    });
+                }
                 Outcome::AskAi(text) => {
                     // The [ai] table is re-read here: switching the AI on
                     // from Ajustes used to need a restart, and the answer

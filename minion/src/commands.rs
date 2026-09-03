@@ -500,6 +500,13 @@ pub enum Decision {
     StopDictation,
     /// Undo whatever Minion last did.
     UndoLast,
+    /// «cancela», «para», «basta», bare: stop whatever Minion itself is
+    /// doing right now — reading a reply aloud, a macro between two of its
+    /// steps, a pending question, the conversation window. Distinct from
+    /// [`Decision::Run`]'s "cancelar" (escape) and any contextual command
+    /// with an object in it ("cancela esto"), which still mean what they
+    /// meant before — see [`cancel_word`].
+    Cancel,
     /// A question, to be answered aloud.
     Answer(crate::answers::Question),
     /// «pregunta a la IA …», «pregúntale a la IA …», «IA, …»: what to ask
@@ -550,6 +557,26 @@ fn sounds_like_wake_word(word: &str) -> bool {
         let same_start = word.chars().take(PREFIX).eq(wake.chars().take(PREFIX));
         same_start && crate::text::edits_between(word, wake) <= 1
     })
+}
+
+/// Whether the whole (wake-word-stripped) phrase is nothing but Minion's
+/// own cancel word — "cancela", "para" or "basta" — with nothing else said.
+///
+/// Deliberately not routed through [`similarity`]: that drops fillers like
+/// "esto" from both sides, which would make "cancela esto" score the same
+/// as bare "cancela" and lose its own, different meaning (see
+/// [`Decision::Cancel`]). One word of tolerance, the same one edit
+/// [`sounds_like_wake_word`] allows, covers the recogniser dropping a
+/// syllable without opening this up to ordinary sentences that merely
+/// contain one of these words.
+fn cancel_word(rest: &str) -> bool {
+    const WORDS: &[&str] = &["cancela", "para", "basta"];
+    let mut words = rest.split_whitespace();
+    let Some(only) = words.next() else { return false };
+    if words.next().is_some() {
+        return false;
+    }
+    WORDS.iter().any(|word| *word == only || crate::text::edits_between(only, word) <= 1)
 }
 
 /// Strips the wake word. Returns `None` if the sentence is not a command.
@@ -1368,6 +1395,16 @@ pub fn decide_in(transcript: &str, context: Option<&str>) -> (Decision, f32) {
         }
     }
 
+    // Minion's own cancel word, bare — before anything contextual, since
+    // stopping Minion outweighs whatever the application in front would
+    // otherwise have done with the same word. Checked on the raw phrase
+    // rather than through `similarity`: that drops "esto" as a filler,
+    // which would make "cancela esto" indistinguishable from "cancela" and
+    // swallow the escape/Ctrl-C meaning that phrase still has.
+    if cancel_word(rest) {
+        return (Decision::Cancel, 1.0);
+    }
+
     // Commands belonging to the application in front come first: they are
     // the most specific thing that can match.
     if let Some(bundle) = context {
@@ -1868,6 +1905,23 @@ fn try_macro_step(step: &str) -> StepResult {
     }
 }
 
+/// Set by [`request_cancel`] when "cancela"/"para"/"basta" is heard, and
+/// checked between a running macro's steps — never at the first, so a
+/// cancel word left over from before this macro started (nothing was
+/// running to hear it) cannot stop one that only starts afterwards.
+/// Global rather than threaded through `perform`/`run_macro`: nothing else
+/// needs to know about it, and only one macro ever runs at a time in this
+/// single-threaded loop.
+static CANCEL_MACRO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// «cancela», «para», «basta»: stop the macro that may be running, at its
+/// next step boundary. Safe to call with none running — the flag is
+/// cleared the moment the next one starts, so it cannot leak forward onto
+/// an unrelated later macro.
+pub fn request_cancel() {
+    CANCEL_MACRO.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Runs a macro's steps in order, stopping at the first one that fails.
 ///
 /// `try_step` decides what a step means and, unless it names another
@@ -1875,8 +1929,17 @@ fn try_macro_step(step: &str) -> StepResult {
 /// [`try_macro_step`] directly so a test can supply one that only records
 /// what it was asked to do.
 fn run_macro_steps(macro_: &Macro, mut try_step: impl FnMut(&str) -> StepResult) {
+    CANCEL_MACRO.store(false, std::sync::atomic::Ordering::Relaxed);
     let total = macro_.steps.len();
     for (i, step) in macro_.steps.iter().enumerate() {
+        if i > 0 && CANCEL_MACRO.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            crate::journal::write(&format!(
+                "cancel   {}: stopped at {}/{total} — cancelled",
+                macro_.name,
+                i + 1
+            ));
+            return;
+        }
         crate::journal::write(&format!("macro    {}: {}/{total} {step}", macro_.name, i + 1));
         match try_step(step) {
             StepResult::Ok => {}
@@ -3288,6 +3351,37 @@ mod tests {
             StepResult::Ok
         });
         assert!(seen.borrow().is_empty());
+    }
+
+    #[test]
+    fn cancel_stops_a_macro_between_steps() {
+        let seen = std::cell::RefCell::new(Vec::new());
+        let steps: &[&str] = &["uno", "dos", "tres"];
+        let macro_ = Macro { name: "prueba", phrases: &["prueba"], steps };
+        run_macro_steps(&macro_, |step| {
+            seen.borrow_mut().push(step.to_string());
+            // The cancel word arrives right after the first step.
+            if step == "uno" {
+                request_cancel();
+            }
+            StepResult::Ok
+        });
+        assert_eq!(*seen.borrow(), vec!["uno".to_string()]);
+    }
+
+    #[test]
+    fn a_cancel_word_left_over_does_not_stop_the_next_macro() {
+        // Nothing was running to hear it, so a stale flag must not cancel
+        // the first step of whatever runs next.
+        request_cancel();
+        let seen = std::cell::RefCell::new(Vec::new());
+        let steps: &[&str] = &["uno", "dos"];
+        let macro_ = Macro { name: "prueba", phrases: &["prueba"], steps };
+        run_macro_steps(&macro_, |step| {
+            seen.borrow_mut().push(step.to_string());
+            StepResult::Ok
+        });
+        assert_eq!(*seen.borrow(), vec!["uno".to_string(), "dos".to_string()]);
     }
 
     #[test]
