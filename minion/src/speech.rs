@@ -41,11 +41,20 @@ pub fn default_voice() -> Option<String> {
     let listing = Command::new("/usr/bin/say").arg("-v").arg("?").output().ok()?;
     let listing = String::from_utf8_lossy(&listing.stdout);
 
-    let spanish: Vec<&str> = listing
+    // Any Spanish voice will do; a Mac that only carries es_MX or es_AR
+    // used to get no match here and `say` read Spanish in an English voice.
+    // Spain's voices go first so the preferred list still wins ties.
+    let mut spanish: Vec<&str> = listing
         .lines()
         .filter(|line| line.contains("es_ES"))
         .filter_map(|line| line.split_whitespace().next())
         .collect();
+    spanish.extend(
+        listing
+            .lines()
+            .filter(|line| line.contains(" es_") && !line.contains("es_ES"))
+            .filter_map(|line| line.split_whitespace().next()),
+    );
 
     PREFERRED
         .iter()
