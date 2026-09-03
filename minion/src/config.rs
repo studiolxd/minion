@@ -14,6 +14,9 @@ use serde::Deserialize;
 /// Idle minutes before the model is released, when the file says nothing.
 const DEFAULT_UNLOAD_MINUTES: u64 = 5;
 
+/// Seconds the conversation window stays open when the file says nothing.
+const DEFAULT_CONVERSATION_SECONDS: u64 = 5;
+
 /// Shortcut that pauses and resumes when nothing is set.
 pub const DEFAULT_RESUME_SHORTCUT: &str = "ctrl-alt-m";
 
@@ -150,6 +153,34 @@ pub struct Config {
     /// almost always names. Applied while dictating, before punctuation.
     #[serde(default)]
     pub dictation_words: Vec<DictationWordConfig>,
+    /// Seconds after a command (or an answer) during which the next
+    /// utterance is obeyed without the wake word.
+    ///
+    /// `None` means the default of 5; zero disables the window entirely,
+    /// for someone who would rather every sentence start with «minion».
+    pub conversation_seconds: Option<u64>,
+
+    /// "always" (the default) listens continuously; "hold" only listens
+    /// while `resume_shortcut` is held down, and does not need the wake
+    /// word while it is.
+    pub listen_mode: Option<String>,
+
+    /// Bundle IDs of applications that pause listening while in front —
+    /// a video call is the one time an always-on microphone is unwelcome.
+    ///
+    /// `None` uses the built-in list (Zoom, Teams, FaceTime). Google Meet
+    /// in a browser tab has no bundle ID of its own to check — it is
+    /// Chrome, like every other tab — so it cannot be detected this way
+    /// and is not on the list.
+    pub pause_during: Option<Vec<String>>,
+}
+
+/// How Minion decides when to listen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenMode {
+    Always,
+    /// Only while the shortcut is held down.
+    Hold,
 }
 
 /// A command of your own: what to say, and which keys to press.
@@ -228,9 +259,16 @@ impl Default for Config {
             spoken_punctuation: true,
             auto_capitalise: true,
             dictation_words: Vec::new(),
+            conversation_seconds: None,
+            listen_mode: None,
+            pause_during: None,
         }
     }
 }
+
+/// Bundle IDs paused for when the file says nothing.
+const DEFAULT_PAUSE_DURING: &[&str] =
+    &["us.zoom.xos", "com.microsoft.teams2", "com.apple.FaceTime"];
 
 /// Where the configuration file lives.
 pub fn path() -> Option<PathBuf> {
@@ -521,6 +559,31 @@ impl Config {
         }
     }
 
+    /// How long the conversation window stays open after a command or an
+    /// answer. `None` (zero seconds configured) disables it.
+    pub fn conversation_window(&self) -> Duration {
+        Duration::from_secs(self.conversation_seconds.unwrap_or(DEFAULT_CONVERSATION_SECONDS))
+    }
+
+    /// Whether to listen continuously or only while the shortcut is held.
+    ///
+    /// Anything other than "hold" — including a typo — falls back to
+    /// "always", the safer default: a mistyped value should not leave
+    /// someone wondering why Minion never listens.
+    pub fn listen_mode(&self) -> ListenMode {
+        match self.listen_mode.as_deref() {
+            Some("hold") => ListenMode::Hold,
+            _ => ListenMode::Always,
+        }
+    }
+
+    /// Bundle IDs that pause listening while in front.
+    pub fn pause_during(&self) -> Vec<String> {
+        self.pause_during
+            .clone()
+            .unwrap_or_else(|| DEFAULT_PAUSE_DURING.iter().map(|id| id.to_string()).collect())
+    }
+
     /// Commands defined in the file, as `'static` entries.
     ///
     /// Anything whose shortcut cannot be read is reported and skipped: one
@@ -757,6 +820,41 @@ mod tests {
 
         let custom: Config = toml::from_str("unload_after_minutes = 30").expect("should parse");
         assert_eq!(custom.idle_unload(), Some(Duration::from_secs(1800)));
+    }
+
+    #[test]
+    fn the_conversation_window_is_five_seconds_by_default_and_zero_disables_it() {
+        let default: Config = toml::from_str("").expect("empty config should parse");
+        assert_eq!(default.conversation_window(), Duration::from_secs(5));
+
+        let disabled: Config =
+            toml::from_str("conversation_seconds = 0").expect("should parse");
+        assert_eq!(disabled.conversation_window(), Duration::ZERO);
+    }
+
+    #[test]
+    fn listen_mode_defaults_to_always_and_a_typo_falls_back_to_it() {
+        let default: Config = toml::from_str("").expect("empty config should parse");
+        assert_eq!(default.listen_mode(), ListenMode::Always);
+
+        let hold: Config = toml::from_str(r#"listen_mode = "hold""#).expect("should parse");
+        assert_eq!(hold.listen_mode(), ListenMode::Hold);
+
+        let typo: Config = toml::from_str(r#"listen_mode = "holf""#).expect("should parse");
+        assert_eq!(typo.listen_mode(), ListenMode::Always);
+    }
+
+    #[test]
+    fn pause_during_defaults_to_the_built_in_conferencing_apps() {
+        let default: Config = toml::from_str("").expect("empty config should parse");
+        assert_eq!(
+            default.pause_during(),
+            vec!["us.zoom.xos", "com.microsoft.teams2", "com.apple.FaceTime"]
+        );
+
+        let custom: Config =
+            toml::from_str(r#"pause_during = ["com.example.calls"]"#).expect("should parse");
+        assert_eq!(custom.pause_during(), vec!["com.example.calls"]);
     }
 
     #[test]

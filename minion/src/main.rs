@@ -55,6 +55,10 @@ use session::{Outcome, Session, Undoable};
 const TOOLTIP_IDLE: &str = "Minion — control por voz";
 const TOOLTIP_LISTENING: &str = "Minion — escuchando";
 const TOOLTIP_PAUSED: &str = "Minion — en pausa";
+/// Push-to-talk's own pair, used instead of the two above when
+/// `listen_mode = "hold"`.
+const TOOLTIP_HOLD_ACTIVE: &str = "Minion — escuchando (mantén pulsado)";
+const TOOLTIP_HOLD_IDLE: &str = "Minion — pulsa para hablar";
 
 /// How much of a transcript the tooltip carries.
 ///
@@ -121,6 +125,104 @@ const UI_THROTTLE_TICKS: u32 = 5;
 /// happens while the sentence is still being spoken is a second the
 /// speaker never waits for. The wake-up itself is one atomic read.
 const IDLE_CHECK: Duration = Duration::from_millis(250);
+
+/// Smart auto-pause: checked on the same idle tick as everything else
+/// above, rather than through `NSWorkspace`/distributed-notification
+/// observers. Those need a run loop of their own to deliver blocks on, and
+/// the idle tick already polls a few times a second for other reasons —
+/// one more cheap check costs nothing extra.
+mod auto_pause {
+    use core_foundation::base::{CFType, TCFType};
+    use core_foundation::boolean::CFBoolean;
+    use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
+    use core_foundation::string::CFString;
+    use std::ffi::c_void;
+
+    /// Whether the login session is locked (password or Touch ID lock, the
+    /// screen saver locking the screen).
+    ///
+    /// `CGSessionCopyCurrentDictionary` is undocumented but has been the
+    /// standard way to ask this without a helper process for as long as
+    /// the alternative — watching `com.apple.screenIsLocked` — has existed;
+    /// both end up reading the same session dictionary.
+    pub fn screen_locked() -> bool {
+        #[link(name = "CoreGraphics", kind = "framework")]
+        extern "C" {
+            fn CGSessionCopyCurrentDictionary() -> CFDictionaryRef;
+        }
+        unsafe {
+            let raw = CGSessionCopyCurrentDictionary();
+            if raw.is_null() {
+                // No session at all, e.g. before anyone has logged in.
+                // Reading that as "locked forever" would leave nothing to
+                // resume it, so the safer answer is "not locked".
+                return false;
+            }
+            let dict: CFDictionary<*const c_void, *const c_void> =
+                TCFType::wrap_under_create_rule(raw);
+            let key = CFString::from_static_string("CGSSessionScreenIsLocked");
+            dict.find(key.as_CFTypeRef())
+                .and_then(|value| CFType::wrap_under_get_rule(*value).downcast::<CFBoolean>())
+                .map(bool::from)
+                .unwrap_or(false)
+        }
+    }
+
+    /// Whether the main display is asleep — the screen turned off, whether
+    /// because the whole Mac slept or only the display did.
+    pub fn display_asleep() -> bool {
+        core_graphics::display::CGDisplay::main().is_asleep()
+    }
+
+    /// Whether the application in front is one to pause listening for.
+    pub fn frontmost_matches(frontmost: Option<&str>, pause_during: &[String]) -> bool {
+        frontmost.is_some_and(|id| pause_during.iter().any(|paused| paused == id))
+    }
+
+    /// Why listening should be paused right now, if it should.
+    ///
+    /// Checked in order of how much it would cost to keep listening
+    /// wrongly: a locked or sleeping Mac hears nothing useful at all,
+    /// while an unwelcome app being in front is the milder case.
+    pub fn reason(frontmost: Option<&str>, pause_during: &[String]) -> Option<String> {
+        if screen_locked() {
+            return Some("the screen is locked".to_string());
+        }
+        if display_asleep() {
+            return Some("the display is asleep".to_string());
+        }
+        if frontmost_matches(frontmost, pause_during) {
+            return Some(format!("{} is in front", frontmost.unwrap_or_default()));
+        }
+        None
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn only_a_listed_bundle_id_matches() {
+            let listed = vec!["us.zoom.xos".to_string(), "com.apple.FaceTime".to_string()];
+            assert!(frontmost_matches(Some("us.zoom.xos"), &listed));
+            assert!(!frontmost_matches(Some("com.apple.Safari"), &listed));
+            assert!(!frontmost_matches(None, &listed));
+        }
+
+        #[test]
+        fn an_empty_list_matches_nothing() {
+            assert!(!frontmost_matches(Some("us.zoom.xos"), &[]));
+        }
+
+        #[test]
+        fn the_display_answers_something_either_way() {
+            // Whichever it is on the machine running the tests, it must not
+            // panic or hang — that is the only thing worth checking here.
+            let _ = display_asleep();
+            let _ = screen_locked();
+        }
+    }
+}
 
 /// Whether `executable` lives inside a `.app` bundle.
 ///
@@ -323,6 +425,17 @@ struct Listening {
     log_ignored_speech: Arc<AtomicBool>,
     play_sounds: Arc<AtomicBool>,
     idle_unload: Option<Duration>,
+    /// How long the conversation window stays open after a command or an
+    /// answer. Zero disables it.
+    conversation_window: Duration,
+    /// Set while the conversation window is open, so the menu bar can show
+    /// the attentive face.
+    window_open: Arc<AtomicBool>,
+    /// `listen_mode = "hold"`: no wake word is needed while `active` is
+    /// true, since that only happens while the shortcut is held.
+    hold_mode: bool,
+    /// Bundle IDs of applications that pause listening while in front.
+    pause_during: Vec<String>,
     voice: Option<Voice>,
     training: Training,
     active: Arc<AtomicBool>,
@@ -330,6 +443,11 @@ struct Listening {
     acted: Arc<AtomicBool>,
     /// Set while in dictation mode, so the menu bar can show it.
     dictating: Arc<AtomicBool>,
+    /// Set while the model is being reloaded after a decision is needed —
+    /// the one delay long enough (~1 s) to be worth showing a face for.
+    thinking: Arc<AtomicBool>,
+    /// Set while `speech::say` is talking back.
+    speaking: Arc<AtomicBool>,
     /// How to answer questions aloud.
     voice_reply: Option<VoiceReply>,
     /// Which microphone to use, or none to follow the system.
@@ -356,11 +474,17 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
         log_ignored_speech,
         play_sounds,
         idle_unload,
+        conversation_window,
+        window_open,
+        hold_mode,
+        pause_during,
         mut voice,
         training,
         active,
         acted,
         dictating,
+        thinking,
+        speaking,
         voice_reply,
         microphone,
         show_catalogue,
@@ -384,6 +508,10 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
     // capital, an open quote) never spans two dictation sessions, and a
     // vocabulary edited while Minion was running takes effect right away.
     let mut transformer: Option<dictation::Transformer> = None;
+    // Set once smart auto-pause has paused listening on its own, so it
+    // knows the pause is its own to lift — a manual pause never sets this,
+    // and so never gets silently overridden once the reason clears.
+    let mut auto_paused = false;
     note!("Model loaded. {}", resident_memory());
 
     // How long to stay deaf after speaking: the segmenter needs
@@ -412,6 +540,38 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
         let utterance = match listener.utterances.recv_timeout(IDLE_CHECK) {
             Ok(utterance) => utterance,
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                // The window has no timer of its own — it just stops being
+                // open once `Instant::now()` passes its deadline — so this
+                // is where that becomes visible to the menu bar.
+                window_open.store(session.window_open(Instant::now()), Ordering::Relaxed);
+                // Smart auto-pause. Only in "always" mode: push-to-talk
+                // already gates listening on the key, and layering this on
+                // top of it would fight that — resuming on its own the
+                // moment a meeting ends, key or no key.
+                if !hold_mode {
+                    let listening = active.load(Ordering::Relaxed);
+                    if listening && auto_paused {
+                        // Turned back on by something other than this
+                        // check — the menu, the shortcut, a spoken order —
+                        // so the pause is no longer this feature's to lift.
+                        auto_paused = false;
+                    }
+                    let reason = auto_pause::reason(
+                        actions::frontmost_app().as_deref(),
+                        &pause_during,
+                    );
+                    if let Some(reason) = reason {
+                        if listening {
+                            active.store(false, Ordering::Relaxed);
+                            auto_paused = true;
+                            note!("paused automatically — {reason}");
+                        }
+                    } else if auto_paused {
+                        active.store(true, Ordering::Relaxed);
+                        auto_paused = false;
+                        note!("resumed automatically — the reason has gone away");
+                    }
+                }
                 // Someone has started talking. If the model was released
                 // while idle, load it now: the sentence and the silence
                 // that closes it take longer than the load, so this hides
@@ -538,9 +698,15 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
             }
         }
 
-        // Reload if it was released while idle. Costs about a second, once.
+        // Reload if it was released while idle. Costs about a second, once —
+        // long enough that it is the only case worth a "thinking" face for;
+        // the usual 150–300 ms of transcription and the speaker check is a
+        // flicker not worth showing.
         if model.is_none() {
-            match load_model(&model_path) {
+            thinking.store(true, Ordering::Relaxed);
+            let reloaded = load_model(&model_path);
+            thinking.store(false, Ordering::Relaxed);
+            match reloaded {
                 Ok(loaded) => {
                     model = Some(loaded);
                     note!("Speech heard — model reloaded. {}", resident_memory());
@@ -578,7 +744,22 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
             // and it is read per instruction: the first of a chain may well
             // have changed which application that is.
             let context = actions::frontmost_app();
-            let (decision, confidence) = commands::decide_in(&part, context.as_deref());
+            let now = Instant::now();
+            // Push-to-talk: every utterance heard was, by definition, said
+            // while the shortcut was held, so none of it needs the wake
+            // word — there is no window to time out or to log about.
+            let (decision, confidence) = if hold_mode {
+                session.resolve_held(&part, context.as_deref())
+            } else {
+                let resolved = session.resolve(&part, now, context.as_deref());
+                if let Some(after) = resolved.window_after {
+                    note!(
+                        "window   «{part}»  (no wake word, {after:.1} s after the last command)"
+                    );
+                }
+                (resolved.decision, resolved.confidence)
+            };
+            window_open.store(!hold_mode && session.window_open(now), Ordering::Relaxed);
 
             match session.interpret(&part, decision, context.as_deref()) {
                 Outcome::EnterDictation => {
@@ -636,6 +817,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                     acted.store(true, Ordering::Relaxed);
                     match &voice_reply {
                         Some(settings) => {
+                            speaking.store(true, Ordering::Relaxed);
                             speech::say(
                                 &reply,
                                 settings.voice.as_deref(),
@@ -644,12 +826,17 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                                 &deaf,
                                 speech_tail,
                             );
+                            speaking.store(false, Ordering::Relaxed);
                             // Whatever arrived while it was talking is its
                             // own voice, or was said over it. Either way it
                             // was not meant as an instruction.
                             while listener.utterances.try_recv().is_ok() {}
                         }
                         None => actions::show_message(&reply),
+                    }
+                    if !hold_mode {
+                        session.open_window(now, conversation_window);
+                        window_open.store(session.window_open(now), Ordering::Relaxed);
                     }
                 }
                 Outcome::Undo(taken) => match taken {
@@ -691,7 +878,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                     note!("unknown  «{part}»  ->  nothing to repeat yet");
                 }
                 Outcome::Perform { decision, repeats } => {
-                    let refused = report(
+                    let ran = report(
                         &part,
                         &decision,
                         confidence,
@@ -705,9 +892,17 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                             status: &status,
                         },
                     );
-                    if refused {
-                        // Nothing happened, so there is nothing to undo.
-                        session.forget_undo();
+                    match ran {
+                        Ran::Blocked => {
+                            // Nothing happened, so there is nothing to undo.
+                            session.forget_undo();
+                        }
+                        Ran::Yes if !hold_mode => {
+                            session.open_window(now, conversation_window);
+                            window_open.store(session.window_open(now), Ordering::Relaxed);
+                        }
+                        Ran::Yes => {}
+                        Ran::Nothing => {}
                     }
 
                     if commands::is_sleep(&decision) {
@@ -736,6 +931,21 @@ struct Reporting<'a> {
     status: &'a Status,
 }
 
+/// What actually happened to a decision, once it was carried out.
+///
+/// A plain `bool` used to say only whether it was refused; the conversation
+/// window needs the third case too, since neither "not addressed to me" nor
+/// "not understood" is a command that ran and is worth extending it for.
+#[derive(PartialEq, Eq)]
+enum Ran {
+    /// `Ignored` or `Unrecognised`: nothing was carried out.
+    Nothing,
+    /// Understood and carried out.
+    Yes,
+    /// Understood, but macOS refused it.
+    Blocked,
+}
+
 /// Carries out a decision and writes down what happened.
 fn report(
     transcript: &str,
@@ -743,9 +953,9 @@ fn report(
     confidence: f32,
     repeats: usize,
     at: &Reporting,
-) -> bool {
+) -> Ran {
     let seconds = at.seconds;
-    let mut refused = false;
+    let mut ran = Ran::Nothing;
     match decision {
         Decision::Ignored => {
             // Speech that was not for us. The wording is only written
@@ -770,7 +980,7 @@ fn report(
                 outcome = commands::perform(decision);
             }
             if let Some(done) = outcome {
-                refused = done.outcome.is_err();
+                ran = if done.outcome.is_err() { Ran::Blocked } else { Ran::Yes };
                 if let Err(reason) = &done.outcome {
                     // Understood perfectly and refused by the system.
                     // Almost always the Accessibility permission.
@@ -808,7 +1018,7 @@ fn report(
             }
         }
     }
-    refused
+    ran
 }
 
 /// Builds the menu bar item and hands control to AppKit. Never returns.
@@ -824,6 +1034,13 @@ enum Face {
     Awake,
     Asleep,
     Dictating,
+    /// From the end of an utterance until a slow decision (a model reload).
+    Thinking,
+    /// While `speech::say` is talking back.
+    Speaking,
+    /// The conversation window is open: the next utterance needs no wake
+    /// word. Reuses the "acting" drawing — attentive rather than idle.
+    Listening,
     /// The blink after a command; never the resting state.
     Acting,
 }
@@ -837,6 +1054,14 @@ struct Bar {
     status: Status,
     /// Set while dictating: a different face.
     dictating: Arc<AtomicBool>,
+    /// Set while the model is reloading after an utterance: a different face.
+    thinking: Arc<AtomicBool>,
+    /// Set while speaking a reply aloud: a different face.
+    speaking: Arc<AtomicBool>,
+    /// Set while the conversation window is open: a different face.
+    window_open: Arc<AtomicBool>,
+    /// Whether `listen_mode = "hold"`, so the tooltip can say so.
+    hold_mode: bool,
 }
 
 fn run_menu_bar(
@@ -849,7 +1074,16 @@ fn run_menu_bar(
     // Raised when someone asks aloud what they can say.
     catalogue_asked: Arc<AtomicBool>,
 ) -> Result<()> {
-    let Bar { model_path, downloading, status, dictating } = bar;
+    let Bar {
+        model_path,
+        downloading,
+        status,
+        dictating,
+        thinking,
+        speaking,
+        window_open,
+        hold_mode,
+    } = bar;
     let mtm = MainThreadMarker::new()
         .ok_or_else(|| anyhow!("the menu bar must be built on the main thread"))?;
     let app = NSApplication::sharedApplication(mtm);
@@ -971,6 +1205,9 @@ fn run_menu_bar(
     let active_for_timer = Arc::clone(&active);
     let shown_face = Cell::new(if busy { Face::Asleep } else { Face::Awake });
     let dictating_for_timer = Arc::clone(&dictating);
+    let thinking_for_timer = Arc::clone(&thinking);
+    let speaking_for_timer = Arc::clone(&speaking);
+    let window_open_for_timer = Arc::clone(&window_open);
     let shown_tooltip = std::cell::RefCell::new(opening_tooltip);
     let status_for_timer = Arc::clone(&status);
     let downloading_for_timer = Arc::clone(&downloading);
@@ -1149,10 +1386,19 @@ fn run_menu_bar(
         let listening = active_for_timer.load(Ordering::Relaxed);
         // Downloading is not listening, whatever the switch says.
         let awake = listening && !downloading_for_timer.load(Ordering::Relaxed);
-        let wanted = match (awake, dictating_for_timer.load(Ordering::Relaxed)) {
-            (false, _) => Face::Asleep,
-            (true, true) => Face::Dictating,
-            (true, false) => Face::Awake,
+        let wanted = match (
+            awake,
+            speaking_for_timer.load(Ordering::Relaxed),
+            thinking_for_timer.load(Ordering::Relaxed),
+            dictating_for_timer.load(Ordering::Relaxed),
+            window_open_for_timer.load(Ordering::Relaxed),
+        ) {
+            (false, _, _, _, _) => Face::Asleep,
+            (true, true, _, _, _) => Face::Speaking,
+            (true, false, true, _, _) => Face::Thinking,
+            (true, false, false, true, _) => Face::Dictating,
+            (true, false, false, false, true) => Face::Listening,
+            (true, false, false, false, false) => Face::Awake,
         };
         if wanted == shown_face.get() {
             return;
@@ -1164,13 +1410,23 @@ fn run_menu_bar(
         // three, because they all end up flipping the same flag.
         if !downloading_for_timer.load(Ordering::Relaxed) && was_awake != awake {
             if let Ok(mut text) = status_for_timer.lock() {
-                *text = if awake { TOOLTIP_LISTENING } else { TOOLTIP_PAUSED }.to_string();
+                *text = if hold_mode {
+                    if awake { TOOLTIP_HOLD_ACTIVE } else { TOOLTIP_HOLD_IDLE }
+                } else if awake {
+                    TOOLTIP_LISTENING
+                } else {
+                    TOOLTIP_PAUSED
+                }
+                .to_string();
             }
         }
         let face = match wanted {
             Face::Awake | Face::Acting => icon::awake(),
             Face::Asleep => icon::asleep(),
             Face::Dictating => icon::dictating(),
+            Face::Thinking => icon::thinking(),
+            Face::Speaking => icon::speaking(),
+            Face::Listening => icon::acting(),
         };
         if let Ok(face) = face {
             let _ = tray_for_timer.set_icon_with_as_template(Some(face), true);
@@ -1613,7 +1869,15 @@ fn main() -> Result<()> {
         println!("Log: {}", log.display());
     }
     report_permissions();
-    let active = Arc::new(AtomicBool::new(true));
+    let listen_mode = config.listen_mode();
+    // Push-to-talk starts silent: nothing is held yet. "Always" starts
+    // listening, as it always has.
+    let active = Arc::new(AtomicBool::new(listen_mode == config::ListenMode::Always));
+    if listen_mode == config::ListenMode::Hold && !downloading.load(Ordering::Relaxed) {
+        // The status set before the config was read assumed "always"; say
+        // what push-to-talk actually starts as.
+        set_status(&status, TOOLTIP_HOLD_IDLE);
+    }
     // Raised by the listening loop when a command runs, lowered by the run
     // loop once the icon has blinked.
     let acted = Arc::new(AtomicBool::new(false));
@@ -1621,6 +1885,15 @@ fn main() -> Result<()> {
     // the face in the menu bar.
     let dictating = Arc::new(AtomicBool::new(false));
     let worker_dictating = Arc::clone(&dictating);
+    // Same idea, for the "thinking" and "speaking" faces.
+    let thinking = Arc::new(AtomicBool::new(false));
+    let worker_thinking = Arc::clone(&thinking);
+    let speaking = Arc::new(AtomicBool::new(false));
+    let worker_speaking = Arc::clone(&speaking);
+    let window_open = Arc::new(AtomicBool::new(false));
+    let worker_window_open = Arc::clone(&window_open);
+    let conversation_window = config.conversation_window();
+    let pause_during = config.pause_during();
 
     let worker_active = Arc::clone(&active);
     let worker_log_ignored = Arc::clone(&log_ignored);
@@ -1642,6 +1915,10 @@ fn main() -> Result<()> {
         downloading: Arc::clone(&downloading),
         status: Arc::clone(&status),
         dictating: Arc::clone(&dictating),
+        thinking: Arc::clone(&thinking),
+        speaking: Arc::clone(&speaking),
+        window_open: Arc::clone(&window_open),
+        hold_mode: listen_mode == config::ListenMode::Hold,
     };
     std::thread::spawn(move || {
         // First run: 670 MB before anything can be heard. Reported through
@@ -1674,6 +1951,12 @@ fn main() -> Result<()> {
             active: worker_active,
             acted: worker_acted,
             dictating: worker_dictating,
+            thinking: worker_thinking,
+            speaking: worker_speaking,
+            conversation_window,
+            window_open: worker_window_open,
+            hold_mode: listen_mode == config::ListenMode::Hold,
+            pause_during,
             voice_reply,
             microphone,
             show_catalogue: worker_catalogue,
@@ -1690,11 +1973,25 @@ fn main() -> Result<()> {
 
     // Kept alive for the life of the process: dropping it stops the watch.
     if let Some(shortcut) = config.resume_shortcut() {
-        if hotkey::watch(&shortcut, Arc::clone(&active)) {
-            note!("Shortcut {shortcut} pauses and resumes.");
+        let mode = match listen_mode {
+            config::ListenMode::Always => hotkey::Mode::Toggle,
+            config::ListenMode::Hold => hotkey::Mode::Hold,
+        };
+        if hotkey::watch(&shortcut, Arc::clone(&active), mode) {
+            match listen_mode {
+                config::ListenMode::Always => note!("Shortcut {shortcut} pauses and resumes."),
+                config::ListenMode::Hold => {
+                    note!("Push-to-talk: listens only while {shortcut} is held.");
+                }
+            }
         } else {
             note!("Cannot read the shortcut «{shortcut}»; ignoring it.");
         }
+    } else if listen_mode == config::ListenMode::Hold {
+        note!(
+            "listen_mode is \"hold\" but resume_shortcut is empty — Minion \
+             has no key to listen while held and will stay silent."
+        );
     }
 
     run_menu_bar(
