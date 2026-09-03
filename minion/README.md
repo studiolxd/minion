@@ -232,6 +232,53 @@ rather than the normalised form used for matching, and it is sent as a
 Unicode string rather than as keystrokes, so ñ and á do not depend on the
 keyboard layout.
 
+### Dictado
+
+"minion, **empieza a dictar**" (also *modo dictado*) opens a longer
+session: everything said afterwards is typed, one chunk at a time, until
+"minion, **deja de dictar**" (also *fin del dictado*). Three things happen
+to the words on the way to the keyboard:
+
+**Spoken punctuation.** Say the sign instead of typing it:
+
+| Say | Types | Say | Types |
+|---|---|---|---|
+| coma | , | dos puntos | : |
+| punto | . | punto y coma | ; |
+| punto y aparte | . and a new paragraph | punto y seguido | . |
+| nueva línea / salto de línea | a line break | puntos suspensivos | … |
+| abre/cierra interrogación | ¿ / ? | abre/cierra exclamación | ¡ / ! |
+| abre/cierra paréntesis | ( / ) | comillas | " (opens, then closes) |
+| guion | - | arroba | @ |
+| almohadilla | # | barra | / |
+
+Spacing follows Spanish typography on its own: no space before `, . ; : ? !
+)`, one after; nothing after an opening `¿ ¡ (` or an opening quote. To
+type one of these words instead of its sign, say "**literal**" first —
+"literal coma" types the word *coma*. Turn all of it off with
+`spoken_punctuation = false`.
+
+**Capitalisation.** The first word of a dictation, and whatever follows a
+`. ? !`, gets a capital automatically. "**mayúscula**" capitalises just the
+next word; "**en mayúsculas** X" shouts the rest of the chunk. Off with
+`auto_capitalise = false`.
+
+**Personal vocabulary.** For names the recogniser cannot spell — the log
+showed «Mir Ángel Sufire García» for a real name — `config.toml` can say
+what to type instead of what was actually heard:
+
+```toml
+[[dictation_words]]
+heard = "mir angel sufire"
+written = "Miguel Ángel Subir"
+```
+
+Matching ignores accents and case, checks the longest entry first, and
+runs before punctuation, so a name mid-sentence still gets its signs
+around it. Whole numbers work the same way without any configuration —
+"treinta y cinco" or "número cuarenta y dos" type as digits — for figures
+up to 999 999.
+
 ### The same words, read where you are
 
 A phrase can mean the right thing in each place instead of needing a

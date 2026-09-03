@@ -134,6 +134,22 @@ pub struct Config {
     /// Entirely new commands, bound to a keyboard shortcut.
     #[serde(default)]
     pub commands: Vec<CommandConfig>,
+
+    /// Whether spoken punctuation ("coma", "punto", "abre interrogación"…)
+    /// is turned into signs while dictating. On by default; turn off to
+    /// type every such word verbatim.
+    #[serde(default = "yes")]
+    pub spoken_punctuation: bool,
+
+    /// Whether dictation capitalises the start of a sentence, and honours
+    /// «mayúscula»/«en mayúsculas». On by default.
+    #[serde(default = "yes")]
+    pub auto_capitalise: bool,
+
+    /// Words the recogniser reliably mangles, and what to type instead —
+    /// almost always names. Applied while dictating, before punctuation.
+    #[serde(default)]
+    pub dictation_words: Vec<DictationWordConfig>,
 }
 
 /// A command of your own: what to say, and which keys to press.
@@ -167,6 +183,19 @@ pub struct AudioConfig {
     pub max_utterance_ms: Option<usize>,
 }
 
+/// A name (or other word) the recogniser reliably mangles, and the correct
+/// spelling to type instead — the fix for the log's «unknown ...» lines
+/// that turn out to be a mangled name rather than an unrecognised command.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DictationWordConfig {
+    /// What the recogniser actually produces, matched via
+    /// [`crate::text::normalise`] so accents and case do not matter.
+    pub heard: String,
+    /// What to type instead, exactly as written here.
+    pub written: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
@@ -196,6 +225,9 @@ impl Default for Config {
             voice: None,
             speech_rate: None,
             unload_after_minutes: None,
+            spoken_punctuation: true,
+            auto_capitalise: true,
+            dictation_words: Vec::new(),
         }
     }
 }
@@ -531,6 +563,27 @@ impl Config {
             .collect()
     }
 
+    /// Personal vocabulary, normalised on the heard side and sorted so the
+    /// longest heard phrase is tried first — "mir angel sufire" must be
+    /// matched whole rather than stopping at a shorter entry that also
+    /// happens to fit its start.
+    pub fn dictation_words(&self) -> Vec<(Vec<String>, String)> {
+        let mut entries: Vec<(Vec<String>, String)> = self
+            .dictation_words
+            .iter()
+            .map(|word| {
+                let heard = crate::text::normalise(&word.heard)
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect();
+                (heard, word.written.clone())
+            })
+            .filter(|(heard, _): &(Vec<String>, String)| !heard.is_empty())
+            .collect();
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.0.len()));
+        entries
+    }
+
     pub fn wake_words(&self) -> Option<Vec<&'static str>> {
         if self.wake_words.is_empty() {
             return None;
@@ -771,6 +824,42 @@ mod tests {
         let commands = config.extra_commands();
         assert_eq!(commands.len(), 1, "the good one should survive");
         assert_eq!(commands[0].name, "bueno");
+    }
+
+    #[test]
+    fn spoken_punctuation_and_auto_capitalise_are_on_by_default() {
+        let config: Config = toml::from_str("").expect("empty config should parse");
+        assert!(config.spoken_punctuation);
+        assert!(config.auto_capitalise);
+        let quiet: Config =
+            toml::from_str("spoken_punctuation = false\nauto_capitalise = false\n")
+                .expect("should parse");
+        assert!(!quiet.spoken_punctuation);
+        assert!(!quiet.auto_capitalise);
+    }
+
+    #[test]
+    fn dictation_words_are_normalised_on_the_heard_side_and_sorted_longest_first() {
+        let config: Config = toml::from_str(
+            r#"
+            [[dictation_words]]
+            heard = "Mir"
+            written = "MIR"
+
+            [[dictation_words]]
+            heard = "Mir Ángel Sufire"
+            written = "Miguel Ángel Subir"
+            "#,
+        )
+        .expect("dictation_words should parse");
+        let words = config.dictation_words();
+        assert_eq!(
+            words,
+            vec![
+                (vec!["mir".to_string(), "angel".to_string(), "sufire".to_string()], "Miguel Ángel Subir".to_string()),
+                (vec!["mir".to_string()], "MIR".to_string()),
+            ]
+        );
     }
 
     #[test]

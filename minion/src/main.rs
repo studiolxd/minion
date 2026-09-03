@@ -12,6 +12,7 @@ mod answers;
 mod audio;
 mod commands;
 mod config;
+mod dictation;
 mod enroll;
 mod fbank;
 mod hotkey;
@@ -377,6 +378,10 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
     // utterance to the next. That memory, and the rules that go with it,
     // are in `session`; what follows only carries them out.
     let mut session = Session::new();
+    // Built fresh each time dictation starts, so its state (the pending
+    // capital, an open quote) never spans two dictation sessions, and a
+    // vocabulary edited while Minion was running takes effect right away.
+    let mut transformer: Option<dictation::Transformer> = None;
     note!("Model loaded. {}", resident_memory());
 
     // How long to stay deaf after speaking: the segmenter needs
@@ -576,23 +581,44 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
             match session.interpret(&part, decision, context.as_deref()) {
                 Outcome::EnterDictation => {
                     note!("dictation started — say «deja de dictar» to stop");
+                    transformer = Some(dictation::Transformer::new(&config::load()));
                     dictating.store(true, Ordering::Relaxed);
                     acted.store(true, Ordering::Relaxed);
                 }
                 Outcome::LeaveDictation => {
+                    transformer = None;
                     dictating.store(false, Ordering::Relaxed);
                     note!("dictation ended");
                 }
                 Outcome::NotDictating => note!("not dictating"),
                 // Heard while dictating, with nothing in it to type.
                 Outcome::Nothing => {}
-                Outcome::Type(typed) => match actions::type_text(&format!("{typed} ")) {
-                    Ok(()) => {
-                        note!("typed    «{typed}»");
-                        acted.store(true, Ordering::Relaxed);
+                Outcome::Type(typed) => {
+                    // `session` recorded an undo length in spoken
+                    // characters (see `Undoable::Typed` in session.rs,
+                    // which this module must not touch); what actually
+                    // reaches the keyboard is the rendered text, so any
+                    // difference is written down rather than left to make
+                    // "deshaz" silently wrong.
+                    let rendered = transformer
+                        .as_mut()
+                        .map(|t| t.render(&typed))
+                        .unwrap_or_else(|| typed.clone());
+                    match actions::type_text(&format!("{rendered} ")) {
+                        Ok(()) => {
+                            note!("typed    «{rendered}»");
+                            let (spoken_len, rendered_len) =
+                                (typed.chars().count(), rendered.chars().count());
+                            if rendered_len != spoken_len {
+                                note!(
+                                    "dictation rendered {rendered_len} chars from {spoken_len} spoken"
+                                );
+                            }
+                            acted.store(true, Ordering::Relaxed);
+                        }
+                        Err(reason) => note!("BLOCKED  «{rendered}»  ->  escribir texto: {reason}"),
                     }
-                    Err(reason) => note!("BLOCKED  «{typed}»  ->  escribir texto: {reason}"),
-                },
+                }
                 Outcome::Answer(question) => {
                     // "¿Qué puedes hacer?" is answered by showing the list.
                     if question == answers::Question::Help {
