@@ -91,7 +91,7 @@ pub struct Config {
     ///
     /// Only used once `minion enroll` has recorded a voice. Higher rejects
     /// more, including you on a bad day; lower lets others through. Zero to
-    /// one, default 0.45.
+    /// one, default 0.32.
     pub voice_threshold: Option<f32>,
 
     /// Which microphone to listen through.
@@ -605,5 +605,19 @@ mod tests {
     fn a_typo_is_reported_not_silently_accepted() {
         let bad: Result<Config, _> = toml::from_str("[audio]\nsilence_end = 900\n");
         assert!(bad.is_err(), "unknown fields must not pass unnoticed");
+    }
+
+    /// Every setting in the shipped example must still be a real field on
+    /// [`Config`] — this is what stops `config.example.toml` from drifting
+    /// into a stale copy of something else, as it once did.
+    #[test]
+    fn example_config_parses() {
+        let config: Config = toml::from_str(include_str!("../config.example.toml"))
+            .expect("the example config should parse as a real Config");
+        // Everything in the example is commented out, so this is the
+        // all-defaults case — but parsing it at all is the point.
+        assert!(config.wake_words().is_none());
+        assert_eq!(config.voice_threshold(), DEFAULT_VOICE_THRESHOLD);
+        assert_eq!(config.command_threshold(), crate::commands::DEFAULT_THRESHOLD);
     }
 }
