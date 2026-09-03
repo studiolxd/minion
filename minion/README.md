@@ -11,8 +11,9 @@ Control your Mac by speaking Spanish. Always listening, entirely offline.
 Lives in the menu bar as a small face — eye open while listening, eye shut
 when paused. No Dock icon.
 
-The menu holds one toggle (Pausar / Escuchar), *Aprender del registro…*,
-*Preferencias…*, *Ver el registro*, and Salir.
+The menu holds one toggle (Pausar / Escuchar), a *Registro* submenu
+(*Aprender*, *Ver el registro*), *Ajustes…*, *Reiniciar*, *Ayuda*, and
+Salir.
 
 The icon is a template image drawn once as SVG, rendered for the menu bar
 at run time and for the app at build time, so the two cannot drift apart.
@@ -46,10 +47,11 @@ Uses the system synthesiser and whichever Spanish voice macOS has, which
 costs nothing to ship and is good enough to settle the harder question of
 *when* to speak. Turn it off in preferences, or set `speak = false`.
 
-## Preferences
+## Ajustes
 
-A native window, opened from the menu. It covers what is worth changing
-without reading documentation:
+A native window, opened from the menu (called *Ajustes* — macOS 13+'s name
+for Preferences). It covers what is worth changing without reading
+documentation:
 
 - sound on running a command
 - whether what other people say is written to the log, or only counted
@@ -58,6 +60,18 @@ without reading documentation:
   than a number: nobody wants to type 0.72, they want it to be less touchy
 - **pausa que cierra una frase** — longer if it cuts you off while thinking
 - **liberar memoria** — idle minutes before the model is released
+- keeping recordings of what was heard, for working out why recognition
+  behaves oddly — off by default, since it writes everything said nearby
+- the pause/resume keyboard shortcut, captured by pressing it rather than
+  typing its name; a modifier is required, Escape cancels the capture, and
+  **Ninguno** turns the shortcut off entirely
+- **tu voz** — enrol or forget the voice profile Minion checks commands
+  against; *Olvidar mi voz* deletes it after confirming, and Minion goes
+  back to obeying whoever speaks
+
+The menu bar's tooltip mirrors this without opening anything: it says
+whether Minion is listening or paused, and after each utterance shows the
+last thing heard and what happened to it, shortened to one line.
 
 The controls report by being read rather than by calling back. AppKit
 delivers actions to an Objective-C target, which from Rust means declaring
@@ -90,6 +104,12 @@ change, and keeping them outside means reinstalling does not fetch them
 again. `./download-model.sh` gets them ahead of time if you would rather
 not wait on the first launch.
 
+Each file is pinned to a specific commit of its Hugging Face repository —
+not the mutable `resolve/main` — and checked against a known SHA-256
+before being kept, so a truncated download or a swapped model is rejected
+rather than silently accepted. `MINION_MODEL` points Minion at a model
+folder somewhere else, for testing a different build.
+
 Grant microphone access when asked. For commands that press keys (copy,
 save, close tab) also grant Accessibility under System Settings → Privacy
 & Security → Accessibility, then restart Minion.
@@ -117,13 +137,25 @@ permissions to whichever binary asks for them. Run from a terminal and the
 microphone permission belongs to the terminal, which then grants it to
 every script you run there. Bundled, it is Minion's alone.
 
-`./uninstall.sh` removes it.
+`./uninstall.sh` removes the app and the launch agent, but leaves your
+data — voice profile, config, recordings, logs — behind, the same way
+quitting an app does not erase its documents. `./uninstall.sh --purge`
+deletes that too, after a typed confirmation.
+
+Other ways to reach Minion from a terminal:
+
+```bash
+minion --help                       # this, in Spanish
+minion enroll                       # record a voice profile without the window
+minion export-icon <directory>      # write the menu-bar face as a .iconset
+minion learn [--apply]              # turn `unknown` log lines into aliases
+```
 
 ## How it works
 
 ```
 microphone (48 kHz)
-    │  downmix and decimate
+    │  downmix, low-pass filter, decimate
 16 kHz mono
     │  energy-based speech detection
 one utterance
@@ -137,8 +169,11 @@ Everything runs locally. Nothing is sent anywhere.
 
 ## Speaking to it
 
-Every command opens with the wake word — **ordenador**. Only at the start,
-so "le dije al minion que abriera Chrome" does nothing.
+Every command opens with the wake word — **minion**, by default. Only at
+the start, so "le dije al minion que abriera Chrome" does nothing. It is
+matched loosely: a recogniser slip like "minial" or "minio" still opens a
+command, and "mini on" — the wake word split into two by the recogniser —
+is rejoined before being judged. Configurable in `config.toml`.
 
 Phrasing is forgiving by design. Filler words are dropped and verbs are
 reduced to one form, so a single entry in the table covers the ways people
@@ -317,7 +352,7 @@ much worse than missing one.
 **Deciding and acting are separate.** `commands::decide_in` is pure and
 returns a `Decision`; `commands::perform` carries it out. That is what
 makes the vocabulary testable without applications opening for real —
-the test suite checks all 970 phrases without touching the system.
+the test suite checks about a thousand phrases without touching the system.
 
 **Key codes are positional, not character-based.** Code 8 is wherever `C`
 sits on a US keyboard, which on a Spanish ISO layout is also `C`, so ⌘C
@@ -356,12 +391,12 @@ From a terminal:
 ```
 Phrases that look like an existing command:
 
-  «Ordenador retroceder página.»  ×2
+  «Minion retroceder página.»  ×2
       → atrás (100% similar)
 
 No command resembles these — they may need a new one:
 
-  «Ordenador reproduce la canción vértigo.»
+  «Minion reproduce la canción vértigo.»
 ```
 
 `--apply` writes the first group into `config.toml` as aliases. The
@@ -377,7 +412,7 @@ what is still missing rather than everything that ever failed.
 cargo test
 ```
 
-30 tests. The ones that matter most check that ordinary conversation is
+179 tests. The ones that matter most check that ordinary conversation is
 ignored, that every declared phrase reaches its own command, and that no
 two commands claim the same phrase.
 
@@ -402,7 +437,5 @@ rebuilding.
 - **Real VAD.** Energy cannot tell speech from a door slam, and background
   music keeps it triggering. Silero VAD is the next step.
 
-- **Custom key commands in the config file**: applications and aliases can
-  be added there, but not entirely new shortcuts.
 - **Developer ID signing**, so the app can be shared with other machines.
   The ad-hoc signature is enough for this one.
