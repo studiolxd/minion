@@ -51,3 +51,68 @@ name = "ventana privada"
 phrases = ["ventana de incógnito", "modo incógnito"]
 keys = "cmd-shift-n"
 bundles = ["com.google.Chrome", "com.apple.Safari"]
+
+[[commands]]
+name = "guardar en marcadores"
+phrases = ["guarda esto en marcadores", "añadir a marcadores"]
+keys = "cmd-d"
+bundles = ["com.google.Chrome", "com.apple.Safari"]
+
+[[commands]]
+name = "aumentar zoom"
+phrases = ["aumenta el zoom", "aumentar zoom"]
+keys = "cmd-equals"
+bundles = ["com.google.Chrome", "com.apple.Safari"]
+
+[[commands]]
+name = "reducir zoom"
+phrases = ["reduce el zoom", "reducir zoom"]
+keys = "cmd-minus"
+bundles = ["com.google.Chrome", "com.apple.Safari"]
+
+[[commands]]
+name = "restablecer zoom"
+phrases = ["restablece el zoom", "restablecer zoom"]
+keys = "cmd-0"
+bundles = ["com.google.Chrome", "com.apple.Safari"]
+
+[[commands]]
+name = "bajar página"
+phrases = ["baja la página", "bajar página"]
+keys = "space"
+bundles = ["com.google.Chrome", "com.apple.Safari"]
+
+[[commands]]
+name = "subir página"
+phrases = ["sube la página", "subir página"]
+keys = "shift-space"
+bundles = ["com.google.Chrome", "com.apple.Safari"]
+
+[[commands]]
+name = "copiar la url"
+phrases = ["copia la url", "copiar la url"]
+action = "browser:copy-url"
+bundles = ["com.google.Chrome", "com.apple.Safari"]
+
+# Neither browser has a default shortcut for this, so each goes through its
+# own scripting dictionary — hence two entries with the same phrase, one
+# per bundle, rather than one shared `keys`.
+
+[[commands]]
+name = "duplicar pestaña safari"
+phrases = ["duplica la pestaña", "duplicar pestaña"]
+action = "browser:duplicate-tab-safari"
+bundles = ["com.apple.Safari"]
+
+[[commands]]
+name = "duplicar pestaña chrome"
+phrases = ["duplica la pestaña", "duplicar pestaña"]
+action = "browser:duplicate-tab-chrome"
+bundles = ["com.google.Chrome"]
+
+# Safari only: Chrome has no built-in reader mode to bind a shortcut to.
+[[commands]]
+name = "modo lectura"
+phrases = ["activa el modo lectura", "activar modo lectura"]
+keys = "cmd-shift-r"
+bundles = ["com.apple.Safari"]

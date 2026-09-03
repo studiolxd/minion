@@ -25,6 +25,7 @@ mod spanish;
 mod speech;
 mod startup;
 mod speaker;
+mod system;
 mod text;
 mod vocabulary;
 

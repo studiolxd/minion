@@ -55,8 +55,14 @@
 #
 #     The actions `action` can name: volume:up, volume:down, volume:mute,
 #     volume:unmute, music:play, music:pause, music:next, music:previous,
-#     minion:sleep. There is deliberately no way to run a script from here:
-#     a vocabulary file is data someone may have downloaded, not code.
+#     minion:sleep, window:left, window:right, window:maximize,
+#     window:other-screen, system:brightness-up, system:brightness-down,
+#     system:dark-mode, system:wifi-on, system:wifi-off,
+#     system:empty-trash, system:sleep-display, system:screenshot-window,
+#     clipboard:clear, browser:copy-url, browser:duplicate-tab-safari,
+#     browser:duplicate-tab-chrome. There is deliberately no way to run a
+#     script from here: a vocabulary file is data someone may have
+#     downloaded, not code.
 #
 #   [[sites]]
 #   name = "gmail"                   # said on its own, after an opening verb
@@ -227,6 +233,46 @@ name = "ocultar app"
 phrases = ["esconde la aplicación"]
 keys = "cmd-h"
 
+[[commands]]
+name = "ventana izquierda"
+phrases = ["pon la ventana a la izquierda", "poner ventana izquierda"]
+action = "window:left"
+
+[[commands]]
+name = "ventana derecha"
+phrases = ["pon la ventana a la derecha", "poner ventana derecha"]
+action = "window:right"
+
+[[commands]]
+name = "maximizar ventana"
+phrases = ["maximiza la ventana", "maximizar ventana"]
+action = "window:maximize"
+
+[[commands]]
+name = "ventana a otra pantalla"
+phrases = ["mueve la ventana a la otra pantalla", "mover ventana a otra pantalla"]
+action = "window:other-screen"
+
+[[commands]]
+name = "escritorio siguiente"
+phrases = ["pasa al escritorio siguiente", "siguiente escritorio", "pasar al escritorio siguiente"]
+keys = "ctrl-right"
+
+[[commands]]
+name = "escritorio anterior"
+phrases = ["vuelve al escritorio anterior", "escritorio anterior", "volver al escritorio anterior"]
+keys = "ctrl-left"
+
+[[commands]]
+name = "mostrar escritorio"
+phrases = ["muestra el escritorio", "mostrar escritorio"]
+keys = "f11"
+
+[[commands]]
+name = "mission control"
+phrases = ["abre mission control", "abrir mission control"]
+keys = "ctrl-up"
+
 # ── Navigation ──────────────────────────────────────────────────────────
 
 [[commands]]
@@ -280,6 +326,58 @@ keys = "cmd-space"
 name = "bloquear pantalla"
 phrases = ["bloquea la pantalla"]
 keys = "ctrl-cmd-q"
+
+[[commands]]
+name = "captura de ventana"
+phrases = ["captura la ventana", "capturar la ventana"]
+action = "system:screenshot-window"
+
+[[commands]]
+name = "subir brillo"
+phrases = ["sube el brillo", "subir brillo"]
+action = "system:brightness-up"
+
+[[commands]]
+name = "bajar brillo"
+phrases = ["baja el brillo", "bajar brillo"]
+action = "system:brightness-down"
+
+[[commands]]
+name = "modo oscuro"
+phrases = ["cambia el modo oscuro", "cambiar el modo oscuro"]
+action = "system:dark-mode"
+
+[[commands]]
+name = "activar wifi"
+phrases = ["activa el wifi", "activar wifi"]
+action = "system:wifi-on"
+
+[[commands]]
+name = "desactivar wifi"
+phrases = ["desactiva el wifi", "desactivar wifi"]
+action = "system:wifi-off"
+
+[[commands]]
+name = "vaciar papelera"
+phrases = ["vacía la papelera", "vaciar papelera"]
+action = "system:empty-trash"
+
+[[commands]]
+name = "apagar pantalla"
+phrases = ["apaga la pantalla", "apagar pantalla"]
+action = "system:sleep-display"
+
+# ── Clipboard ───────────────────────────────────────────────────────────
+
+[[commands]]
+name = "pegar sin formato"
+phrases = ["pega como texto plano", "pegar como texto plano"]
+keys = "cmd-alt-shift-v"
+
+[[commands]]
+name = "borrar portapapeles"
+phrases = ["borra el portapapeles", "borrar portapapeles"]
+action = "clipboard:clear"
 
 # ── Sound ───────────────────────────────────────────────────────────────
 
