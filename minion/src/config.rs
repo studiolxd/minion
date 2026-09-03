@@ -249,6 +249,12 @@ pub struct Config {
     /// rejects — taking every other setting down with it.
     #[serde(default)]
     pub ai: AiConfig,
+
+    /// How eagerly Minion releases memory when idle: "auto" (the
+    /// default) follows whether the machine is on battery power,
+    /// "battery" always behaves as if it were, "performance" never
+    /// unloads anything. See [`Config::energy_mode`].
+    pub energy: Option<String>,
 }
 
 /// The `[ai]` table: which model answers what the vocabulary cannot, and
@@ -327,7 +333,73 @@ pub enum ListenMode {
     Hold,
 }
 
-/// A command of your own: what to say, and which keys to press.
+/// How eagerly Minion releases memory when idle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnergyMode {
+    /// Follows whether the machine is on battery power.
+    Auto,
+    /// Never unloads anything, battery or not.
+    Performance,
+    /// Behaves as if always on battery power.
+    Battery,
+}
+
+/// Idle minutes before the speech model is released while on battery
+/// power (or in `battery` mode), regardless of `unload_after_minutes` —
+/// measured to be short enough to matter on a laptop with the lid up all
+/// day, long enough not to cost a reload on every other sentence.
+pub const BATTERY_MODEL_UNLOAD_MINUTES: u64 = 2;
+
+/// Idle minutes before the speaker model is released on battery power (or
+/// in `battery` mode). Longer than the speech model's: reloading it costs
+/// a fresh embedding of the voice profile as well as the model weights,
+/// and it is smaller to begin with, so there is less to gain from letting
+/// it go early.
+pub const BATTERY_SPEAKER_UNLOAD_MINUTES: u64 = 10;
+
+/// What the idle tick should unload, worked out from the energy mode,
+/// whether the machine is on battery power right now, how long nothing has
+/// been said, and the ordinary (non-energy) idle threshold from
+/// `unload_after_minutes`.
+///
+/// Pure on purpose — reading `pmset` and the wall clock belong to the
+/// caller, so this can be tested against fabricated inputs instead of a
+/// real idle Minion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnergyDecision {
+    pub unload_model: bool,
+    pub unload_speaker: bool,
+}
+
+pub fn energy_decision(
+    mode: EnergyMode,
+    on_battery: bool,
+    idle: Duration,
+    normal_unload_after: Option<Duration>,
+) -> EnergyDecision {
+    if mode == EnergyMode::Performance {
+        return EnergyDecision { unload_model: false, unload_speaker: false };
+    }
+    if mode == EnergyMode::Battery || on_battery {
+        return EnergyDecision {
+            unload_model: idle >= Duration::from_secs(BATTERY_MODEL_UNLOAD_MINUTES * 60),
+            unload_speaker: idle >= Duration::from_secs(BATTERY_SPEAKER_UNLOAD_MINUTES * 60),
+        };
+    }
+    EnergyDecision {
+        unload_model: normal_unload_after.is_some_and(|after| idle >= after),
+        unload_speaker: false,
+    }
+}
+
+/// A command of your own: what to say, and what to do — a shortcut, an
+/// AppleScript, or a shell command. Exactly one of `keys`, `script` and
+/// `shell` must be given; see [`Config::extra_commands`].
+///
+/// `script` and `shell` exist here and nowhere else on purpose: a
+/// downloaded vocabulary pack cannot ask Minion to run anything, since it
+/// is data that may have come from elsewhere, but a line typed into your
+/// own `config.toml` is not.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommandConfig {
@@ -336,7 +408,12 @@ pub struct CommandConfig {
     /// Ways of saying it.
     pub phrases: Vec<String>,
     /// The shortcut, as written on a menu: "cmd-shift-b", "ctrl+alt+left".
-    pub keys: String,
+    pub keys: Option<String>,
+    /// AppleScript, run via `osascript -e`.
+    pub script: Option<String>,
+    /// A shell command, run via `/bin/sh -c` with stdin closed, its output
+    /// logged, and a 30-second ceiling. Never in a terminal window.
+    pub shell: Option<String>,
 }
 
 /// Another way of saying an existing command.
@@ -434,6 +511,7 @@ impl Default for Config {
             show_hud: false,
             check_updates: true,
             ai: AiConfig::default(),
+            energy: None,
         }
     }
 }
@@ -736,6 +814,52 @@ fn vad_named(name: Option<&str>) -> Option<audio::Vad> {
     None
 }
 
+/// Works out what a `[[commands]]` entry does: exactly one of `keys`,
+/// `script` and `shell`. Reported and dropped if it names none or more
+/// than one, or a `keys` value that cannot be read.
+fn command_action(entry: &CommandConfig) -> Option<crate::commands::Action> {
+    let mut asked: Vec<crate::commands::Action> = Vec::new();
+    if let Some(keys) = &entry.keys {
+        match crate::actions::parse_shortcut(keys) {
+            Some((code, mods)) => asked.push(crate::commands::Action::Key(code, mods)),
+            None => {
+                crate::journal::write(&format!(
+                    "Ignoring command «{}»: cannot read the shortcut «{keys}»",
+                    entry.name
+                ));
+                return None;
+            }
+        }
+    }
+    if let Some(script) = &entry.script {
+        asked.push(crate::commands::Action::RunScript(Box::leak(
+            script.clone().into_boxed_str(),
+        )));
+    }
+    if let Some(shell) = &entry.shell {
+        asked.push(crate::commands::Action::RunShell(Box::leak(
+            shell.clone().into_boxed_str(),
+        )));
+    }
+    match asked.len() {
+        1 => Some(asked[0]),
+        0 => {
+            crate::journal::write(&format!(
+                "Ignoring command «{}»: it does nothing — give it keys, script or shell",
+                entry.name
+            ));
+            None
+        }
+        _ => {
+            crate::journal::write(&format!(
+                "Ignoring command «{}»: it asks for more than one thing at once",
+                entry.name
+            ));
+            None
+        }
+    }
+}
+
 impl Config {
     /// Audio settings, with anything unset left at its default.
     pub fn audio_settings(&self) -> audio::Settings {
@@ -865,21 +989,30 @@ impl Config {
         }
     }
 
+    /// How eagerly to release memory when idle.
+    ///
+    /// Anything other than "performance" or "battery" — including a typo
+    /// or nothing at all — falls back to "auto", the same way
+    /// [`Self::listen_mode`] falls back to "always".
+    pub fn energy_mode(&self) -> EnergyMode {
+        match self.energy.as_deref() {
+            Some("performance") => EnergyMode::Performance,
+            Some("battery") => EnergyMode::Battery,
+            _ => EnergyMode::Auto,
+        }
+    }
+
     /// Commands defined in the file, as `'static` entries.
     ///
-    /// Anything whose shortcut cannot be read is reported and skipped: one
-    /// typo should cost that command, not the whole file.
+    /// Exactly one of `keys`, `script` and `shell` must be given; naming
+    /// none or more than one is reported and the entry is skipped, the
+    /// same as a shortcut that cannot be read — one bad line costs that
+    /// command, not the whole file.
     pub fn extra_commands(&self) -> Vec<crate::commands::Command> {
         self.commands
             .iter()
             .filter_map(|entry| {
-                let Some((code, mods)) = crate::actions::parse_shortcut(&entry.keys) else {
-                    crate::journal::write(&format!(
-                        "Ignoring command «{}»: cannot read the shortcut «{}»",
-                        entry.name, entry.keys
-                    ));
-                    return None;
-                };
+                let action = command_action(entry)?;
                 let phrases: Vec<&'static str> = entry
                     .phrases
                     .iter()
@@ -888,7 +1021,7 @@ impl Config {
                 Some(crate::commands::Command {
                     phrases: Box::leak(phrases.into_boxed_slice()),
                     name: Box::leak(entry.name.clone().into_boxed_str()),
-                    action: crate::commands::Action::Key(code, mods),
+                    action,
                     category: crate::vocabulary::USER_CATEGORY,
                 })
             })
@@ -1279,6 +1412,43 @@ mod tests {
     }
 
     #[test]
+    fn a_command_can_run_a_script_or_a_shell_command_instead_of_keys() {
+        let config: Config = toml::from_str(
+            r#"
+            [[commands]]
+            name = "vacía la papelera"
+            phrases = ["vacía la papelera"]
+            script = "tell application \"Finder\" to empty trash"
+
+            [[commands]]
+            name = "backup"
+            phrases = ["haz una copia"]
+            shell = "rsync -a ~/Documents ~/Backup"
+            "#,
+        )
+        .expect("should parse");
+        let commands = config.extra_commands();
+        assert_eq!(commands.len(), 2);
+        assert!(matches!(commands[0].action, crate::commands::Action::RunScript(_)));
+        assert!(matches!(commands[1].action, crate::commands::Action::RunShell(_)));
+    }
+
+    #[test]
+    fn a_command_with_keys_and_a_script_is_refused() {
+        let config: Config = toml::from_str(
+            r#"
+            [[commands]]
+            name = "ambiguo"
+            phrases = ["esto no vale"]
+            keys = "cmd-k"
+            script = "beep"
+            "#,
+        )
+        .expect("should parse");
+        assert!(config.extra_commands().is_empty(), "asking for two things is refused");
+    }
+
+    #[test]
     fn spoken_punctuation_and_auto_capitalise_are_on_by_default() {
         let config: Config = toml::from_str("").expect("empty config should parse");
         assert!(config.spoken_punctuation);
@@ -1430,5 +1600,65 @@ mod tests {
         // set_option relies on.
         let broken = "[[aliases]]\ncommand = \"x\"\nphrase = \"y\"\n[audio\n";
         assert!(parse_checked(without_alias(broken, "y")).is_err());
+    }
+
+    #[test]
+    fn energy_mode_defaults_to_auto_and_a_typo_falls_back_to_it() {
+        let default: Config = toml::from_str("").expect("empty config should parse");
+        assert_eq!(default.energy_mode(), EnergyMode::Auto);
+        let typo: Config = toml::from_str(r#"energy = "batery""#).expect("should parse");
+        assert_eq!(typo.energy_mode(), EnergyMode::Auto);
+        let performance: Config =
+            toml::from_str(r#"energy = "performance""#).expect("should parse");
+        assert_eq!(performance.energy_mode(), EnergyMode::Performance);
+        let battery: Config = toml::from_str(r#"energy = "battery""#).expect("should parse");
+        assert_eq!(battery.energy_mode(), EnergyMode::Battery);
+    }
+
+    #[test]
+    fn performance_mode_never_unloads_anything() {
+        let decision = energy_decision(
+            EnergyMode::Performance,
+            true,
+            Duration::from_secs(3600),
+            Some(Duration::from_secs(60)),
+        );
+        assert_eq!(decision, EnergyDecision { unload_model: false, unload_speaker: false });
+    }
+
+    #[test]
+    fn auto_mode_off_battery_uses_the_ordinary_idle_threshold() {
+        let normal = Some(Duration::from_secs(300));
+        let too_soon = energy_decision(EnergyMode::Auto, false, Duration::from_secs(299), normal);
+        assert_eq!(too_soon, EnergyDecision { unload_model: false, unload_speaker: false });
+        let due = energy_decision(EnergyMode::Auto, false, Duration::from_secs(300), normal);
+        assert_eq!(due, EnergyDecision { unload_model: true, unload_speaker: false });
+    }
+
+    #[test]
+    fn auto_mode_off_battery_with_unload_disabled_never_unloads() {
+        let decision = energy_decision(EnergyMode::Auto, false, Duration::from_secs(999_999), None);
+        assert_eq!(decision, EnergyDecision { unload_model: false, unload_speaker: false });
+    }
+
+    #[test]
+    fn auto_mode_on_battery_uses_the_shorter_thresholds() {
+        let two_minutes = Duration::from_secs(BATTERY_MODEL_UNLOAD_MINUTES * 60);
+        let ten_minutes = Duration::from_secs(BATTERY_SPEAKER_UNLOAD_MINUTES * 60);
+        let normal = Some(Duration::from_secs(3600)); // would say "not yet" on its own
+
+        let just_model =
+            energy_decision(EnergyMode::Auto, true, two_minutes, normal);
+        assert_eq!(just_model, EnergyDecision { unload_model: true, unload_speaker: false });
+
+        let both = energy_decision(EnergyMode::Auto, true, ten_minutes, normal);
+        assert_eq!(both, EnergyDecision { unload_model: true, unload_speaker: true });
+    }
+
+    #[test]
+    fn battery_mode_behaves_like_on_battery_even_plugged_in() {
+        let two_minutes = Duration::from_secs(BATTERY_MODEL_UNLOAD_MINUTES * 60);
+        let decision = energy_decision(EnergyMode::Battery, false, two_minutes, None);
+        assert_eq!(decision, EnergyDecision { unload_model: true, unload_speaker: false });
     }
 }

@@ -17,8 +17,11 @@
 //! What a file may say is deliberately narrow: a name, some phrases, and
 //! one of four things to do — press a shortcut, run one of Minion's own
 //! named actions, type a string, open a URL. There is no way to put a
-//! script in a vocabulary file, because a vocabulary file is data that may
-//! have been downloaded, and data that runs is not data.
+//! script in a built-in file or a downloaded pack, because both are data
+//! that may have been shared around, and data that runs is not data.
+//! `config.toml` is the one exception: `script` (AppleScript) and `shell`
+//! (`/bin/sh -c`, 30 s ceiling) are read there and nowhere else — see
+//! [`read_action`].
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -123,6 +126,15 @@ struct CommandEntry {
     text: Option<String>,
     /// A page to open.
     url: Option<String>,
+    /// AppleScript to run, read only from `config.toml`.
+    ///
+    /// Never from a built-in file or a downloaded pack: those are data
+    /// that may have arrived from elsewhere, and running a script is not
+    /// something data gets to ask for. See [`read_action`].
+    script: Option<String>,
+    /// A shell command to run, read only from `config.toml`. Same reason
+    /// as `script`.
+    shell: Option<String>,
     /// Bundle identifiers this only applies in. Empty means everywhere.
     #[serde(default)]
     bundles: Vec<String>,
@@ -412,7 +424,24 @@ fn without(phrases: &'static [&'static str], unwanted: &str) -> &'static [&'stat
 /// command, not the file.
 fn read_action(entry: &CommandEntry, source: &str) -> Option<Action> {
     let name = &entry.name;
+    // `script`/`shell` are the one thing a vocabulary file cannot ask for
+    // on its own say-so: a downloaded pack is data, and data that runs is
+    // not data. Only `config.toml` — written by the person running
+    // Minion, never fetched — gets to use them. The merge already knows
+    // which file this entry came from, so the check is just that.
+    if (entry.script.is_some() || entry.shell.is_some()) && source != "config.toml" {
+        crate::note!(
+            "Ignoring script in pack {source}: scripts are only read from config.toml"
+        );
+        return None;
+    }
     let mut asked: Vec<Action> = Vec::new();
+    if let Some(script) = &entry.script {
+        asked.push(Action::RunScript(leak(script.clone())));
+    }
+    if let Some(shell) = &entry.shell {
+        asked.push(Action::RunShell(leak(shell.clone())));
+    }
     if let Some(keys) = &entry.keys {
         match actions::parse_shortcut(keys) {
             Some((code, mods)) => asked.push(Action::Key(code, mods)),
@@ -774,5 +803,51 @@ mod tests {
             vocabulary.commands[1].action,
             Action::Open("https://example.com/parte")
         ));
+    }
+
+    #[test]
+    fn a_script_or_shell_command_is_accepted_from_config_toml() {
+        let mut vocabulary = Vocabulary::default();
+        vocabulary.merge_toml(
+            "config.toml",
+            r#"
+            [[commands]]
+            name = "vacía la papelera"
+            phrases = ["vacía la papelera"]
+            script = "tell application \"Finder\" to empty trash"
+
+            [[commands]]
+            name = "backup"
+            phrases = ["haz una copia"]
+            shell = "rsync -a ~/Documents ~/Backup"
+            "#,
+        );
+        let names: Vec<&str> = vocabulary.commands.iter().map(|c| c.name).collect();
+        assert_eq!(names, ["vacía la papelera", "backup"]);
+        assert!(matches!(vocabulary.commands[0].action, Action::RunScript(_)));
+        assert!(matches!(vocabulary.commands[1].action, Action::RunShell(_)));
+    }
+
+    #[test]
+    fn a_pack_cannot_ask_for_a_script_or_a_shell_command() {
+        let mut vocabulary = Vocabulary::default();
+        vocabulary.merge_toml(
+            "pack.toml",
+            r#"
+            [[commands]]
+            name = "sospechosa"
+            phrases = ["borra todo"]
+            script = "tell application \"Finder\" to empty trash"
+
+            [[commands]]
+            name = "sospechosa2"
+            phrases = ["ejecuta esto"]
+            shell = "rm -rf ~"
+            "#,
+        );
+        assert!(
+            vocabulary.commands.is_empty(),
+            "a pack asking for a script or a shell command should be refused entirely"
+        );
     }
 }

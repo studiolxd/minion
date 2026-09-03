@@ -196,13 +196,22 @@ const TLDS: &[&str] = &["com", "es", "org", "net", "io", "dev", "app", "co", "ai
 /// Everything a vocabulary file can ask for, and nothing more: the file
 /// names an action, the action itself is Rust. `Script` is reachable only
 /// through [`crate::vocabulary`]'s fixed list of named actions, never
-/// written out in a file.
+/// written out in a file. `RunScript`/`RunShell` are the one exception,
+/// and a narrow one: a `script`/`shell` value written by hand in
+/// `config.toml` only — never a downloaded pack, never a built-in file.
+/// See `vocabulary::read_action`.
 #[derive(Clone, Copy, Debug)]
 pub enum Action {
     Key(u16, Mods),
     Volume(i32),
     Mute(bool),
     Script(&'static str),
+    /// AppleScript written by the user in `config.toml`, run via
+    /// `osascript -e`.
+    RunScript(&'static str),
+    /// A shell command written by the user in `config.toml`, run via
+    /// `/bin/sh -c`.
+    RunShell(&'static str),
     /// Type a fixed string into whatever has focus.
     Type(&'static str),
     /// Open a web address.
@@ -1640,6 +1649,16 @@ fn run_action(action: Action) -> Result<(), String> {
         Action::Volume(delta) => actions::adjust_volume(delta),
         Action::Mute(muted) => actions::set_muted(muted),
         Action::Script(script) => actions::applescript(script),
+        Action::RunScript(script) => actions::applescript(script),
+        Action::RunShell(command) => match actions::run_shell(command) {
+            Ok(output) => {
+                if !output.trim().is_empty() {
+                    crate::journal::write(&format!("shell    {output}"));
+                }
+                Ok(())
+            }
+            Err(e) => Err(e),
+        },
         Action::Type(text) => actions::type_text(text),
         Action::Open(url) => actions::open_url(url, None),
         Action::Sleep => Ok(()),
