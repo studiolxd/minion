@@ -1064,13 +1064,33 @@ fn relaunch_arguments(executable: &Path) -> Vec<std::path::PathBuf> {
 /// Minion at all. The paths are passed as arguments rather than
 /// interpolated into the script, so nothing about them can be read as
 /// shell.
+///
+/// Under launchd none of that would work: when a job's main process exits,
+/// launchd kills everything left in its process group, the waiting `sh`
+/// included, and the restart never happens — the first «Reiniciar» closed
+/// Minion and nothing came back. So the launch agent, when it is running
+/// this copy, is asked to do the restart itself (`kickstart -k` stops and
+/// starts the job); only a copy started by hand falls back to the shell,
+/// put into a session of its own so the exit cannot take it along.
 fn relaunch() {
+    if startup::kickstart() {
+        return;
+    }
     let Ok(executable) = std::env::current_exe() else {
         return;
     };
     let mut command = std::process::Command::new("/bin/sh");
     command.arg("-c").arg(r#"sleep 2; exec "$0" "$@""#);
     command.args(relaunch_arguments(&executable));
+    // Safety: setsid only detaches the child from this process group and
+    // touches no memory shared with the parent.
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        command.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
     let _ = command.spawn();
 }
 

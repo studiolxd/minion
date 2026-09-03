@@ -16,6 +16,28 @@ fn agent_path() -> Option<PathBuf> {
 }
 
 /// Whether Minion is set to start with the Mac.
+/// Asks launchd to stop and start the launch agent, if this copy runs
+/// under it. True when launchd accepted — in which case this process is
+/// about to be killed and should not bother starting anything itself.
+pub fn kickstart() -> bool {
+    let domain = format!("gui/{}", unsafe { libc::getuid() });
+    // Only a job that launchd actually manages can be kicked; a copy opened
+    // by hand while the agent is installed but not loaded is not one.
+    let managed = Command::new("/bin/launchctl")
+        .args(["print", &format!("{domain}/{LABEL}")])
+        .output()
+        .is_ok_and(|out| out.status.success());
+    let started_by_launchd =
+        std::env::var_os("XPC_SERVICE_NAME").as_deref() == Some(std::ffi::OsStr::new(LABEL));
+    if !managed || !started_by_launchd {
+        return false;
+    }
+    Command::new("/bin/launchctl")
+        .args(["kickstart", "-k", &format!("{domain}/{LABEL}")])
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 pub fn enabled() -> bool {
     agent_path().is_some_and(|path| path.exists())
 }
