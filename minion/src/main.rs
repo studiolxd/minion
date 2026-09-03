@@ -25,6 +25,7 @@ mod metrics;
 mod microphone;
 mod models;
 mod notify;
+mod onboarding;
 mod packs;
 mod preferences;
 mod session;
@@ -542,6 +543,12 @@ struct Listening {
     save_recordings: bool,
     /// What the tooltip should say.
     status: Status,
+    /// Raised once for every `Outcome::Answer` — the onboarding assistant's
+    /// "Prueba" page waits on this rather than re-parsing the tooltip.
+    answered: Arc<AtomicBool>,
+    /// Raised, and never lowered, once the microphone is proven to deliver
+    /// only silence. See `audio::SilenceWatch`.
+    mic_denied: Arc<AtomicBool>,
 }
 
 /// Settings for speaking back.
@@ -574,6 +581,8 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
         show_catalogue,
         save_recordings,
         status,
+        answered,
+        mic_denied,
     } = setup;
 
     // While Minion is speaking it must not act on what it hears: it listens
@@ -690,6 +699,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                 // Nothing but exact zeros since the stream opened: macOS
                 // denied the microphone. Said once, with somewhere to go.
                 if listener.silent.swap(false, Ordering::Relaxed) {
+                    mic_denied.store(true, Ordering::Relaxed);
                     note!("deaf     the microphone delivers only silence — permission denied?");
                     let _ = std::process::Command::new("/usr/bin/open")
                         .arg(MICROPHONE_SETTINGS)
@@ -1007,6 +1017,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                     note!("asked    «{part}»  ->  {reply}");
                     set_status(&status, &last_utterance_tooltip(&part, &reply));
                     acted.store(true, Ordering::Relaxed);
+                    answered.store(true, Ordering::Relaxed);
                     match &voice_reply {
                         Some(settings) => {
                             speaking.store(true, Ordering::Relaxed);
@@ -1328,6 +1339,12 @@ struct Bar {
     window_open: Arc<AtomicBool>,
     /// Whether `listen_mode = "hold"`, so the tooltip can say so.
     hold_mode: bool,
+    /// Raised once for every `Outcome::Answer` — read by the onboarding
+    /// assistant's "Prueba" page.
+    answered: Arc<AtomicBool>,
+    /// Raised, and never lowered, once the microphone is proven to
+    /// deliver only silence.
+    mic_denied: Arc<AtomicBool>,
 }
 
 fn run_menu_bar(
@@ -1349,6 +1366,8 @@ fn run_menu_bar(
         speaking,
         window_open,
         hold_mode,
+        answered,
+        mic_denied,
     } = bar;
     let mtm = MainThreadMarker::new()
         .ok_or_else(|| anyhow!("the menu bar must be built on the main thread"))?;
@@ -1374,6 +1393,7 @@ fn run_menu_bar(
     // a dialog, rather than acting outright.
     let update_packs = MenuItem::new("Actualizar vocabulario…", true, None);
     let commands_item = MenuItem::new("Ayuda", true, None);
+    let assistant_item = MenuItem::new("Asistente…", true, None);
     let preferences = MenuItem::new("Ajustes…", true, None);
 
     // The two things you do with the log, together. Kept in scope for the
@@ -1423,10 +1443,12 @@ fn run_menu_bar(
     menu.append(&restart)?;
     menu.append(&update_packs)?;
     menu.append(&commands_item)?;
+    menu.append(&assistant_item)?;
     menu.append(&quit)?;
 
     let toggle_id = toggle.id().clone();
     let learn_id = learn.id().clone();
+    let assistant_id = assistant_item.id().clone();
     let preferences_id = preferences.id().clone();
     let commands_id = commands_item.id().clone();
     let show_log_id = show_log.id().clone();
@@ -1439,19 +1461,42 @@ fn run_menu_bar(
     // not stack another one behind it.
     let panel = Rc::new(preferences::Preferences::new(mtm));
 
+    // Watches this application's keys, so the shortcut button can be set by
+    // pressing a combination rather than typing its name.
+    let panel_for_capture = Rc::clone(&panel);
+    let _capture = preferences::capture_keys(move |code, mods| {
+        panel_for_capture.is_capturing() && panel_for_capture.capture(code, mods)
+    });
+    // Requests from the menu thread, which must not touch AppKit itself.
+    let open_requested = Arc::new(AtomicBool::new(false));
+    let learn_requested = Arc::new(AtomicBool::new(false));
+    let catalogue_requested = Arc::new(AtomicBool::new(false));
+    let stats_requested = Arc::new(AtomicBool::new(false));
+    // "Asistente…", from the menu.
+    let assistant_requested = Arc::new(AtomicBool::new(false));
+
+    let onboarding = Rc::new(onboarding::Window::new(
+        mtm,
+        onboarding::Shared {
+            status: Arc::clone(&status),
+            downloading: Arc::clone(&downloading),
+            training: Arc::clone(&training),
+            model_path: model_path.clone(),
+            answered: Arc::clone(&answered),
+            mic_denied: Arc::clone(&mic_denied),
+            open_settings: Arc::clone(&open_requested),
+            open_catalogue: Arc::clone(&catalogue_requested),
+        },
+    ));
+
     // On a fresh install there is nothing to discover from a menu bar icon
-    // and a wake word nobody has been told about, so the window opens once
-    // by itself. The marker goes in the configuration file, which is also
-    // what creates it.
+    // and a wake word nobody has been told about, so the assistant opens
+    // once by itself. The marker goes in the configuration file, which is
+    // also what creates it.
     let first_run = config::path().is_none_or(|path| !path.exists());
     if first_run {
         let _ = config::set_option("sounds", "true");
-        actions::show_message(
-            "Minion escucha por el micrófono y obedece cuando empiezas por \
-             «minion».\n\nPrueba: «minion, abre Chrome».\n\nEn esta ventana \
-             puedes ajustar cómo escucha y enseñarle tu voz.",
-        );
-        panel.show();
+        onboarding.show();
     }
     let report = Rc::new(preferences::Report::new(
         mtm,
@@ -1468,18 +1513,6 @@ fn run_menu_bar(
         "Estadísticas",
         objc2_foundation::NSSize::new(620.0, 640.0),
     ));
-
-    // Watches this application's keys, so the shortcut button can be set by
-    // pressing a combination rather than typing its name.
-    let panel_for_capture = Rc::clone(&panel);
-    let _capture = preferences::capture_keys(move |code, mods| {
-        panel_for_capture.is_capturing() && panel_for_capture.capture(code, mods)
-    });
-    // Requests from the menu thread, which must not touch AppKit itself.
-    let open_requested = Arc::new(AtomicBool::new(false));
-    let learn_requested = Arc::new(AtomicBool::new(false));
-    let catalogue_requested = Arc::new(AtomicBool::new(false));
-    let stats_requested = Arc::new(AtomicBool::new(false));
 
     // What each "Últimas órdenes" slot currently holds, so the menu-event
     // thread — which owns no state of its own — can look one up by number
@@ -1536,6 +1569,8 @@ fn run_menu_bar(
     let acted_for_timer = Arc::clone(&acted);
     let blink_until: Cell<Option<std::time::Instant>> = Cell::new(None);
     let panel_for_timer = Rc::clone(&panel);
+    let onboarding_for_timer = Rc::clone(&onboarding);
+    let assistant_for_timer = Arc::clone(&assistant_requested);
     let open_for_timer = Arc::clone(&open_requested);
     let learn_for_timer = Arc::clone(&learn_requested);
     let training_for_timer = Arc::clone(&training);
@@ -1643,7 +1678,9 @@ fn run_menu_bar(
         // still repaints promptly.
         let throttle_tick = throttle_ticks.get().wrapping_add(1);
         throttle_ticks.set(throttle_tick);
-        let watched = panel_for_timer.is_visible() || blink_until.get().is_some();
+        let watched = panel_for_timer.is_visible()
+            || onboarding_for_timer.is_visible()
+            || blink_until.get().is_some();
         if !watched && !on_schedule(throttle_tick, UI_THROTTLE_TICKS) {
             return;
         }
@@ -1651,6 +1688,13 @@ fn run_menu_bar(
         if open_for_timer.swap(false, Ordering::Relaxed) {
             panel_for_timer.show();
         }
+        if assistant_for_timer.swap(false, Ordering::Relaxed) {
+            onboarding_for_timer.show();
+        }
+        // Reads the assistant's controls and repaints its page — see
+        // `onboarding::Window::poll`. Before the training-session block
+        // below, so a finished session's message is seen here first.
+        onboarding_for_timer.poll();
         // Leaving, by restart or quit: let the settings window save what
         // it still holds (a wake word typed but not yet committed) first.
         let restarting = restart_for_timer.swap(false, Ordering::Relaxed);
@@ -1953,6 +1997,7 @@ fn run_menu_bar(
     // serviced from another thread while AppKit owns the main one. The icon
     // and the item's text are repainted by the timer above, not from here.
     let open_from_menu = Arc::clone(&open_requested);
+    let assistant_from_menu = Arc::clone(&assistant_requested);
     let learn_from_menu = Arc::clone(&learn_requested);
     let restart_from_menu = Arc::clone(&restart_requested);
     let quit_from_menu = Arc::clone(&quit_requested);
@@ -1975,6 +2020,9 @@ fn run_menu_bar(
                 learn_from_menu.store(true, Ordering::Relaxed);
             } else if event.id == commands_id {
                 catalogue_from_menu.store(true, Ordering::Relaxed);
+            } else if event.id == assistant_id {
+                // Windows belong to the main thread; the timer opens it.
+                assistant_from_menu.store(true, Ordering::Relaxed);
             } else if event.id == preferences_id {
                 // Windows belong to the main thread; the timer opens it.
                 open_from_menu.store(true, Ordering::Relaxed);
@@ -2524,6 +2572,12 @@ fn main() -> Result<()> {
     let worker_speaking = Arc::clone(&speaking);
     let window_open = Arc::new(AtomicBool::new(false));
     let worker_window_open = Arc::clone(&window_open);
+    // Read by the onboarding assistant, on the main thread; written by the
+    // listening loop, on its own.
+    let answered = Arc::new(AtomicBool::new(false));
+    let worker_answered = Arc::clone(&answered);
+    let mic_denied = Arc::new(AtomicBool::new(false));
+    let worker_mic_denied = Arc::clone(&mic_denied);
     let conversation_window = config.conversation_window();
     let pause_when_microphone_busy = config.pause_when_microphone_busy;
 
@@ -2551,6 +2605,8 @@ fn main() -> Result<()> {
         speaking: Arc::clone(&speaking),
         window_open: Arc::clone(&window_open),
         hold_mode: listen_mode == config::ListenMode::Hold,
+        answered: Arc::clone(&answered),
+        mic_denied: Arc::clone(&mic_denied),
     };
     std::thread::spawn(move || {
         // First run: 670 MB before anything can be heard. Reported through
@@ -2594,6 +2650,8 @@ fn main() -> Result<()> {
             show_catalogue: worker_catalogue,
             save_recordings,
             status: Arc::clone(&worker_status),
+            answered: worker_answered,
+            mic_denied: worker_mic_denied,
         }) {
             fatal(&format!(
                 "Minion no puede escuchar y va a cerrarse.\n\n{e:#}\n\nComprueba \
