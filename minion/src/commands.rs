@@ -255,6 +255,39 @@ pub struct ContextualCommand {
     pub category: &'static str,
 }
 
+/// Where «dicta …» sends what follows, from `[[destinations]]` in the
+/// vocabulary.
+///
+/// Identified by `name` and looked up again at the point of use, the same
+/// way [`Decision::Run`] carries a command's name rather than a reference
+/// to it — see [`named_destination`].
+pub struct Destination {
+    /// Stable identifier, carried by [`Decision::DictateInto`].
+    pub name: &'static str,
+    /// Words that must all be present in what follows «dicta» for this to
+    /// be the one meant: `["nota"]`, `["correo"]`, `["mensaje"]`,
+    /// `["documento"]`.
+    pub trigger: &'static [&'static str],
+    /// The application to bring forward first. `None` means whatever is
+    /// already in front — «dicta en el documento».
+    pub bundle_id: Option<&'static str>,
+    /// Whether a name after «a» is expected and typed before dictation
+    /// begins.
+    pub takes_recipient: bool,
+    /// Pressed once the application is frontmost, before anything is
+    /// typed — ⌘N for a new note, email or message.
+    pub keys_before_typing: &'static [(u16, Mods)],
+    /// Pressed after the recipient has been typed, to reach the body —
+    /// two tabs in Mail (send field, then subject), one return in
+    /// Messages.
+    pub keys_after_recipient: &'static [(u16, Mods)],
+}
+
+/// The destination with this name.
+pub fn named_destination(name: &str) -> Option<&'static Destination> {
+    vocabulary().destinations.iter().find(|d| d.name == name)
+}
+
 /// Browsers, for deciding where a link should open.
 ///
 /// Stays in Rust rather than moving into `browsers.toml`: it is not a
@@ -420,6 +453,11 @@ pub enum Decision {
     Numbered { name: &'static str, number: usize, key: (u16, Mods) },
     /// Start typing everything said from now on.
     StartDictation,
+    /// «dicta …»: bring a destination's application forward, type a
+    /// recipient into it if it takes one, then start dictation. Names the
+    /// destination rather than carrying it, the same way [`Decision::Run`]
+    /// carries a command's name — see [`named_destination`].
+    DictateInto { destination: &'static str, recipient: Option<String> },
     /// Stop doing that.
     StopDictation,
     /// Undo whatever Minion last did.
@@ -708,6 +746,47 @@ fn dictation_text(transcript: &str) -> Option<String> {
     // the verb list, which holds no verb that opens a command as well.
     // Any text at all is text: "minion escribe sí" means sí.
     (!text.trim().is_empty()).then_some(text)
+}
+
+/// Recognises «dicta …» aimed at one of [`vocabulary()`]'s destinations,
+/// rather than literal text to type. Checked before [`dictation_text`], or
+/// «dicta una nota» would type the literal words "una nota" instead of
+/// opening Notas.
+///
+/// Only the verb "dictar" itself is read this way — "escribe una nota"
+/// still types "una nota" literally, exactly as before. Works on the
+/// original words, not the normalised ones, for the same reason
+/// [`dictation_replace`] does: a recipient's name must keep its capitals
+/// and accents until [`crate::dictation::spell_recipient`] rewrites it
+/// through the personal vocabulary.
+fn dictate_into(transcript: &str) -> Option<(&'static str, Option<String>)> {
+    let words: Vec<&str> = transcript.split_whitespace().collect();
+    if words.len() < 3 {
+        return None;
+    }
+    if !wake_words().contains(&normalise(words[0]).as_str()) {
+        return None;
+    }
+    if spanish::canonical_verb(&normalise(words[1])) != "dictar" {
+        return None;
+    }
+
+    let rest = &words[2..];
+    let rest_words = keywords(&rest.join(" "));
+    let destination = vocabulary()
+        .destinations
+        .iter()
+        .find(|d| d.trigger.iter().all(|needed| rest_words.iter().any(|w| w == needed)))?;
+
+    if !destination.takes_recipient {
+        return Some((destination.name, None));
+    }
+    let recipient = rest
+        .iter()
+        .position(|w| normalise(w) == "a")
+        .map(|at| rest[at + 1..].join(" "))
+        .filter(|r| !r.trim().is_empty());
+    Some((destination.name, recipient))
 }
 
 /// What an edit command asks for, said while dictating instead of more
@@ -1098,6 +1177,13 @@ pub fn decide_in(transcript: &str, context: Option<&str>) -> (Decision, f32) {
         // Just the wake word. Not a failure to understand — nothing was
         // asked — so it should not chirp or count as an error.
         return (Decision::Ignored, 0.0);
+    }
+
+    // «dicta una nota», «dicta un correo a Ana»: before the literal
+    // dictation text below, since both start with the same verb and only
+    // the destination table tells them apart.
+    if let Some((destination, recipient)) = dictate_into(transcript) {
+        return (Decision::DictateInto { destination, recipient }, 1.0);
     }
 
     // Dictation first: everything after the verb is content, not a command,
@@ -2435,6 +2521,87 @@ mod tests {
         assert_eq!(decide("minion dictado").0, Decision::StartDictation);
         assert_eq!(decide("minion deja de dictar").0, Decision::StopDictation);
         assert_eq!(decide("minion fin del dictado").0, Decision::StopDictation);
+    }
+
+    #[test]
+    fn dictate_into_opens_a_destination_instead_of_typing_literally() {
+        assert_eq!(
+            decide("minion dicta una nota").0,
+            Decision::DictateInto { destination: "nota", recipient: None }
+        );
+        assert_eq!(
+            decide("minion dicta en el documento").0,
+            Decision::DictateInto { destination: "documento", recipient: None }
+        );
+    }
+
+    #[test]
+    fn dictate_into_reads_a_recipient_after_a() {
+        assert_eq!(
+            decide("minion dicta un correo a Ana").0,
+            Decision::DictateInto {
+                destination: "correo",
+                recipient: Some("Ana".to_string())
+            }
+        );
+        assert_eq!(
+            decide("minion dicta un mensaje a Ana Pérez").0,
+            Decision::DictateInto {
+                destination: "mensaje",
+                recipient: Some("Ana Pérez".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn dictate_into_without_a_recipient_still_opens_the_destination() {
+        // "correo" and "mensaje" take a recipient, but do not require one:
+        // the compose window still opens, just with nobody typed into it.
+        assert_eq!(
+            decide("minion dicta un correo").0,
+            Decision::DictateInto { destination: "correo", recipient: None }
+        );
+    }
+
+    #[test]
+    fn only_dictar_opens_a_destination() {
+        // "escribe"/"anota"/"apunta" keep typing literally — only "dictar"
+        // is read against the destination table.
+        assert_eq!(decide("minion escribe una nota").0, Decision::Type("una nota".to_string()));
+        assert_eq!(decide("minion anota una nota").0, Decision::Type("una nota".to_string()));
+    }
+
+    #[test]
+    fn dictate_into_falls_back_to_literal_text_for_no_destination() {
+        // "dictar" without a known destination word is still literal
+        // dictation, exactly as before this destination table existed.
+        assert_eq!(
+            decide("minion dicta la lista de la compra").0,
+            Decision::Type("la lista de la compra".to_string())
+        );
+    }
+
+    #[test]
+    fn every_built_in_destination_reads_its_shortcuts() {
+        let nota = named_destination("nota").expect("nota");
+        assert_eq!(nota.bundle_id, Some("com.apple.Notes"));
+        assert_eq!(nota.keys_before_typing, [(key::N, Mods::CMD)]);
+        assert!(!nota.takes_recipient);
+
+        let correo = named_destination("correo").expect("correo");
+        assert_eq!(correo.bundle_id, Some("com.apple.mail"));
+        assert!(correo.takes_recipient);
+        assert_eq!(correo.keys_after_recipient, [(key::TAB, Mods::NONE), (key::TAB, Mods::NONE)]);
+
+        let mensaje = named_destination("mensaje").expect("mensaje");
+        assert_eq!(mensaje.bundle_id, Some("com.apple.MobileSMS"));
+        assert!(mensaje.takes_recipient);
+        assert_eq!(mensaje.keys_after_recipient, [(36, Mods::NONE)], "return");
+
+        let documento = named_destination("documento").expect("documento");
+        assert_eq!(documento.bundle_id, None);
+        assert!(!documento.takes_recipient);
+        assert!(documento.keys_before_typing.is_empty());
     }
 
     #[test]

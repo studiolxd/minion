@@ -1029,6 +1029,29 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                     dictating.store(false, Ordering::Relaxed);
                     note!("dictation ended");
                 }
+                Outcome::DictateInto { destination, recipient } => {
+                    match commands::named_destination(destination) {
+                        Some(entry) => match prepare_destination(entry, recipient.as_deref()) {
+                            Ok(()) => {
+                                session.confirm_dictation();
+                                note!(
+                                    "dictation started in {} — say «deja de dictar» to stop",
+                                    entry.name
+                                );
+                                transformer = Some(dictation::Transformer::new(&config::load()));
+                                dictating.store(true, Ordering::Relaxed);
+                                acted.store(true, Ordering::Relaxed);
+                            }
+                            Err(reason) => note!(
+                                "BLOCKED  «{part}»  ->  dictar en {}: {reason}",
+                                entry.name
+                            ),
+                        },
+                        None => note!(
+                            "unknown  «{part}»  ->  no destination called «{destination}»"
+                        ),
+                    }
+                }
                 Outcome::NotDictating => note!("not dictating"),
                 // Heard while dictating, with nothing in it to type.
                 Outcome::Nothing => {}
@@ -1251,6 +1274,53 @@ enum Ran {
     Yes,
     /// Understood, but macOS refused it.
     Blocked,
+}
+
+/// Carries out an `Outcome::DictateInto` destination: brings its
+/// application forward (unless there is none — «dicta en el documento»
+/// dictates into whatever is already there), waits for it to actually
+/// become frontmost, then types the recipient — through the personal
+/// vocabulary, the same as anything else dictated — and the keys that
+/// follow it.
+///
+/// Returns as soon as the destination is ready for dictation to begin;
+/// entering dictation itself is `Outcome::DictateInto`'s caller's job, once
+/// this returns `Ok`.
+fn prepare_destination(destination: &commands::Destination, recipient: Option<&str>) -> Result<(), String> {
+    if let Some(bundle_id) = destination.bundle_id {
+        actions::open_app(bundle_id)?;
+        if !wait_for_frontmost(bundle_id, Duration::from_secs(3)) {
+            return Err(format!("{bundle_id} never came to the front"));
+        }
+    }
+    for (code, mods) in destination.keys_before_typing {
+        actions::press(*code, *mods)?;
+    }
+    if let Some(name) = recipient {
+        let spelled = dictation::spell_recipient(name, &config::load());
+        actions::type_text(&spelled)?;
+        for (code, mods) in destination.keys_after_recipient {
+            actions::press(*code, *mods)?;
+        }
+    }
+    Ok(())
+}
+
+/// Polls [`actions::frontmost_app`] until `bundle_id` is in front, or
+/// `timeout` runs out. A launched application takes a moment to come
+/// forward, and typing into whatever was in front before it does would
+/// send a recipient's name to the wrong window entirely.
+fn wait_for_frontmost(bundle_id: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if actions::frontmost_app().as_deref() == Some(bundle_id) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// Carries out a decision and writes down what happened.
