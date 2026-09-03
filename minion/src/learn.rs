@@ -99,10 +99,15 @@ pub fn apply(lesson: &Lesson) -> Result<usize, String> {
     let mut addition = String::from("\n# Aprendido del registro con `minion learn`.\n");
     for candidate in &lesson.teachable {
         let phrase = without_wake_word(&candidate.phrase);
+        // Quoted by the config writer, not by hand: a phrase learned from
+        // the log is whatever the recogniser wrote, quotation marks and
+        // backslashes included, and one of those in a hand-written
+        // `"{...}"` leaves a file that no longer parses.
         let _ = write!(
             addition,
-            "\n[[aliases]]\ncommand = \"{}\"\nphrase = \"{}\"\n",
-            candidate.command, phrase
+            "\n[[aliases]]\ncommand = {}\nphrase = {}\n",
+            config::toml_string(&candidate.command),
+            config::toml_string(&phrase)
         );
     }
 
