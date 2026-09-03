@@ -13,6 +13,7 @@
 //! along when a setting changes elsewhere, which a callback would not.
 
 use std::cell::Cell;
+use std::rc::Rc;
 
 use objc2::rc::Retained;
 use objc2::MainThreadMarker;
@@ -277,6 +278,10 @@ fn narrow(frame: NSRect, width: f64) -> NSRect {
     NSRect::new(frame.origin, NSSize::new(width, frame.size.height))
 }
 
+/// Return, and Return on the numeric keypad: both commit a field.
+const RETURN: u16 = 36;
+const KEYPAD_ENTER: u16 = 76;
+
 /// Indent for a hint that belongs to a checkbox, lining up with its label.
 const INDENT: f64 = 20.0;
 
@@ -352,6 +357,11 @@ pub struct Preferences {
     speak: Switch,
     wake_word: Retained<NSTextField>,
     last_wake_word: std::cell::RefCell<String>,
+    /// Set by the key watcher below when Return is pressed, so a field can
+    /// be committed without waiting for the focus to move.
+    entered: Rc<Cell<bool>>,
+    /// Kept alive for as long as the window: dropping it stops the watch.
+    _keys: KeyCapture,
     microphone: Chooser,
     speaker: Chooser,
     sensitivity: Dial,
@@ -627,6 +637,17 @@ impl Preferences {
             window
         };
 
+        // Return commits a field without waiting for the focus to leave it.
+        // The watcher never swallows the key: it only takes note.
+        let entered = Rc::new(Cell::new(false));
+        let pressed = Rc::clone(&entered);
+        let keys = capture_keys(move |code, _mods| {
+            if code == RETURN || code == KEYPAD_ENTER {
+                pressed.set(true);
+            }
+            false
+        });
+
         let preferences = Self {
             window,
             sounds,
@@ -635,6 +656,8 @@ impl Preferences {
             speak,
             wake_word,
             last_wake_word: std::cell::RefCell::new(current_wake),
+            entered,
+            _keys: keys,
             microphone,
             speaker,
             sensitivity,
@@ -667,6 +690,16 @@ impl Preferences {
         }
         self.window.makeKeyAndOrderFront(None);
         self.window.orderFrontRegardless();
+    }
+
+    /// Whether a text field is being typed into right now.
+    ///
+    /// A field under the cursor owns the window's field editor; when the
+    /// focus leaves, that editor goes away. Asking the control is more
+    /// reliable than comparing against the first responder, which during
+    /// editing is the editor rather than the field.
+    fn is_editing(&self, field: &NSTextField) -> bool {
+        field.currentEditor().is_some()
     }
 
     fn update_readouts(&self) {
@@ -720,9 +753,15 @@ impl Preferences {
         }
         // The wake word is read once at startup, so changing it needs a
         // restart — and an empty one would leave nothing to say.
+        //
+        // Committed when the field is done being edited, not on every poll:
+        // typing "casa" through a poll that fires between letters used to
+        // save "c", "ca", "cas" and put up a restart dialog for each one.
+        let entered = self.entered.replace(false);
+        let settled = entered || !self.is_editing(&self.wake_word);
         let typed_wake = self.wake_word.stringValue().to_string();
         let wake_changed = typed_wake.trim() != self.last_wake_word.borrow().trim();
-        if wake_changed && !typed_wake.trim().is_empty() {
+        if settled && wake_changed && !typed_wake.trim().is_empty() {
             let word = crate::text::normalise(&typed_wake);
             // The default carries its own misspellings; anything else is
             // taken as written.
