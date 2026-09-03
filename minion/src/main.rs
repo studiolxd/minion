@@ -1913,7 +1913,7 @@ fn run_menu_bar(
 
     // The "what did it hear" HUD — see hud.rs. Starts pinned exactly as
     // the settings window already read `show_hud` at construction.
-    let hud = Rc::new(hud::Hud::new(mtm, panel.show_hud_on()));
+    let hud = Rc::new(hud::Hud::new(mtm, panel.show_hud_on(), config::load().hud_seconds()));
     // Watches this application's keys, so the shortcut button can be set by
     // pressing a combination rather than typing its name.
     let panel_for_capture = Rc::clone(&panel);

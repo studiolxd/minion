@@ -106,17 +106,24 @@ struct Visibility {
     busy: bool,
     activity_until: Option<Instant>,
     forced_hidden: bool,
+    /// How long [`Self::note_heard`] keeps the panel up — `[hud_seconds]`
+    /// in `config.toml`, resolved once when the HUD is built.
+    hud_seconds: f64,
 }
 
 impl Visibility {
     fn new() -> Self {
-        Self::default()
+        Self::with_hud_seconds(HUD_SECONDS)
+    }
+
+    fn with_hud_seconds(hud_seconds: f64) -> Self {
+        Self { hud_seconds, ..Self::default() }
     }
 
     /// A wake word was heard and understood (or not) — keep the panel up
-    /// for [`HUD_SECONDS`] from now.
+    /// for [`Self::hud_seconds`] from now.
     fn note_heard(&mut self, now: Instant) {
-        self.activity_until = Some(now + Duration::from_secs_f64(HUD_SECONDS));
+        self.activity_until = Some(now + Duration::from_secs_f64(self.hud_seconds));
         self.forced_hidden = false;
     }
 
@@ -259,7 +266,7 @@ pub struct Hud {
 impl Hud {
     /// Builds the panel, hidden until something calls [`Hud::tick`] with a
     /// reason to show it.
-    pub fn new(mtm: MainThreadMarker, pinned: bool) -> Self {
+    pub fn new(mtm: MainThreadMarker, pinned: bool, hud_seconds: f64) -> Self {
         let style = NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel;
         let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(WIDTH, HEIGHT));
         let window = NSPanel::initWithContentRect_styleMask_backing_defer(
@@ -334,7 +341,7 @@ impl Hud {
         window.setContentView(Some(&effect));
         position(&window, mtm);
 
-        let mut state = Visibility::new();
+        let mut state = Visibility::with_hud_seconds(hud_seconds);
         state.set_pinned(pinned);
         Self {
             window,
