@@ -2002,6 +2002,30 @@ pub fn is_sleep(decision: &Decision) -> bool {
     matches!(decision, Decision::Run(name) if *name == "dormir")
 }
 
+/// The question worth asking before carrying out `decision`, if it names
+/// one of the built-in commands costly enough that a low-confidence guess
+/// should be confirmed rather than simply run — closing a window or a
+/// tab, quitting an application, emptying the Trash, hanging up, deleting,
+/// turning off the screen. `None` for everything else, which just runs
+/// regardless of how it scored.
+///
+/// Named by decision rather than scored: a command earns a place here by
+/// being hard to undo, not by how it happened to be matched. See
+/// `Session::ask_confirm`, which only asks when the score is also below
+/// `[confirm_below]`.
+pub fn confirm_question(decision: &Decision) -> Option<String> {
+    match decision {
+        Decision::Run("cerrar ventana") => Some("¿Cerrar la ventana?".to_string()),
+        Decision::Run("cerrar pestaña") => Some("¿Cerrar la pestaña?".to_string()),
+        Decision::Run("vaciar papelera") => Some("¿Vaciar la papelera?".to_string()),
+        Decision::Run("borrar") => Some("¿Borrar esto?".to_string()),
+        Decision::Run("apagar pantalla") => Some("¿Apagar la pantalla?".to_string()),
+        Decision::RunHere("colgar") => Some("¿Colgar la llamada?".to_string()),
+        Decision::Quit { name, .. } => Some(format!("¿Salir de {name}?")),
+        _ => None,
+    }
+}
+
 /// The command a phrase most resembles, ignoring the confidence threshold.
 ///
 /// Used by `minion learn` to suggest what a misheard phrase was probably
@@ -2282,6 +2306,24 @@ mod tests {
         assert_eq!(decision("minion fin"), Decision::Run("tecla fin"));
         assert_eq!(decision("minion pagina arriba"), Decision::Run("pagina arriba"));
         assert_eq!(decision("minion pagina abajo"), Decision::Run("pagina abajo"));
+    }
+
+    #[test]
+    fn confirm_question_names_every_costly_command() {
+        assert_eq!(confirm_question(&Decision::Run("cerrar ventana")).as_deref(), Some("¿Cerrar la ventana?"));
+        assert_eq!(confirm_question(&Decision::Run("cerrar pestaña")).as_deref(), Some("¿Cerrar la pestaña?"));
+        assert_eq!(confirm_question(&Decision::Run("vaciar papelera")).as_deref(), Some("¿Vaciar la papelera?"));
+        assert_eq!(confirm_question(&Decision::Run("borrar")).as_deref(), Some("¿Borrar esto?"));
+        assert_eq!(confirm_question(&Decision::Run("apagar pantalla")).as_deref(), Some("¿Apagar la pantalla?"));
+        assert_eq!(confirm_question(&Decision::RunHere("colgar")).as_deref(), Some("¿Colgar la llamada?"));
+        assert_eq!(
+            confirm_question(&Decision::Quit { name: "Safari", bundle_id: "com.apple.Safari" }).as_deref(),
+            Some("¿Salir de Safari?")
+        );
+        // Nothing else is costly.
+        assert!(confirm_question(&Decision::Run("borrar palabra")).is_none());
+        assert!(confirm_question(&Decision::Launch { name: "Chrome", bundle_id: "com.google.Chrome" })
+            .is_none());
     }
 
     #[test]

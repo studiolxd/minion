@@ -646,6 +646,9 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
     // And how close a second reading has to be before the choice is put to
     // the user instead of guessed at. Read from the same file, once.
     session.disambiguates(startup.disambiguation_margin());
+    // And how sure a costly command has to be before it just runs instead
+    // of being confirmed — see `commands::confirm_question`.
+    session.confirms_below(startup.confirm_below());
     // Built fresh each time dictation starts, so its state (the pending
     // capital, an open quote) never spans two dictation sessions, and a
     // vocabulary edited while Minion was running takes effect right away.
@@ -1211,6 +1214,36 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                     }
                     continue;
                 }
+                Some(Reply::ConfirmYes { phrase, decision, repeats }) => {
+                    // The decision was already made before it was asked
+                    // about — see the confirmation check below, which
+                    // never calls `session.interpret` — so this only
+                    // needs to record it, the same way `interpret` would.
+                    session.interpret(&phrase, decision.clone(), context.as_deref());
+                    let ran = report(
+                        &phrase,
+                        &decision,
+                        1.0,
+                        repeats,
+                        &Reporting {
+                            seconds,
+                            elapsed_ms,
+                            log_ignored_speech: log_ignored_speech.load(Ordering::Relaxed),
+                            play_sounds: play_sounds.load(Ordering::Relaxed),
+                            acted: &acted,
+                            status: &status,
+                        },
+                    );
+                    match ran {
+                        Ran::Blocked => session.forget_undo(),
+                        Ran::Yes if !hold_mode => {
+                            session.open_window(now, conversation_window);
+                            window_open.store(session.window_open(now), Ordering::Relaxed);
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
                 Some(Reply::No { phrase, answered }) => {
                     note!("declined «{phrase}»");
                     // A "no" was the answer and is spent. Anything else was
@@ -1254,6 +1287,18 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                 // leaving it unanswerable would only lose it. Timed from
                 // after it spoke: the seconds are the ones the person has
                 // to answer in.
+                ask_aloud(&question.text);
+                session.open_question(&resolved.phrase, question, Instant::now());
+                hud::set_question_pending(true);
+                continue;
+            }
+
+            // A costly command — closing a window, quitting an app,
+            // emptying the Trash and the like — matched below
+            // `confirm_below`: asked about before it runs, through the
+            // same question machinery, rather than simply carried out.
+            if let Some(question) = session.ask_confirm(&decision, confidence, 1) {
+                note!("asking   «{part}»  ->  {}?  (confirm)", question.description);
                 ask_aloud(&question.text);
                 session.open_question(&resolved.phrase, question, Instant::now());
                 hud::set_question_pending(true);

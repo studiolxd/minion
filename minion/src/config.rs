@@ -29,6 +29,10 @@ pub const DEFAULT_RESUME_SHORTCUT: &str = "ctrl-alt-m";
 /// what `hud.rs` used as a constant before this became configurable.
 const DEFAULT_HUD_SECONDS: f64 = 4.0;
 
+/// Confidence a costly command needs before it just runs, when the file
+/// says nothing — see [`Config::confirm_below`].
+const DEFAULT_CONFIRM_BELOW: f32 = 0.85;
+
 /// Cosine similarity a voice must reach to be treated as yours.
 ///
 /// Measured rather than guessed. Against a profile trained on this
@@ -278,6 +282,25 @@ pub struct Config {
     /// is off: pinning a panel that never appears has nothing to pin.
     #[serde(default)]
     pub hud_pinned: bool,
+
+    /// Confidence the winning command needs before it just runs. Below
+    /// this, one of the built-in costly commands (closing a window or a
+    /// tab, quitting an application, emptying the Trash, hanging up,
+    /// deleting, turning off the screen) is asked about instead — see
+    /// [`Self::confirm_below`] and `commands::confirm_question`. `None` is
+    /// the default of 0.85.
+    pub confirm_below: Option<f32>,
+
+    /// How Minion signals what it is doing without a full spoken answer:
+    /// "voice" (speak, no earcons), "sounds" (earcons, no speech),
+    /// "both" (the default) or "quiet" (neither). See [`Self::feedback`].
+    pub feedback: Option<String>,
+
+    /// When true, a confirmation (see `confirm_below`) is an earcon only,
+    /// never a spoken question, and a spoken answer is cut to its first
+    /// sentence.
+    #[serde(default)]
+    pub brief_answers: bool,
 }
 
 /// The `[ai]` table: which model answers what the vocabulary cannot, and
@@ -354,6 +377,33 @@ pub enum ListenMode {
     Always,
     /// Only while the shortcut is held down.
     Hold,
+}
+
+/// How Minion signals what it is doing — see [`Config::feedback`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Feedback {
+    /// Speak, never an earcon.
+    Voice,
+    /// A short system sound, never speech.
+    Sounds,
+    /// Both — the default, and everything Minion did before this setting
+    /// existed.
+    Both,
+    /// Neither.
+    Quiet,
+}
+
+impl Feedback {
+    /// Whether this mode plays the short earcons for heard/done/not
+    /// understood/blocked/a question asked.
+    pub fn sounds(self) -> bool {
+        matches!(self, Feedback::Sounds | Feedback::Both)
+    }
+
+    /// Whether this mode lets a spoken answer actually speak.
+    pub fn speaks(self) -> bool {
+        matches!(self, Feedback::Voice | Feedback::Both)
+    }
 }
 
 /// How eagerly Minion releases memory when idle.
@@ -559,6 +609,9 @@ impl Default for Config {
             energy: None,
             hud_seconds: None,
             hud_pinned: false,
+            confirm_below: None,
+            feedback: None,
+            brief_answers: false,
         }
     }
 }
@@ -1284,6 +1337,24 @@ impl Config {
         self.disambiguation_margin.unwrap_or(DEFAULT_DISAMBIGUATION_MARGIN).clamp(0.0, 0.5)
     }
 
+    /// Confidence a costly command needs before it just runs; below it,
+    /// it is confirmed instead. `None` (nothing set) is the default 0.85.
+    pub fn confirm_below(&self) -> f32 {
+        self.confirm_below.unwrap_or(DEFAULT_CONFIRM_BELOW).clamp(0.0, 1.0)
+    }
+
+    /// How Minion signals what it is doing, when the file says nothing or
+    /// says something it does not recognise: "both", same as before this
+    /// setting existed.
+    pub fn feedback(&self) -> Feedback {
+        match self.feedback.as_deref() {
+            Some("voice") => Feedback::Voice,
+            Some("sounds") => Feedback::Sounds,
+            Some("quiet") => Feedback::Quiet,
+            _ => Feedback::Both,
+        }
+    }
+
     /// Whether to listen continuously or only while the shortcut is held.
     ///
     /// Anything other than "hold" — including a typo — falls back to
@@ -1660,6 +1731,48 @@ mod tests {
 
         let typo: Config = toml::from_str(r#"listen_mode = "holf""#).expect("should parse");
         assert_eq!(typo.listen_mode(), ListenMode::Always);
+    }
+
+    #[test]
+    fn confirm_below_defaults_to_0_85() {
+        let default: Config = toml::from_str("").expect("empty config should parse");
+        assert_eq!(default.confirm_below(), 0.85);
+        let set: Config = toml::from_str("confirm_below = 0.6").expect("should parse");
+        assert_eq!(set.confirm_below(), 0.6);
+    }
+
+    #[test]
+    fn feedback_defaults_to_both_and_a_typo_falls_back_to_it() {
+        let default: Config = toml::from_str("").expect("empty config should parse");
+        assert_eq!(default.feedback(), Feedback::Both);
+
+        for (value, expected) in [
+            ("voice", Feedback::Voice),
+            ("sounds", Feedback::Sounds),
+            ("both", Feedback::Both),
+            ("quiet", Feedback::Quiet),
+            ("silencioso", Feedback::Both),
+        ] {
+            let config: Config =
+                toml::from_str(&format!(r#"feedback = "{value}""#)).expect("should parse");
+            assert_eq!(config.feedback(), expected, "«{value}»");
+        }
+    }
+
+    #[test]
+    fn feedback_modes_govern_sounds_and_speech_independently() {
+        assert!(Feedback::Voice.speaks() && !Feedback::Voice.sounds());
+        assert!(Feedback::Sounds.sounds() && !Feedback::Sounds.speaks());
+        assert!(Feedback::Both.speaks() && Feedback::Both.sounds());
+        assert!(!Feedback::Quiet.speaks() && !Feedback::Quiet.sounds());
+    }
+
+    #[test]
+    fn brief_answers_defaults_to_off() {
+        let default: Config = toml::from_str("").expect("empty config should parse");
+        assert!(!default.brief_answers);
+        let on: Config = toml::from_str("brief_answers = true").expect("should parse");
+        assert!(on.brief_answers);
     }
 
     #[test]
