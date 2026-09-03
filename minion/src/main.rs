@@ -1067,6 +1067,23 @@ fn fatal(message: &str) -> ! {
 }
 
 fn main() -> Result<()> {
+    // A panic aborts (see [profile.release]), and an abort leaves nothing
+    // behind. Written down first, so the restart that follows can be
+    // explained afterwards rather than guessed at.
+    std::panic::set_hook(Box::new(|info| {
+        let payload = info.payload();
+        let message = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("panicked");
+        let place = info.location().map_or_else(
+            || "an unknown place".to_string(),
+            |at| format!("{}:{}", at.file(), at.line()),
+        );
+        journal::write(&format!("panic    {message} at {place}"));
+    }));
+
     // `minion learn` reads the log and turns its failures into vocabulary.
     // It touches neither the microphone nor the model, so it is handled
     // before any of that is set up.

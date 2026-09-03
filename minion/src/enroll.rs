@@ -57,6 +57,13 @@ impl Session {
 
     /// Takes one utterance. Returns true when training is over.
     pub fn accept(&mut self, embedding: Option<crate::speaker::Embedding>) -> bool {
+        // The listening loop and the window clear a finished session on
+        // their own schedules, so one more utterance can arrive after the
+        // last sentence. There is no sixth prompt to ask for: indexing
+        // PROMPTS here is what used to abort the process.
+        if self.finished {
+            return true;
+        }
         let Some(embedding) = embedding else {
             self.message = format!(
                 "{}/{SENTENCES} — demasiado corto, repite: «{}»",
@@ -210,6 +217,20 @@ mod tests {
             session.message
         );
         assert_ne!(asking, session.message, "and should say it was too short");
+    }
+
+    #[test]
+    fn one_utterance_too_many_is_not_a_sixth_prompt() {
+        // Whatever arrives after the fifth sentence must not be looked up
+        // in PROMPTS: there is no entry there.
+        let mut session = Session::starting(String::new());
+        for _ in 0..SENTENCES {
+            session.accept(Some(fake_voice(1.0)));
+        }
+        let done = session.message.clone();
+        assert!(session.accept(None), "a finished session stays finished");
+        assert!(session.accept(Some(fake_voice(1.0))));
+        assert_eq!(session.message, done, "and keeps what it had to say");
     }
 
     #[test]
