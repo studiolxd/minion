@@ -13,12 +13,14 @@
 //! along when a setting changes elsewhere, which a callback would not.
 
 use std::cell::Cell;
+use std::rc::Rc;
 
 use objc2::rc::Retained;
 use objc2::MainThreadMarker;
 use objc2_app_kit::{
-    NSApplication, NSBackingStoreType, NSButton, NSColor, NSFont, NSLineBreakMode, NSPopUpButton,
-    NSScrollView, NSSlider, NSTextField, NSView, NSWindow, NSWindowStyleMask,
+    NSAccessibility, NSAutoresizingMaskOptions, NSApplication, NSBackingStoreType, NSButton, NSColor, NSFont, NSLineBreakMode,
+    NSPopUpButton, NSScrollView, NSSlider, NSTextField, NSTextView, NSView, NSWindow,
+    NSWindowStyleMask,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
@@ -103,11 +105,23 @@ struct Layout {
     width: f64,
     /// Distance from the top of the canvas to the next free position.
     used: f64,
+    /// The last label written above a control, so the control that follows
+    /// can answer to the same name when read aloud.
+    last_label: Option<String>,
+    /// The last control placed, so a hint can become its description.
+    last_control: Option<Retained<NSView>>,
 }
 
 impl Layout {
     fn new(mtm: MainThreadMarker, width: f64) -> Self {
-        Self { mtm, canvas: NSView::new(mtm), width, used: spacing::TOP }
+        Self {
+            mtm,
+            canvas: NSView::new(mtm),
+            width,
+            used: spacing::TOP,
+            last_label: None,
+            last_control: None,
+        }
     }
 
     fn content_width(&self) -> f64 {
@@ -135,6 +149,22 @@ impl Layout {
         self.canvas.addSubview(view);
     }
 
+    /// Adds a control and gives it the name a screen reader will say.
+    ///
+    /// Every control carries the same words as its visible label: a
+    /// checkbox announced as "checkbox" and nothing else is unusable, and
+    /// a slider with a label beside it has no idea the label is there.
+    fn add_control(&mut self, view: &NSView, name: &str) {
+        self.add(view);
+        view.setAccessibilityLabel(Some(&NSString::from_str(name)));
+        self.last_control = Some(Retained::from(view));
+    }
+
+    /// The name for a control that follows a label of its own.
+    fn borrowed_label(&self) -> String {
+        self.last_label.clone().unwrap_or_default()
+    }
+
     /// A section heading.
     fn heading(&mut self, text: &str) {
         if self.used > spacing::TOP {
@@ -151,6 +181,7 @@ impl Layout {
         let frame = self.place(spacing::LABEL, 0.0);
         let view = plain_label(self.mtm, text, frame);
         self.add(&view);
+        self.last_label = Some(text.to_string());
         self.gap(spacing::AFTER_LABEL);
     }
 
@@ -161,10 +192,16 @@ impl Layout {
     fn hint(&mut self, text: &str, indent: f64) {
         self.gap(spacing::BEFORE_HINT);
         let width = self.content_width() - indent;
-        let lines = wrapped_lines(text, width);
-        let frame = self.place(spacing::HINT_LINE * lines, indent);
-        let view = small_label(self.mtm, text, frame);
+        let blank = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, 0.0));
+        let view = small_label(self.mtm, text, blank);
+        let frame = self.place(text_height(&view, width, text), indent);
+        view.setFrame(frame);
         self.add(&view);
+        // The hint explains the control above it, so that is where it
+        // belongs for anyone who cannot see the two side by side.
+        if let Some(control) = &self.last_control {
+            control.setAccessibilityHelp(Some(&NSString::from_str(text)));
+        }
         self.gap(spacing::AFTER_HINT);
     }
 
@@ -179,7 +216,7 @@ impl Layout {
             )
         };
         button.setFrame(frame);
-        self.add(&button);
+        self.add_control(&button, title);
         self.gap(spacing::SIBLING);
         let switch = Switch { control: button, last: Cell::new(on) };
         switch.show(on);
@@ -205,7 +242,8 @@ impl Layout {
             frame.origin,
             NSSize::new(frame.size.width - READOUT, frame.size.height),
         ));
-        self.add(&control);
+        let name = self.borrowed_label();
+        self.add_control(&control, &name);
 
         let readout = small_label(
             self.mtm,
@@ -244,7 +282,8 @@ impl Layout {
             .and_then(|wanted| values.iter().position(|name| *name == wanted))
             .unwrap_or(0) as isize;
         control.selectItemAtIndex(selected);
-        self.add(&control);
+        let name = self.borrowed_label();
+        self.add_control(&control, &name);
         self.gap(spacing::SIBLING);
 
         Chooser { control, values, last: Cell::new(selected) }
@@ -277,14 +316,64 @@ fn narrow(frame: NSRect, width: f64) -> NSRect {
     NSRect::new(frame.origin, NSSize::new(width, frame.size.height))
 }
 
+/// A frame for a second control on the same row, after one `width` wide.
+fn beside(frame: NSRect, width: f64, own_width: f64) -> NSRect {
+    NSRect::new(
+        NSPoint::new(frame.origin.x + width + spacing::SIBLING, frame.origin.y),
+        NSSize::new(own_width, frame.size.height),
+    )
+}
+
+/// How long the button waits for a combination before giving up.
+const CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Escape, which cancels the capture rather than becoming the shortcut.
+const ESCAPE: u16 = 53;
+
+/// Whether a key code is F1-F12, the only keys usable without a modifier.
+fn is_function_key(code: u16) -> bool {
+    crate::actions::name_of_key(code)
+        .is_some_and(|name| name.starts_with('f') && name[1..].parse::<u8>().is_ok())
+}
+
+/// Return, and Return on the numeric keypad: both commit a field.
+const RETURN: u16 = 36;
+const KEYPAD_ENTER: u16 = 76;
+
+/// Height of a line of the training prompt, which is set larger than a
+/// hint because it is read aloud from across the room.
+const PROMPT_LINE: f64 = 19.0;
+
 /// Indent for a hint that belongs to a checkbox, lining up with its label.
 const INDENT: f64 = 20.0;
+
+/// The height a label needs at a given width, asked of AppKit.
+///
+/// Counting characters and dividing by an average width is what clipped
+/// the accented Spanish hints: «í» and «ó» are not the average character,
+/// and the estimate came up a line short on exactly the lines that
+/// mattered. The cell lays the text out with the font it will be drawn
+/// in, so it knows. [`wrapped_lines`] stays as the fallback for the case
+/// where there is no cell to ask.
+fn text_height(field: &NSTextField, width: f64, text: &str) -> f64 {
+    // A tall box to wrap inside; the answer is the height actually used.
+    const ROOM: f64 = 10_000.0;
+    let bounds = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, ROOM));
+    let measured = field
+        .cell()
+        .map(|cell| cell.cellSizeForBounds(bounds).height)
+        .filter(|height| height.is_finite() && *height > 0.0);
+    match measured {
+        Some(height) => height.ceil().max(spacing::HINT_LINE),
+        None => spacing::HINT_LINE * wrapped_lines(text, width),
+    }
+}
 
 /// How many lines a hint needs at the width it has.
 ///
 /// Approximate — 11-point system text averages close to six points per
 /// character — but erring long only leaves a little space, while erring
-/// short cuts words off.
+/// short cuts words off. Only used when the label has no cell to measure.
 fn wrapped_lines(text: &str, width: f64) -> f64 {
     let per_line = (width / 5.9).max(10.0);
     ((text.chars().count() as f64 / per_line).ceil()).max(1.0)
@@ -344,14 +433,42 @@ impl Switch {
     }
 }
 
+/// A push button, and the state it had when it was last read.
+///
+/// AppKit only counts clicks for a button with a target, and this window
+/// deliberately has none — see the note at the top. A click shows up
+/// instead as a change in the button's state between two polls.
+struct Press {
+    control: Retained<NSButton>,
+    last: Cell<isize>,
+}
+
+impl Press {
+    fn new(control: Retained<NSButton>) -> Self {
+        let last = Cell::new(control.state());
+        Self { control, last }
+    }
+
+    fn clicked(&self) -> bool {
+        let now = self.control.state();
+        now != self.last.replace(now) && now != 0
+    }
+}
+
 pub struct Preferences {
     window: Retained<NSWindow>,
     sounds: Switch,
     log_voices: Switch,
+    recordings: Switch,
     at_login: Switch,
     speak: Switch,
     wake_word: Retained<NSTextField>,
     last_wake_word: std::cell::RefCell<String>,
+    /// Set by the key watcher below when Return is pressed, so a field can
+    /// be committed without waiting for the focus to move.
+    entered: Rc<Cell<bool>>,
+    /// Kept alive for as long as the window: dropping it stops the watch.
+    _keys: KeyCapture,
     microphone: Chooser,
     speaker: Chooser,
     sensitivity: Dial,
@@ -360,13 +477,22 @@ pub struct Preferences {
     shortcut: Retained<NSButton>,
     /// The shortcut as stored, e.g. "alt-space".
     shortcut_value: std::cell::RefCell<String>,
+    /// Clears the shortcut, leaving Minion with none.
+    clear_shortcut: Press,
     /// True while waiting for the user to press a combination.
     capturing: Cell<bool>,
+    /// When the wait started, so it can give up on its own.
+    capture_started: Cell<Option<std::time::Instant>>,
     /// Starts and reports voice training.
     train: Retained<NSButton>,
     train_clicks: Cell<isize>,
     train_status: Retained<NSTextField>,
     train_requested: Cell<bool>,
+    /// Stops a training session halfway through.
+    cancel_train: Press,
+    cancel_requested: Cell<bool>,
+    /// Deletes the voice profile, after asking.
+    forget: Press,
     /// The button's state last time it was read, to notice a click without
     /// an Objective-C target — see the note at the top of this file.
     button_clicks: Cell<isize>,
@@ -480,11 +606,94 @@ impl Preferences {
              Normalmente solo se cuenta cuánto se oyó, no qué se dijo.",
             INDENT,
         );
+        let recordings = layout.checkbox(
+            "Guardar lo que oye en archivos de audio",
+            settings.save_recordings,
+        );
+        layout.hint(
+            "Guarda cada frase como WAV en ~/Library/Application \
+             Support/Minion/recordings. Actívalo solo mientras depuras.",
+            INDENT,
+        );
         let at_login = layout.checkbox("Abrir al iniciar sesión", startup::enabled());
         let speak = layout.checkbox("Responder en voz alta", settings.speak);
         layout.hint(
             "Solo a preguntas: «¿qué hora es?», «¿cuánta batería queda?».",
             INDENT,
+        );
+
+        // Directly under the behaviour it changes, and above the fold: in
+        // a window that scrolls, a section at the bottom is one nobody
+        // finds, and this is the one that decides who Minion obeys.
+        layout.heading("Tu voz");
+        let trained = crate::speaker::has_profile();
+        // Safety: no target and no action, so nothing is called back into.
+        let train = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str(if trained {
+                    "Volver a entrenar"
+                } else {
+                    "Entrenar mi voz"
+                }),
+                None,
+                None,
+                mtm,
+            )
+        };
+        let voice_row = layout.place(spacing::BUTTON, 0.0);
+        train.setFrame(narrow(voice_row, 170.0));
+        layout.add_control(&train, "Entrenar mi voz");
+        // Safety: no target and no action, so nothing is called back into.
+        let cancel_train = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str("Cancelar"),
+                None,
+                None,
+                mtm,
+            )
+        };
+        cancel_train.setFrame(beside(voice_row, 170.0, 110.0));
+        cancel_train.setAccessibilityLabel(Some(&NSString::from_str(
+            "Cancelar el entrenamiento",
+        )));
+        // Only means anything while training is under way.
+        cancel_train.setHidden(true);
+        layout.add(&cancel_train);
+
+        // Big enough to read from where you sit to talk to the machine:
+        // this line is a sentence to be said aloud, not a footnote.
+        let train_status_frame = {
+            layout.gap(spacing::BEFORE_HINT);
+            layout.place(PROMPT_LINE * 2.0, 0.0)
+        };
+        let train_status = plain_label(
+            mtm,
+            if trained {
+                "Minion solo obedece a tu voz."
+            } else {
+                "Ahora obedece a cualquiera que diga la palabra clave."
+            },
+            train_status_frame,
+        );
+        train_status.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+        layout.add(&train_status);
+        layout.gap(spacing::SIBLING);
+
+        // Safety: no target and no action, so nothing is called back into.
+        let forget = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str("Olvidar mi voz"),
+                None,
+                None,
+                mtm,
+            )
+        };
+        forget.setFrame(narrow(layout.place(spacing::BUTTON, 0.0), 170.0));
+        layout.add_control(&forget, "Olvidar mi voz");
+        layout.hint(
+            "Borra el perfil de voz. Minion volverá a obedecer a cualquiera \
+             que diga la palabra clave.",
+            0.0,
         );
 
         layout.heading("Palabra clave");
@@ -496,7 +705,7 @@ impl Preferences {
         let wake_word = NSTextField::new(mtm);
         wake_word.setStringValue(&NSString::from_str(&current_wake));
         wake_word.setFrame(narrow(layout.place(spacing::FIELD, 0.0), 170.0));
-        layout.add(&wake_word);
+        layout.add_control(&wake_word, "Palabra clave");
         layout.hint(
             "Toda orden empieza por ella. Elige algo que no digas por casualidad.",
             0.0,
@@ -530,6 +739,10 @@ impl Preferences {
             .idle_unload()
             .map_or(0.0, |d| d.as_secs() as f64 / 60.0);
         let memory = layout.slider((0.0, 30.0), minutes, 7);
+        layout.hint(
+            "«Nunca» mantiene el modelo cargado: responde antes, usa ~900 MB.",
+            0.0,
+        );
 
         layout.heading("Atajo para pausar y reanudar");
         let current_shortcut = settings
@@ -544,9 +757,26 @@ impl Preferences {
                 mtm,
             )
         };
-        shortcut.setFrame(narrow(layout.place(spacing::BUTTON, 0.0), 170.0));
-        layout.add(&shortcut);
-        layout.hint("Pulsa el botón y luego la combinación que quieras.", 0.0);
+        let row = layout.place(spacing::BUTTON, 0.0);
+        shortcut.setFrame(narrow(row, 170.0));
+        layout.add_control(&shortcut, "Atajo para pausar y reanudar");
+        // Safety: no target and no action, so nothing is called back into.
+        let clear = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str("Ninguno"),
+                None,
+                None,
+                mtm,
+            )
+        };
+        clear.setFrame(beside(row, 170.0, 100.0));
+        clear.setAccessibilityLabel(Some(&NSString::from_str("Quitar el atajo")));
+        layout.add(&clear);
+        layout.hint(
+            "Pulsa el botón y luego la combinación, que debe llevar ⌘, ⌥ o ⌃. \
+             Escape cancela; «Ninguno» deja a Minion sin atajo.",
+            0.0,
+        );
 
         layout.heading("Dispositivos");
         layout.field_label("Micrófono");
@@ -557,38 +787,6 @@ impl Preferences {
             "En automático cambian con el Mac; fíjalos para que no lo hagan.",
             0.0,
         );
-
-        layout.heading("Tu voz");
-        let trained = crate::speaker::has_profile();
-        // Safety: no target and no action, so nothing is called back into.
-        let train = unsafe {
-            NSButton::buttonWithTitle_target_action(
-                &NSString::from_str(if trained {
-                    "Volver a entrenar"
-                } else {
-                    "Entrenar mi voz"
-                }),
-                None,
-                None,
-                mtm,
-            )
-        };
-        train.setFrame(narrow(layout.place(spacing::BUTTON, 0.0), 170.0));
-        layout.add(&train);
-        let train_status_frame = {
-            layout.gap(spacing::BEFORE_HINT);
-            layout.place(spacing::HINT_LINE * 2.0, 0.0)
-        };
-        let train_status = small_label(
-            mtm,
-            if trained {
-                "Minion solo obedece a tu voz."
-            } else {
-                "Ahora obedece a cualquiera que diga la palabra clave."
-            },
-            train_status_frame,
-        );
-        layout.add(&train_status);
 
         let (canvas, content_height) = layout.finish();
 
@@ -605,7 +803,7 @@ impl Preferences {
                     false,
                 )
             };
-            window.setTitle(&NSString::from_str("Preferencias de Minion"));
+            window.setTitle(&NSString::from_str("Ajustes de Minion"));
             // Safety: the window is kept alive by this struct for the life
             // of the process, so closing it must not release it — otherwise
             // reopening from the menu would use freed memory.
@@ -627,14 +825,28 @@ impl Preferences {
             window
         };
 
+        // Return commits a field without waiting for the focus to leave it.
+        // The watcher never swallows the key: it only takes note.
+        let entered = Rc::new(Cell::new(false));
+        let pressed = Rc::clone(&entered);
+        let keys = capture_keys(move |code, _mods| {
+            if code == RETURN || code == KEYPAD_ENTER {
+                pressed.set(true);
+            }
+            false
+        });
+
         let preferences = Self {
             window,
             sounds,
             log_voices,
+            recordings,
             at_login,
             speak,
             wake_word,
             last_wake_word: std::cell::RefCell::new(current_wake),
+            entered,
+            _keys: keys,
             microphone,
             speaker,
             sensitivity,
@@ -642,12 +854,17 @@ impl Preferences {
             memory,
             shortcut,
             shortcut_value: std::cell::RefCell::new(current_shortcut),
+            clear_shortcut: Press::new(clear),
             capturing: Cell::new(false),
+            capture_started: Cell::new(None),
             button_clicks: Cell::new(0),
             train,
             train_clicks: Cell::new(0),
             train_status,
             train_requested: Cell::new(false),
+            cancel_train: Press::new(cancel_train),
+            cancel_requested: Cell::new(false),
+            forget: Press::new(forget),
         };
         preferences.update_readouts();
         preferences
@@ -661,12 +878,23 @@ impl Preferences {
     /// whatever you were using — which looks exactly like nothing happened.
     pub fn show(&self) {
         if let Some(mtm) = MainThreadMarker::new() {
+            install_main_menu(mtm);
             let app = NSApplication::sharedApplication(mtm);
             #[allow(deprecated)]
             app.activateIgnoringOtherApps(true);
         }
         self.window.makeKeyAndOrderFront(None);
         self.window.orderFrontRegardless();
+    }
+
+    /// Whether a text field is being typed into right now.
+    ///
+    /// A field under the cursor owns the window's field editor; when the
+    /// focus leaves, that editor goes away. Asking the control is more
+    /// reliable than comparing against the first responder, which during
+    /// editing is the editor rather than the field.
+    fn is_editing(&self, field: &NSTextField) -> bool {
+        field.currentEditor().is_some()
     }
 
     fn update_readouts(&self) {
@@ -708,6 +936,10 @@ impl Preferences {
             save("log_ignored_speech", if on { "true" } else { "false" });
             changed = true;
         }
+        if let Some(on) = self.recordings.toggled() {
+            save("save_recordings", if on { "true" } else { "false" });
+            changed = true;
+        }
         if let Some(on) = self.at_login.toggled() {
             if let Err(e) = startup::set(on) {
                 crate::journal::write(&format!("start at login: {e}"));
@@ -720,16 +952,22 @@ impl Preferences {
         }
         // The wake word is read once at startup, so changing it needs a
         // restart — and an empty one would leave nothing to say.
+        //
+        // Committed when the field is done being edited, not on every poll:
+        // typing "casa" through a poll that fires between letters used to
+        // save "c", "ca", "cas" and put up a restart dialog for each one.
+        let entered = self.entered.replace(false);
+        let settled = entered || !self.is_editing(&self.wake_word);
         let typed_wake = self.wake_word.stringValue().to_string();
         let wake_changed = typed_wake.trim() != self.last_wake_word.borrow().trim();
-        if wake_changed && !typed_wake.trim().is_empty() {
+        if settled && wake_changed && !typed_wake.trim().is_empty() {
             let word = crate::text::normalise(&typed_wake);
             // The default carries its own misspellings; anything else is
             // taken as written.
             if word == crate::commands::DEFAULT_WAKE_WORDS[0] {
                 save("wake_words", "[]");
             } else {
-                save("wake_words", &format!("[\"{word}\"]"));
+                save("wake_words", &format!("[{}]", config::toml_string(&word)));
             }
             *self.last_wake_word.borrow_mut() = typed_wake;
             needs_restart = true;
@@ -739,12 +977,12 @@ impl Preferences {
         // Devices need a restart to take effect: the stream is opened once
         // and the listening loop owns it.
         if let Some(chosen) = self.microphone.changed() {
-            save("microphone", &format!("\"{}\"", chosen.unwrap_or_default()));
+            save("microphone", &config::toml_string(&chosen.unwrap_or_default()));
             needs_restart = true;
             changed = true;
         }
         if let Some(chosen) = self.speaker.changed() {
-            save("speaker", &format!("\"{}\"", chosen.unwrap_or_default()));
+            save("speaker", &config::toml_string(&chosen.unwrap_or_default()));
             changed = true;
         }
         if let Some(step) = self.sensitivity.moved() {
@@ -772,6 +1010,35 @@ impl Preferences {
                     self.begin_capture();
                 }
             }
+        } else if self
+            .capture_started
+            .get()
+            .is_some_and(|since| since.elapsed() >= CAPTURE_TIMEOUT)
+        {
+            // Nothing was pressed: a button reading «Pulsa la combinación…»
+            // for the rest of the session looks broken.
+            self.end_capture();
+        }
+
+        if self.cancel_train.clicked() {
+            self.cancel_requested.set(true);
+            self.cancel_train.control.setHidden(true);
+            // Not through `show_training`: a cancelled session leaves the
+            // button saying «Entrenar mi voz», since nothing was learned.
+            self.train_status
+                .setStringValue(&NSString::from_str("Entrenamiento cancelado."));
+        }
+        if self.forget.clicked() {
+            self.forget_voice();
+            changed = true;
+        }
+
+        if self.clear_shortcut.clicked() {
+            self.end_capture();
+            save("resume_shortcut", &config::toml_string(""));
+            self.shortcut_value.borrow_mut().clear();
+            self.shortcut.setTitle(&NSString::from_str(&pretty("")));
+            changed = true;
         }
 
         if changed {
@@ -803,9 +1070,60 @@ impl Preferences {
     /// Shows how training is going.
     pub fn show_training(&self, message: &str, finished: bool) {
         self.train_status.setStringValue(&NSString::from_str(message));
+        // The way out is only offered while there is something to get out
+        // of: five phrases is long enough to change your mind.
+        self.cancel_train.control.setHidden(finished);
         if finished {
             self.train
                 .setTitle(&NSString::from_str("Volver a entrenar"));
+        }
+    }
+
+    /// Whether the person just asked to stop training.
+    ///
+    /// Cleared by asking, like the training request: only the loop that
+    /// owns the microphone can end the session.
+    ///
+    /// Waiting to be read by the run loop timer in `main.rs`, next to
+    /// `take_training_request`; until it is, the button only clears the
+    /// window's own prompt.
+    #[allow(dead_code)]
+    pub fn take_cancel_request(&self) -> bool {
+        self.cancel_requested.replace(false)
+    }
+
+    /// Deletes the voice profile, once.
+    ///
+    /// Asked about first: it is the one setting here that cannot be undone
+    /// without saying five phrases again.
+    fn forget_voice(&self) {
+        let Some(path) = crate::speaker::profile_path() else {
+            return;
+        };
+        if !path.exists() {
+            self.show_training("No hay ninguna voz que olvidar.", true);
+            return;
+        }
+        if !crate::actions::ask(
+            "¿Olvidar tu voz? Minion volverá a obedecer a cualquiera que diga \
+             la palabra clave.",
+            "Olvidar",
+        ) {
+            return;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                crate::journal::write("voice profile deleted from the settings window");
+                self.train.setTitle(&NSString::from_str("Entrenar mi voz"));
+                self.show_training(
+                    "Voz olvidada. Reinicia Minion para que deje de reconocerte.",
+                    true,
+                );
+            }
+            Err(e) => {
+                crate::journal::write(&format!("could not delete the voice profile: {e}"));
+                self.show_training("No se pudo borrar el perfil de voz.", true);
+            }
         }
     }
 
@@ -818,26 +1136,52 @@ impl Preferences {
     /// also quit something.
     fn begin_capture(&self) {
         self.capturing.set(true);
+        self.capture_started.set(Some(std::time::Instant::now()));
         self.shortcut
             .setTitle(&NSString::from_str("Pulsa la combinación…"));
     }
 
+    /// Stops waiting and puts the shortcut in the button again.
+    fn end_capture(&self) {
+        self.capturing.set(false);
+        self.capture_started.set(None);
+        self.button_clicks.set(self.shortcut.state());
+        let current = self.shortcut_value.borrow().clone();
+        self.shortcut.setTitle(&NSString::from_str(&pretty(&current)));
+    }
+
     /// Called from the run loop with whatever key was pressed, if capturing.
+    ///
+    /// Escape gets out of it, and a bare key is refused: without a modifier
+    /// the shortcut is a letter, and then every «a» typed anywhere on the
+    /// machine pauses Minion. Function keys are the exception, since they
+    /// carry no character of their own.
     pub fn capture(&self, code: u16, mods: crate::actions::Mods) -> bool {
         if !self.capturing.get() {
             return false;
         }
-        self.capturing.set(false);
-        self.button_clicks.set(self.shortcut.state());
+        if code == ESCAPE && mods == crate::actions::Mods::NONE {
+            self.end_capture();
+            return true;
+        }
 
-        let Some(text) = crate::actions::shortcut_text(code, mods) else {
-            // A key with no name: leave what was there.
-            let current = self.shortcut_value.borrow().clone();
-            self.shortcut.setTitle(&NSString::from_str(&pretty(&current)));
+        let named = crate::actions::shortcut_text(code, mods);
+        let Some(text) = named else {
+            // A key with no name: keep waiting for one that has one.
             return true;
         };
+        if mods == crate::actions::Mods::NONE && !is_function_key(code) {
+            self.capture_started.set(Some(std::time::Instant::now()));
+            self.shortcut
+                .setTitle(&NSString::from_str("Añade ⌘, ⌥ o ⌃"));
+            return true;
+        }
+
+        self.capturing.set(false);
+        self.capture_started.set(None);
+        self.button_clicks.set(self.shortcut.state());
         self.shortcut.setTitle(&NSString::from_str(&pretty(&text)));
-        save("resume_shortcut", &format!("\"{text}\""));
+        save("resume_shortcut", &config::toml_string(&text));
         *self.shortcut_value.borrow_mut() = text;
         true
     }
@@ -854,6 +1198,76 @@ impl Preferences {
     pub fn log_voices_on(&self) -> bool {
         self.log_voices.on()
     }
+}
+
+/// Gives the application the menu its windows need, once.
+///
+/// An accessory application shows no menu bar, so Minion had none at all —
+/// and with no menu there is nothing for ⌘C, ⌘V or ⌘W to go through:
+/// AppKit routes a key equivalent by looking for it in `mainMenu` first.
+/// The result was a text field that could not be pasted into. The items
+/// are the standard responder actions, so whatever has focus answers them.
+fn install_main_menu(mtm: MainThreadMarker) {
+    use objc2::sel;
+    use objc2_app_kit::{NSMenu, NSMenuItem};
+
+    let app = NSApplication::sharedApplication(mtm);
+    if app.mainMenu().is_some() {
+        return;
+    }
+
+    /// A menu item: what it says, what it does, its key equivalent, and
+    /// the tag the action reads (only the text finder uses one).
+    type Item<'a> = (&'a str, objc2::runtime::Sel, &'a str, isize);
+
+    /// `NSTextFinderActionShowFindInterface`: open the find bar.
+    const SHOW_FIND: isize = 1;
+
+    let sections: [(&str, &[Item]); 2] = [
+        (
+            "Edición",
+            &[
+                ("Deshacer", sel!(undo:), "z", 0),
+                ("Cortar", sel!(cut:), "x", 0),
+                ("Copiar", sel!(copy:), "c", 0),
+                ("Pegar", sel!(paste:), "v", 0),
+                ("Seleccionar todo", sel!(selectAll:), "a", 0),
+                ("Buscar…", sel!(performTextFinderAction:), "f", SHOW_FIND),
+            ],
+        ),
+        ("Ventana", &[("Cerrar", sel!(performClose:), "w", 0)]),
+    ];
+
+    let bar = NSMenu::new(mtm);
+    // AppKit treats the first submenu as the application menu whatever is
+    // in it, so an empty one goes first and the real menus keep their
+    // names — an accessory application never draws them, but the key
+    // equivalents are searched in every menu, including this one.
+    let application = NSMenuItem::new(mtm);
+    application.setSubmenu(Some(&NSMenu::new(mtm)));
+    bar.addItem(&application);
+    for (title, items) in sections {
+        let menu = NSMenu::initWithTitle(mtm.alloc(), &NSString::from_str(title));
+        for (name, action, key, tag) in items {
+            // Safety: the selectors are the standard responder ones; with
+            // no target set they travel up the responder chain, so an item
+            // nothing answers is simply greyed out.
+            let item = unsafe {
+                NSMenuItem::initWithTitle_action_keyEquivalent(
+                    mtm.alloc(),
+                    &NSString::from_str(name),
+                    Some(*action),
+                    &NSString::from_str(key),
+                )
+            };
+            item.setTag(*tag);
+            menu.addItem(&item);
+        }
+        let holder = NSMenuItem::new(mtm);
+        holder.setSubmenu(Some(&menu));
+        bar.addItem(&holder);
+    }
+    app.setMainMenu(Some(&bar));
 }
 
 fn save(key: &str, value: &str) {
@@ -917,7 +1331,7 @@ pub struct KeyCapture {
 /// something to read next to the log, not a demand for attention.
 pub struct Report {
     window: Retained<NSWindow>,
-    text: Retained<NSTextField>,
+    text: Retained<NSTextView>,
 }
 
 impl Report {
@@ -939,24 +1353,34 @@ impl Report {
         unsafe { window.setReleasedWhenClosed(false) };
         window.center();
 
-        // Inside a scroll view: the command list is longer than any window
-        // anyone wants on screen.
-        let text = label(
-            mtm,
-            "",
-            NSRect::new(
-                NSPoint::new(0.0, 0.0),
-                NSSize::new(size.width - MARGIN * 2.0, size.height - MARGIN * 2.0),
-            ),
-            false,
-        );
+        // A text view rather than a label: a thousand phrases are there to
+        // be searched and copied, and only a text view brings ⌘F, a
+        // selection and the standard Edit menu with it.
+        let inner = NSSize::new(size.width - MARGIN * 2.0, size.height - MARGIN * 2.0);
+        let text = NSTextView::new(mtm);
+        text.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), inner));
+        text.setEditable(false);
+        text.setSelectable(true);
+        text.setRichText(false);
         text.setFont(Some(&NSFont::monospacedSystemFontOfSize_weight(11.0, 0.0)));
+        // Grows downwards inside the scroll view and never sideways, so
+        // the lines wrap instead of running off the right edge.
+        text.setVerticallyResizable(true);
+        text.setHorizontallyResizable(false);
+        text.setMinSize(NSSize::new(0.0, 0.0));
+        text.setMaxSize(NSSize::new(f64::MAX, f64::MAX));
+        text.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+        // Safety: reading the text view's own container, which exists for
+        // a view built the ordinary way.
+        if let Some(container) = unsafe { text.textContainer() } {
+            container.setWidthTracksTextView(true);
+            container.setContainerSize(NSSize::new(inner.width, f64::MAX));
+        }
+        text.setUsesFindBar(true);
+        text.setIncrementalSearchingEnabled(true);
 
         let scroll = NSScrollView::new(mtm);
-        scroll.setFrame(NSRect::new(
-            NSPoint::new(MARGIN, MARGIN),
-            NSSize::new(size.width - MARGIN * 2.0, size.height - MARGIN * 2.0),
-        ));
+        scroll.setFrame(NSRect::new(NSPoint::new(MARGIN, MARGIN), inner));
         scroll.setHasVerticalScroller(true);
         scroll.setDocumentView(Some(&text));
         if let Some(content) = window.contentView() {
@@ -966,10 +1390,9 @@ impl Report {
     }
 
     pub fn show(&self, body: &str) {
-        self.text.setStringValue(&NSString::from_str(body));
-        // Grow to fit, so the scroll view knows how far it can go.
-        self.text.sizeToFit();
+        self.text.setString(&NSString::from_str(body));
         if let Some(mtm) = MainThreadMarker::new() {
+            install_main_menu(mtm);
             let app = NSApplication::sharedApplication(mtm);
             #[allow(deprecated)]
             app.activateIgnoringOtherApps(true);
@@ -1001,6 +1424,20 @@ mod tests {
     fn a_narrower_hint_needs_more_lines() {
         let text = "Toda orden empieza por ella. Elige algo que no digas por casualidad.";
         assert!(wrapped_lines(text, 200.0) > wrapped_lines(text, 400.0));
+    }
+
+    #[test]
+    fn only_function_keys_stand_alone() {
+        // Everything else needs a modifier, or typing pauses Minion.
+        assert!(is_function_key(crate::actions::parse_shortcut("f5").unwrap().0));
+        assert!(is_function_key(crate::actions::parse_shortcut("f12").unwrap().0));
+        assert!(!is_function_key(crate::actions::key::A));
+        assert!(!is_function_key(crate::actions::key::SPACE));
+    }
+
+    #[test]
+    fn no_shortcut_reads_as_none() {
+        assert_eq!(pretty(""), "Ninguno");
     }
 
     #[test]

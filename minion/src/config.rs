@@ -216,9 +216,7 @@ pub fn path() -> Option<PathBuf> {
 /// string; this just borrows that.
 ///
 /// Public so other writers of `config.toml` (`learn.rs`, `preferences.rs`)
-/// can adopt it too, instead of hand-quoting. Not yet called outside this
-/// module's own tests, hence the `allow`.
-#[allow(dead_code)]
+/// can adopt it too, instead of hand-quoting.
 pub fn toml_string(value: &str) -> String {
     toml::Value::String(value.to_string()).to_string()
 }

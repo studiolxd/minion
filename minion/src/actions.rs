@@ -8,7 +8,9 @@
 use std::process::Command;
 
 use core_foundation::base::TCFType;
-use objc2_app_kit::NSWorkspace;
+use objc2::MainThreadMarker;
+use objc2_app_kit::{NSAlert, NSAlertFirstButtonReturn, NSApplication, NSWorkspace};
+use objc2_foundation::{NSOperationQueue, NSString};
 use core_foundation::boolean::CFBoolean;
 use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
 use core_foundation::string::CFString;
@@ -313,31 +315,62 @@ pub fn search_spotify(query: &str) -> bool {
 }
 
 /// Shows a message with a single dismiss button.
+///
+/// Queued on the main thread instead of shown where the caller stands:
+/// most callers are worker threads, and AppKit belongs to the main one.
+/// The caller does not wait, which is what it did when this was a spawned
+/// `osascript`.
 pub fn show_message(text: &str) {
-    let escaped = text.replace('\\', "").replace('"', "'");
-    applescript(&format!(
-        "display dialog \"{escaped}\" with title \"Minion\" buttons {{\"Cerrar\"}} \
-         default button \"Cerrar\""
-    ));
+    let text = text.to_string();
+    let work = block2::RcBlock::new(move || {
+        if let Some(mtm) = MainThreadMarker::new() {
+            alert(mtm, &text, None);
+        }
+    });
+    unsafe { NSOperationQueue::mainQueue().addOperationWithBlock(&work) };
 }
 
 /// Asks a yes/no question. True when the affirmative button was pressed.
 ///
-/// Blocks until answered, so it must not be called from the recognition
-/// thread — a dialog waiting for a click would stop everything being heard.
+/// Runs where it is called, so it has to be called from the main thread —
+/// which is where it is used, from the run loop timer. Off the main thread
+/// there is no honest answer to give, so it says no rather than blocking
+/// the recognition loop behind a dialog nobody can see.
 pub fn ask(text: &str, affirmative: &str) -> bool {
-    let escaped = text.replace('\\', "").replace('"', "'");
-    let script = format!(
-        "display dialog \"{escaped}\" with title \"Minion\" \
-         buttons {{\"Cancelar\", \"{affirmative}\"}} default button \"{affirmative}\""
-    );
-    Command::new("/usr/bin/osascript")
-        .arg("-e")
-        .arg(script)
-        .output()
-        .is_ok_and(|out| {
-            String::from_utf8_lossy(&out.stdout).contains(&format!("button returned:{affirmative}"))
-        })
+    let Some(mtm) = MainThreadMarker::new() else {
+        crate::journal::write("a question was asked off the main thread; answering no");
+        return false;
+    };
+    alert(mtm, text, Some(affirmative))
+}
+
+/// Puts up an alert and waits for it. True if the first button was used.
+///
+/// An `NSAlert` rather than AppleScript's `display dialog`: the script had
+/// to have its quotes and backslashes filed off the message on the way in,
+/// so what the user read was not quite what the program meant to say.
+fn alert(mtm: MainThreadMarker, text: &str, affirmative: Option<&str>) -> bool {
+    // Minion is an accessory application and never the active one, so
+    // without this the alert opens behind whatever is in front.
+    let app = NSApplication::sharedApplication(mtm);
+    #[allow(deprecated)]
+    app.activateIgnoringOtherApps(true);
+
+    let alert = NSAlert::new(mtm);
+    alert.setMessageText(&NSString::from_str("Minion"));
+    alert.setInformativeText(&NSString::from_str(text));
+    match affirmative {
+        Some(yes) => {
+            // The first button added is the default one, and the one whose
+            // return code is `NSAlertFirstButtonReturn`.
+            alert.addButtonWithTitle(&NSString::from_str(yes));
+            alert.addButtonWithTitle(&NSString::from_str("Cancelar"));
+        }
+        None => {
+            alert.addButtonWithTitle(&NSString::from_str("Cerrar"));
+        }
+    }
+    alert.runModal() == NSAlertFirstButtonReturn
 }
 
 /// Shows a file in the Finder.
