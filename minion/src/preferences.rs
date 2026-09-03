@@ -17,8 +17,8 @@ use std::cell::Cell;
 use objc2::rc::Retained;
 use objc2::MainThreadMarker;
 use objc2_app_kit::{
-    NSApplication, NSBackingStoreType, NSButton, NSColor, NSFont, NSLineBreakMode, NSSlider,
-    NSTextField, NSView, NSWindow, NSWindowStyleMask,
+    NSApplication, NSBackingStoreType, NSButton, NSColor, NSFont, NSLineBreakMode, NSScrollView,
+    NSSlider, NSTextField, NSView, NSWindow, NSWindowStyleMask,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
@@ -696,8 +696,8 @@ pub struct Report {
 }
 
 impl Report {
-    pub fn new(mtm: MainThreadMarker) -> Self {
-        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(460.0, 380.0));
+    pub fn new(mtm: MainThreadMarker, title: &str, size: NSSize) -> Self {
+        let frame = NSRect::new(NSPoint::new(0.0, 0.0), size);
         let style = NSWindowStyleMask::Titled
             | NSWindowStyleMask::Closable
             | NSWindowStyleMask::Resizable;
@@ -710,28 +710,40 @@ impl Report {
                 false,
             )
         };
-        window.setTitle(&NSString::from_str("Aprender del registro"));
+        window.setTitle(&NSString::from_str(title));
         unsafe { window.setReleasedWhenClosed(false) };
         window.center();
 
+        // Inside a scroll view: the command list is longer than any window
+        // anyone wants on screen.
         let text = label(
             mtm,
             "",
             NSRect::new(
-                NSPoint::new(MARGIN, MARGIN),
-                NSSize::new(460.0 - MARGIN * 2.0, 380.0 - MARGIN * 2.0),
+                NSPoint::new(0.0, 0.0),
+                NSSize::new(size.width - MARGIN * 2.0, size.height - MARGIN * 2.0),
             ),
             false,
         );
         text.setFont(Some(&NSFont::monospacedSystemFontOfSize_weight(11.0, 0.0)));
+
+        let scroll = NSScrollView::new(mtm);
+        scroll.setFrame(NSRect::new(
+            NSPoint::new(MARGIN, MARGIN),
+            NSSize::new(size.width - MARGIN * 2.0, size.height - MARGIN * 2.0),
+        ));
+        scroll.setHasVerticalScroller(true);
+        scroll.setDocumentView(Some(&text));
         if let Some(content) = window.contentView() {
-            content.addSubview(&text);
+            content.addSubview(&scroll);
         }
         Self { window, text }
     }
 
     pub fn show(&self, body: &str) {
         self.text.setStringValue(&NSString::from_str(body));
+        // Grow to fit, so the scroll view knows how far it can go.
+        self.text.sizeToFit();
         if let Some(mtm) = MainThreadMarker::new() {
             let app = NSApplication::sharedApplication(mtm);
             #[allow(deprecated)]

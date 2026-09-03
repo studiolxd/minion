@@ -16,6 +16,7 @@ use tray_icon::Icon;
 
 const AWAKE: &str = include_str!("../assets/awake.svg");
 const ASLEEP: &str = include_str!("../assets/asleep.svg");
+const ACTING: &str = include_str!("../assets/acting.svg");
 
 /// Height in pixels: twice the menu bar's usable height, for Retina.
 ///
@@ -51,6 +52,15 @@ pub fn awake() -> Result<Icon> {
 
 pub fn asleep() -> Result<Icon> {
     render(ASLEEP)
+}
+
+/// Shown briefly when a command runs.
+///
+/// A command that works produces no output of its own, so without some
+/// acknowledgement there is no telling whether you were heard. The sounds
+/// did that job and can be turned off; this does it silently.
+pub fn acting() -> Result<Icon> {
+    render(ACTING)
 }
 
 /// Writes the app icon at every size macOS asks for.
@@ -89,9 +99,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn both_faces_render() {
+    fn every_face_renders() {
         assert!(awake().is_ok(), "the awake face should draw");
         assert!(asleep().is_ok(), "the sleeping face should draw");
+        assert!(acting().is_ok(), "the acting face should draw");
     }
 
     fn draw(svg: &str) -> Vec<u8> {
@@ -106,8 +117,9 @@ mod tests {
     #[test]
     fn the_faces_differ() {
         // Same head, different eye and mouth: the drawings must not be
-        // identical, or pausing would show no change at all.
+        // identical, or a change of state would show nothing at all.
         assert_ne!(draw(AWAKE), draw(ASLEEP));
+        assert_ne!(draw(AWAKE), draw(ACTING));
     }
 
     #[test]

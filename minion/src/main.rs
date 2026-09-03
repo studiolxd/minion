@@ -55,6 +55,9 @@ mod sounds {
 const MENU_PAUSE: &str = "Pausar";
 const MENU_LISTEN: &str = "Escuchar";
 
+/// How long the icon shows that a command ran.
+const BLINK_SECONDS: f64 = 0.45;
+
 /// How often the run loop checks for changes.
 ///
 /// Fast enough that a slider's readout keeps up with the thumb, which is
@@ -189,6 +192,8 @@ struct Listening {
     voice: Option<Voice>,
     training: Training,
     active: Arc<AtomicBool>,
+    /// Raised when something runs, so the menu bar can acknowledge it.
+    acted: Arc<AtomicBool>,
 }
 
 fn listen_and_obey(setup: Listening) -> Result<()> {
@@ -201,6 +206,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
         mut voice,
         training,
         active,
+        acted,
     } = setup;
     // Held in an Option so it can be dropped while idle. It is loaded now
     // rather than on first use, so the first thing said after starting is
@@ -368,6 +374,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                 elapsed_ms,
                 log_ignored_speech.load(Ordering::Relaxed),
                 play_sounds.load(Ordering::Relaxed),
+                &acted,
             );
 
             if commands::is_sleep(&decision) {
@@ -397,6 +404,7 @@ fn report(
     elapsed_ms: u128,
     log_ignored_speech: bool,
     play_sounds: bool,
+    acted: &AtomicBool,
 ) {
         match decision {
             Decision::Ignored => {
@@ -432,6 +440,7 @@ fn report(
                             done.description,
                             confidence * 100.0
                         );
+                        acted.store(true, Ordering::Relaxed);
                         if play_sounds {
                             actions::play_sound(sounds::DONE);
                         }
@@ -463,6 +472,7 @@ fn run_menu_bar(
     sounds_on: Arc<AtomicBool>,
     log_voices_on: Arc<AtomicBool>,
     training: Training,
+    acted: Arc<AtomicBool>,
 ) -> Result<()> {
     let mtm = MainThreadMarker::new()
         .ok_or_else(|| anyhow!("the menu bar must be built on the main thread"))?;
@@ -479,6 +489,7 @@ fn run_menu_bar(
     let learn = MenuItem::new("Aprender", true, None);
     let show_log = MenuItem::new("Ver el registro", true, None);
 
+    let commands_item = MenuItem::new("Qué puedo decirle", true, None);
     let preferences = MenuItem::new("Preferencias…", true, None);
 
     // The two things you do with the log, together. Kept in scope for the
@@ -490,6 +501,7 @@ fn run_menu_bar(
     let quit = MenuItem::new("Salir de Minion", true, None);
     menu.append(&toggle)?;
     menu.append(&PredefinedMenuItem::separator())?;
+    menu.append(&commands_item)?;
     menu.append(&log_menu)?;
     menu.append(&preferences)?;
     menu.append(&PredefinedMenuItem::separator())?;
@@ -498,6 +510,7 @@ fn run_menu_bar(
     let toggle_id = toggle.id().clone();
     let learn_id = learn.id().clone();
     let preferences_id = preferences.id().clone();
+    let commands_id = commands_item.id().clone();
     let show_log_id = show_log.id().clone();
     let quit_id = quit.id().clone();
 
@@ -519,7 +532,16 @@ fn run_menu_bar(
         );
         panel.show();
     }
-    let report = Rc::new(preferences::Report::new(mtm));
+    let report = Rc::new(preferences::Report::new(
+        mtm,
+        "Aprender del registro",
+        objc2_foundation::NSSize::new(480.0, 400.0),
+    ));
+    let catalogue = Rc::new(preferences::Report::new(
+        mtm,
+        "Qué puedo decirle",
+        objc2_foundation::NSSize::new(560.0, 620.0),
+    ));
 
     // Watches this application's keys, so the shortcut button can be set by
     // pressing a combination rather than typing its name.
@@ -530,6 +552,7 @@ fn run_menu_bar(
     // Requests from the menu thread, which must not touch AppKit itself.
     let open_requested = Arc::new(AtomicBool::new(false));
     let learn_requested = Arc::new(AtomicBool::new(false));
+    let catalogue_requested = Arc::new(AtomicBool::new(false));
 
     // Held for the lifetime of the process: dropping it removes the icon.
     let tray = Rc::new(
@@ -551,10 +574,14 @@ fn run_menu_bar(
     let toggle_for_timer = toggle.clone();
     let active_for_timer = Arc::clone(&active);
     let shown_as_listening = Cell::new(true);
+    let acted_for_timer = Arc::clone(&acted);
+    let blink_until: Cell<Option<std::time::Instant>> = Cell::new(None);
     let panel_for_timer = Rc::clone(&panel);
     let open_for_timer = Arc::clone(&open_requested);
     let learn_for_timer = Arc::clone(&learn_requested);
     let training_for_timer = Arc::clone(&training);
+    let catalogue_for_timer = Arc::clone(&catalogue_requested);
+    let catalogue_window = Rc::clone(&catalogue);
     let training_model_path = locate_model(None).unwrap_or_else(|_| "model".into());
     let report_for_timer = Rc::clone(&report);
     let sounds_for_timer = Arc::clone(&sounds_on);
@@ -585,6 +612,9 @@ fn run_menu_bar(
             }
         }
 
+        if catalogue_for_timer.swap(false, Ordering::Relaxed) {
+            catalogue_window.show(&commands::catalogue());
+        }
         if learn_for_timer.swap(false, Ordering::Relaxed) {
             let config = config::load();
             let lesson = learn::analyse(&config);
@@ -617,6 +647,23 @@ fn run_menu_bar(
             voices_for_timer.store(panel_for_timer.log_voices_on(), Ordering::Relaxed);
         }
 
+        // A command just ran: acknowledge it for a moment. Silent, which
+        // matters once the sounds are turned off.
+        if acted_for_timer.swap(false, Ordering::Relaxed) {
+            if let Ok(face) = icon::acting() {
+                let _ = tray_for_timer.set_icon_with_as_template(Some(face), true);
+            }
+            blink_until.set(Some(std::time::Instant::now()));
+        }
+        if let Some(since) = blink_until.get() {
+            if since.elapsed().as_secs_f64() >= BLINK_SECONDS {
+                blink_until.set(None);
+                shown_as_listening.set(!active_for_timer.load(Ordering::Relaxed));
+            } else {
+                return; // hold the acknowledgement
+            }
+        }
+
         let listening = active_for_timer.load(Ordering::Relaxed);
         if listening == shown_as_listening.get() {
             return;
@@ -645,6 +692,7 @@ fn run_menu_bar(
     // and the item's text are repainted by the timer above, not from here.
     let open_from_menu = Arc::clone(&open_requested);
     let learn_from_menu = Arc::clone(&learn_requested);
+    let catalogue_from_menu = Arc::clone(&catalogue_requested);
     std::thread::spawn(move || {
         let events = MenuEvent::receiver();
         while let Ok(event) = events.recv() {
@@ -657,6 +705,8 @@ fn run_menu_bar(
                 );
             } else if event.id == learn_id {
                 learn_from_menu.store(true, Ordering::Relaxed);
+            } else if event.id == commands_id {
+                catalogue_from_menu.store(true, Ordering::Relaxed);
             } else if event.id == preferences_id {
                 // Windows belong to the main thread; the timer opens it.
                 open_from_menu.store(true, Ordering::Relaxed);
@@ -804,10 +854,14 @@ fn main() -> Result<()> {
     }
     report_permissions();
     let active = Arc::new(AtomicBool::new(true));
+    // Raised by the listening loop when a command runs, lowered by the run
+    // loop once the icon has blinked.
+    let acted = Arc::new(AtomicBool::new(false));
 
     let worker_active = Arc::clone(&active);
     let worker_log_ignored = Arc::clone(&log_ignored);
     let worker_sounds = Arc::clone(&play_sounds);
+    let worker_acted = Arc::clone(&acted);
     std::thread::spawn(move || {
         if let Err(e) = listen_and_obey(Listening {
             model_path,
@@ -818,6 +872,7 @@ fn main() -> Result<()> {
             voice,
             training: worker_training,
             active: worker_active,
+            acted: worker_acted,
         }) {
             eprintln!("Error: {e:#}");
             std::process::exit(1);
@@ -833,5 +888,5 @@ fn main() -> Result<()> {
         }
     }
 
-    run_menu_bar(active, play_sounds, log_ignored, training)
+    run_menu_bar(active, play_sounds, log_ignored, training, acted)
 }

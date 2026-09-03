@@ -7,6 +7,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -51,12 +52,21 @@ impl Default for Settings {
 
 /// A running microphone. Dropping it stops capture.
 pub struct Listener {
-    _stream: cpal::platform::Stream,
+    /// Replaced when the system's default input changes, so the field is
+    /// held rather than ignored.
+    _stream: Arc<Mutex<Option<cpal::platform::Stream>>>,
     /// Completed utterances, as 16 kHz mono samples.
     pub utterances: Receiver<Vec<f32>>,
     pub source_hz: u32,
     pub channels: usize,
 }
+
+/// How often to check whether the default microphone changed.
+///
+/// Plugging in headphones changes it, and a stream opened on the old device
+/// keeps delivering audio from a microphone nobody is speaking into — which
+/// looks exactly like Minion having gone deaf, with nothing in the log.
+const DEVICE_CHECK: Duration = Duration::from_secs(3);
 
 /// Downmixes to mono and drops to 16 kHz by taking every Nth sample.
 ///
@@ -209,18 +219,22 @@ impl Segmenter {
 /// `active` mutes processing without closing the device: while false,
 /// incoming audio is discarded as it arrives. Closing and reopening the
 /// microphone instead would make macOS re-check permissions each time.
-pub fn start(settings: Settings, active: Arc<AtomicBool>) -> Result<Listener> {
+/// Opens the current default input, feeding `queue`.
+fn open_default(
+    queue: &Arc<Mutex<Vec<f32>>>,
+    active: &Arc<AtomicBool>,
+) -> Result<(cpal::platform::Stream, u32, usize, cpal::DeviceId)> {
     let host = cpal::default_host();
     let device = host
         .default_input_device()
         .ok_or_else(|| anyhow!("no microphone available"))?;
+    let id = device.id()?;
     let config = device.default_input_config()?;
     let source_hz = config.sample_rate();
     let channels = config.channels() as usize;
 
-    let queue = Arc::new(Mutex::new(Vec::<f32>::new()));
-    let capture_queue = Arc::clone(&queue);
-    let capture_active = Arc::clone(&active);
+    let capture_queue = Arc::clone(queue);
+    let capture_active = Arc::clone(active);
 
     let stream = device.build_input_stream(
         config.into(),
@@ -244,6 +258,51 @@ pub fn start(settings: Settings, active: Arc<AtomicBool>) -> Result<Listener> {
         None,
     )?;
     stream.play()?;
+    Ok((stream, source_hz, channels, id))
+}
+
+pub fn start(settings: Settings, active: Arc<AtomicBool>) -> Result<Listener> {
+    let queue = Arc::new(Mutex::new(Vec::<f32>::new()));
+    let (stream, source_hz, channels, device_id) = open_default(&queue, &active)?;
+
+    // Held so it can be swapped when the default input changes.
+    let stream = Arc::new(Mutex::new(Some(stream)));
+
+    // Watches for the default microphone changing, and follows it.
+    let watch_stream = Arc::clone(&stream);
+    let watch_queue = Arc::clone(&queue);
+    let watch_active = Arc::clone(&active);
+    std::thread::spawn(move || {
+        let mut current = device_id;
+        loop {
+            std::thread::sleep(DEVICE_CHECK);
+            let host = cpal::default_host();
+            let Some(device) = host.default_input_device() else {
+                continue;
+            };
+            let Ok(id) = device.id() else { continue };
+            if id == current {
+                continue;
+            }
+            // Drop the old stream before opening the new one: two streams
+            // on one queue would interleave samples from both microphones.
+            if let Ok(mut held) = watch_stream.lock() {
+                *held = None;
+            }
+            match open_default(&watch_queue, &watch_active) {
+                Ok((fresh, hz, channels, fresh_id)) => {
+                    if let Ok(mut held) = watch_stream.lock() {
+                        *held = Some(fresh);
+                    }
+                    current = fresh_id;
+                    crate::journal::write(&format!(
+                        "Microphone changed — now {hz} Hz, {channels} channel(s)."
+                    ));
+                }
+                Err(e) => crate::journal::write(&format!("Cannot open the new microphone: {e}")),
+            }
+        }
+    });
 
     let (send, utterances) = mpsc::channel();
     let segment_queue = Arc::clone(&queue);

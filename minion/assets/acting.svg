@@ -1,0 +1,12 @@
+<svg viewBox="3.0 1.7 18.0 20.6" xmlns="http://www.w3.org/2000/svg"
+     fill="none" stroke="#000000" stroke-width="1.1"
+     stroke-linecap="round" stroke-linejoin="round">
+  <!-- Same head. -->
+  <path d="M4.4 21.6 V10 a7.6 7.6 0 0 1 15.2 0 v11.6"/>
+  <path d="M3.7 21.6 H20.3"/>
+  <!-- Wide eye and a filled pupil: caught your attention for a moment. -->
+  <circle cx="12" cy="10.2" r="4.3"/>
+  <circle cx="12" cy="10.2" r="2.4" fill="#000000" stroke="none"/>
+  <!-- Broader smile. -->
+  <path d="M8.6 16.8 a4.6 4.6 0 0 0 6.8 0"/>
+</svg>

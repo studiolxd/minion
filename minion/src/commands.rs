@@ -821,6 +821,77 @@ pub fn is_wake_word(word: &str) -> bool {
     wake_words().contains(&word)
 }
 
+/// The whole vocabulary, written out for someone to read.
+///
+/// Generated from the tables rather than kept alongside them: a list of
+/// commands that has to be updated by hand is a list that goes stale, and
+/// the first thing anyone needs is to know what they can say.
+pub fn catalogue() -> String {
+    use std::fmt::Write as _;
+    let wake = wake_words().first().copied().unwrap_or("minion");
+    let mut out = String::new();
+
+    let _ = writeln!(
+        out,
+        "Empieza siempre por «{wake}», y solo al principio de la frase.\n\
+         No hace falta decirlo exacto: se ignoran los artículos y da igual \
+         el tiempo del verbo.\n"
+    );
+
+    let _ = writeln!(out, "── APLICACIONES ─────────────────────\n");
+    let _ = writeln!(
+        out,
+        "Para abrir: {}\nPara cerrar: {}\nO solo el nombre: «{wake}, Spotify»\n",
+        APP_VERBS.join(", "),
+        QUIT_VERBS.join(", ")
+    );
+    for app in all_apps() {
+        let _ = writeln!(out, "  {:<22} {}", app.name, app.aliases.join(" · "));
+    }
+
+    let _ = writeln!(out, "\n── ÓRDENES ──────────────────────────\n");
+    for command in COMMANDS.iter().chain(USER_COMMANDS.get().into_iter().flatten()) {
+        let _ = writeln!(
+            out,
+            "  {:<22} {}",
+            command.name,
+            command.phrases.join(" · ")
+        );
+    }
+
+    let _ = writeln!(out, "\n── SEGÚN DÓNDE ESTÉS ────────────────\n");
+    for command in CONTEXTUAL_COMMANDS {
+        let apps: Vec<&str> = command
+            .bundles
+            .iter()
+            .map(|bundle| {
+                APPS.iter()
+                    .find(|a| a.bundle_id == *bundle)
+                    .map_or(*bundle, |a| a.name)
+            })
+            .collect();
+        let _ = writeln!(
+            out,
+            "  {:<22} {}\n  {:<22} en {}",
+            command.name,
+            command.phrases.join(" · "),
+            "",
+            apps.join(", ")
+        );
+    }
+
+    let _ = writeln!(
+        out,
+        "\n── ADEMÁS ───────────────────────────\n\n\
+           escribir              «{wake}, escribe hola qué tal»\n\
+           páginas web           «{wake}, ve a google.com»\n\
+           música por nombre     «{wake}, pon la canción Vértigo»\n\
+           repetir               «{wake}, otra vez» · «repite tres veces»\n\
+           encadenar             «{wake}, cierra la pestaña y luego recarga»"
+    );
+    out
+}
+
 /// Total number of distinct phrases understood, for the startup banner.
 pub fn phrase_count() -> usize {
     let from_commands: usize = COMMANDS.iter().map(|c| c.phrases.len()).sum();
