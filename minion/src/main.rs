@@ -1409,6 +1409,10 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                     }
                 }
                 Outcome::AskAi(text) => {
+                    // The [ai] table is re-read here: switching the AI on
+                    // from Ajustes used to need a restart, and the answer
+                    // in between was «desactivada» with the switch on.
+                    ai::configure(&config::load());
                     // Thinking can take a while (a cold CLI agent process,
                     // or a slow HTTP round trip), so both faces the model
                     // reload already uses are reused here: the menu bar's
@@ -1549,6 +1553,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                         // off, or `[ai] use` without "unknown", both come
                         // back `None` at no cost beyond the check.
                         if !asked {
+                            ai::configure(&config::load());
                             if let Some(suggestion) =
                                 ai::ask_for_command(&part, &commands::ai_catalogue())
                             {
