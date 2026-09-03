@@ -548,6 +548,26 @@ pub fn has_accessibility_permission() -> bool {
     unsafe { AXIsProcessTrusted() }
 }
 
+#[link(name = "AVFoundation", kind = "framework")]
+unsafe extern "C" {}
+
+/// Whether macOS lets Minion use the microphone: `Some(true)` granted,
+/// `Some(false)` denied or restricted, `None` not asked yet (or the
+/// framework would not answer). Asked of AVFoundation, which is the one
+/// place that knows; the silence watch in `audio.rs` only infers it.
+pub fn microphone_permission() -> Option<bool> {
+    use objc2::runtime::AnyClass;
+    let class = AnyClass::get(c"AVCaptureDevice")?;
+    // AVMediaTypeAudio is the string "soun".
+    let media = NSString::from_str("soun");
+    let status: isize = unsafe { objc2::msg_send![class, authorizationStatusForMediaType: &*media] };
+    match status {
+        3 => Some(true),      // AVAuthorizationStatusAuthorized
+        1 | 2 => Some(false), // restricted, denied
+        _ => None,            // not determined
+    }
+}
+
 /// Asks macOS to prompt for Accessibility, and reports whether it is held.
 ///
 /// This is the part that matters: merely opening the settings pane leaves

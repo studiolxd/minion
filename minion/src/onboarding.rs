@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex};
 use objc2::rc::Retained;
 use objc2::MainThreadMarker;
 use objc2_app_kit::{
+    NSButtonType,
     NSBackingStoreType, NSButton, NSColor, NSFont, NSLineBreakMode, NSTextField, NSWindow,
     NSWindowStyleMask,
 };
@@ -216,9 +217,21 @@ impl Press {
         Self { control, last }
     }
 
+    /// Whether the button was clicked since the last poll.
+    ///
+    /// The buttons here are push-on/push-off, so a click leaves the state
+    /// flipped until it is read — a momentary button only changes state
+    /// while the mouse is down, and a quick click fell between two polls,
+    /// which is why the assistant used to need two. The state is put back
+    /// to off at once, so the button never shows as pressed.
     fn clicked(&self) -> bool {
         let now = self.control.state();
-        now != self.last.replace(now) && now != 0
+        if now == self.last.get() {
+            return false;
+        }
+        self.control.setState(0);
+        self.last.set(0);
+        true
     }
 }
 
@@ -247,6 +260,8 @@ fn button(mtm: MainThreadMarker, title: &str, frame: NSRect) -> Retained<NSButto
         NSButton::buttonWithTitle_target_action(&NSString::from_str(title), None, None, mtm)
     };
     control.setFrame(frame);
+    // See `Press::clicked` for why the button keeps its state.
+    control.setButtonType(NSButtonType::PushOnPushOff);
     control
 }
 
@@ -514,11 +529,15 @@ impl Window {
             let _ = crate::actions::open_accessibility_settings();
         }
         if step == Step::Done {
+            // Either button is a way out: what it opens replaces the
+            // assistant, which has nothing left to say.
             if self.left_press.clicked() {
                 self.open_settings.store(true, Ordering::Relaxed);
+                self.window.orderOut(None);
             }
             if self.right_press.clicked() {
                 self.open_catalogue.store(true, Ordering::Relaxed);
+                self.window.orderOut(None);
             }
         }
 
@@ -576,12 +595,23 @@ impl Window {
                     "Minion necesita permiso para escuchar el micrófono. Sin \
                      él, verá que escucha pero no oirá nada.",
                 );
-                if self.mic_denied.load(Ordering::Relaxed) {
-                    set_text(&self.status_line, "Denegado.");
-                    self.left.setTitle(&NSString::from_str("Abrir Ajustes"));
-                    self.left.setHidden(false);
-                } else {
-                    set_text(&self.status_line, "Concedido (o aún no comprobado).");
+                // AVFoundation knows for sure; the silence watch only infers.
+                let granted = match crate::actions::microphone_permission() {
+                    Some(granted) => Some(granted),
+                    None if self.mic_denied.load(Ordering::Relaxed) => Some(false),
+                    None => None,
+                };
+                match granted {
+                    Some(true) => set_text(&self.status_line, "Concedido."),
+                    Some(false) => {
+                        set_text(&self.status_line, "Denegado.");
+                        self.left.setTitle(&NSString::from_str("Abrir Ajustes"));
+                        self.left.setHidden(false);
+                    }
+                    None => set_text(
+                        &self.status_line,
+                        "Aún no se ha pedido: macOS lo preguntará al empezar a escuchar.",
+                    ),
                 }
             }
             Step::Accessibility => {
