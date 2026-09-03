@@ -189,6 +189,16 @@ pub struct Config {
     /// command to point at.
     pub search_engine: Option<String>,
 
+    /// Ask out loud about a phrase that was not understood but came close
+    /// to something ("¿Querías decir «abrir Safari»?"), and remember the
+    /// answer as an alias.
+    ///
+    /// On by default: the alternative is a log line nobody reads and the
+    /// same mistake tomorrow. False is what Minion did before — say
+    /// nothing, write it down, and wait for `minion learn`.
+    #[serde(default = "yes")]
+    pub ask_before_learning: bool,
+
     /// Post a Notification Center banner for answers, timers and blocked
     /// commands — see `notify.rs`.
     ///
@@ -302,6 +312,7 @@ impl Default for Config {
             pause_during: None,
             macros: Vec::new(),
             search_engine: None,
+            ask_before_learning: true,
             notifications: true,
         }
     }

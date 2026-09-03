@@ -49,6 +49,132 @@ pub fn keywords(phrase: &str) -> Vec<String> {
         .collect()
 }
 
+/// How a Spanish mouth would say a written word, reduced to its sounds.
+///
+/// The recogniser is Spanish; the names it is asked to write are mostly
+/// English. What comes back is the English name spelled as it sounded to a
+/// Spanish ear — "Chrome" as "crome", "cromo" or "crom", "Photoshop" as
+/// "fotochop". Those are the same sounds written three ways, and comparing
+/// spellings can only ever catch them one alias at a time.
+///
+/// So spelling is reduced to sound first, using the part of Spanish
+/// orthography that is genuinely many-to-one: b and v are one sound, c
+/// before a, o, u is k and before e, i is s, z is s too, qu is k, ll is y,
+/// h is silent, double letters are single sounds. Two more rules are about
+/// loanwords rather than Spanish: "ch" before a consonant is the English
+/// /k/ cluster ("chrome"), and Spanish has no word-initial s + consonant,
+/// so "espotifai" and "spotify" start alike. Finally the last vowel goes,
+/// because that is the vowel Spanish adds to an English name that ends in
+/// a consonant, and the one it wavers over ("crome", "cromo", "croma").
+///
+/// The result is not IPA and is not meant to be read: it only has to be
+/// equal for two spellings of the same sound, and different otherwise.
+/// `c` in the output means the "ch" sound, since plain c never survives.
+pub fn phonetic(phrase: &str) -> String {
+    normalise(phrase)
+        .split_whitespace()
+        .map(phonetic_word)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn is_vowel(c: Option<char>) -> bool {
+    matches!(c, Some('a' | 'e' | 'i' | 'o' | 'u'))
+}
+
+/// Whether a letter is one of the two that soften c and g.
+fn is_front(c: Option<char>) -> bool {
+    matches!(c, Some('e' | 'i'))
+}
+
+fn phonetic_word(word: &str) -> String {
+    let letters: Vec<char> = word.chars().collect();
+    let mut sounds = String::with_capacity(letters.len());
+    let mut at = 0;
+    while at < letters.len() {
+        let this = letters[at];
+        let next = letters.get(at + 1).copied();
+        let after = letters.get(at + 2).copied();
+        let mut taken = 1;
+        match this {
+            // Silent, always: "hola" is "ola". The digraphs that use it
+            // are taken below, before the h is ever reached on its own.
+            'h' => {}
+            'c' if next == Some('h') => {
+                taken = 2;
+                // "chrome", "christian": a cluster Spanish does not have,
+                // said /k/. Before a vowel it is the Spanish "ch", which
+                // nothing else in this alphabet writes, so it keeps the c.
+                sounds.push(if is_vowel(after) { 'c' } else { 'k' });
+            }
+            'c' => sounds.push(if is_front(next) { 's' } else { 'k' }),
+            'q' => {
+                sounds.push('k');
+                if next == Some('u') {
+                    taken = 2;
+                }
+            }
+            'z' => sounds.push('s'),
+            'v' => sounds.push('b'),
+            'w' => sounds.push('u'),
+            'x' => sounds.push_str("ks"),
+            'p' if next == Some('h') => {
+                taken = 2;
+                sounds.push('f');
+            }
+            's' if next == Some('h') => {
+                taken = 2;
+                // English /ʃ/ arrives as the nearest Spanish sound, "ch".
+                sounds.push('c');
+            }
+            'g' if is_front(next) => sounds.push('j'),
+            'g' if next == Some('u') && is_front(after) => {
+                taken = 2;
+                sounds.push('g');
+            }
+            // Spanish writes the English w of a loanword as "gu":
+            // "guasap" for WhatsApp, "guisqui" for whisky.
+            'g' if next == Some('u') && is_vowel(after) => {
+                taken = 2;
+                sounds.push('u');
+            }
+            'l' if next == Some('l') => {
+                taken = 2;
+                sounds.push('y');
+            }
+            // A y with no vowel after it is the vowel i: "spotify".
+            'y' if !is_vowel(next) => sounds.push('i'),
+            other => sounds.push(other),
+        }
+        at += taken;
+        // Double letters are one sound, whatever produced them.
+        if sounds.chars().count() >= 2 {
+            let mut tail = sounds.chars().rev();
+            let (last, before) = (tail.next(), tail.next());
+            if last == before {
+                sounds.pop();
+            }
+        }
+    }
+
+    // Spanish has no word-initial s + consonant and puts an e in front of
+    // one: "spotify" is said "espotifai". Dropping it makes the two spellings
+    // start the same way, whichever the recogniser chose to write.
+    if let Some(rest) = sounds.strip_prefix('e') {
+        if rest.starts_with('s') && !is_vowel(rest.chars().nth(1)) && rest.chars().count() >= 3 {
+            sounds = rest.to_string();
+        }
+    }
+
+    // The final vowel of a name is the one Spanish invents: "Chrome" comes
+    // back as "crom", "crome" and "cromo" on different days. Only for words
+    // long enough that the vowel is not most of the word.
+    if sounds.chars().count() >= 4 && is_vowel(sounds.chars().last()) {
+        sounds.pop();
+    }
+    sounds
+}
+
 /// How closely `heard` matches `expected`, from 0 to 1.
 ///
 /// The score has to mean something across its whole range, because the
@@ -306,6 +432,68 @@ mod tests {
         assert!(words_match("abrecrome", "crome", true));
         // The command it used to run, at full confidence.
         assert!(similarity("contar esto", "corta esto") < 0.7);
+    }
+
+    #[test]
+    fn one_sound_survives_many_spellings() {
+        // Each group is one word the recogniser writes differently from
+        // one utterance to the next. Straight from the alias lists and the
+        // log: "crome", "cromo" and "grum" are all "Chrome" said in Spanish.
+        for group in [
+            &["chrome", "crome", "cromo", "croma", "crom", "kromo"][..],
+            &["safari", "safary", "zafari", "safarí"][..],
+            &["espotifai", "spotifai", "espotifay"][..],
+            &["photoshop", "fotochop"][..],
+            &["guasap", "uasap", "wasap"][..],
+            &["yamada", "llamada"][..],
+            &["bale", "vale"][..],
+            &["word", "guord"][..],
+            &["quiero", "kiero"][..],
+        ] {
+            let first = phonetic(group[0]);
+            for spelling in group {
+                assert_eq!(
+                    phonetic(spelling),
+                    first,
+                    "«{spelling}» should sound like «{}»",
+                    group[0]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn different_words_keep_different_sounds() {
+        // The pairs that matter: each of these has been, or could be,
+        // mistaken for the other by a looser rule.
+        for (a, b) in [
+            ("gmail", "mail"),
+            ("mallorca", "orca"),
+            ("minuto", "minion"),
+            ("safari", "terminal"),
+            ("chrome", "cromwell"),
+            ("copiar", "cortar"),
+            ("ventana", "pestana"),
+            ("marca", "marcadores"),
+        ] {
+            assert_ne!(phonetic(a), phonetic(b), "«{a}» and «{b}» are different words");
+        }
+    }
+
+    #[test]
+    fn the_sounds_are_the_ones_spanish_really_merges() {
+        // Spelled out, so the rules can be read off the test: b and v, c
+        // before a back vowel and k and qu, c before a front vowel and z,
+        // ll and y, a silent h, a double letter, and the vowel Spanish
+        // adds to the end of an English name.
+        assert_eq!(phonetic("vaca"), "bak");
+        assert_eq!(phonetic("queso"), "kes");
+        assert_eq!(phonetic("zapato"), "sapat");
+        assert_eq!(phonetic("hola"), "ola");
+        assert_eq!(phonetic("perro"), "per");
+        assert_eq!(phonetic("chrome"), "krom");
+        // A short word keeps its vowel: there would be nothing left of it.
+        assert_eq!(phonetic("no"), "no");
     }
 
     #[test]

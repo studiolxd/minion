@@ -880,30 +880,103 @@ fn near_alias(word: &str, alias: &str) -> bool {
     same_start && crate::text::edits_between(word, alias) <= 1
 }
 
+/// Whether some run of whole words in the sentence *sounds* like the alias.
+///
+/// The names are English and the recogniser writes Spanish, so it picks a
+/// different spelling for the same sounds every time: "chrome", "crome",
+/// "cromo", "croma". [`crate::text::phonetic`] reduces both sides to those
+/// sounds, and one comparison then covers every spelling of them —
+/// including the ones nobody has said yet, which is what listing them one
+/// by one can never do.
+///
+/// Whole words and equality, never a substring or a near miss: everything
+/// this is allowed to forgive is already forgiven inside `phonetic`, and
+/// anything looser would undo the work `near_alias` did to keep "gmail"
+/// out of Mail. Very short sounds are refused for the same reason — at
+/// three letters, two different words share a form too easily.
+fn sounds_alias(words: &[&str], alias: &str) -> bool {
+    const MIN_SOUNDS: usize = 4;
+    let wanted = crate::text::phonetic(alias);
+    if wanted.chars().count() < MIN_SOUNDS {
+        return false;
+    }
+    let spread = alias.split_whitespace().count();
+    if spread == 0 || spread > words.len() {
+        return false;
+    }
+    words
+        .windows(spread)
+        .any(|window| crate::text::phonetic(&window.join(" ")) == wanted)
+}
+
+/// How much of a word sounds like the alias, from 0 to 1.
+///
+/// Only ever a guess to put to the user, never grounds for acting: it says
+/// "most of these sounds agree", which is true of words that are not the
+/// same word. [`sounds_alias`] is the one that decides, and it asks for
+/// every sound.
+fn sounds_near(word: &str, alias: &str) -> f32 {
+    let (heard, wanted) = (crate::text::phonetic(word), crate::text::phonetic(alias));
+    let longest = heard.chars().count().max(wanted.chars().count());
+    // Short words share sounds by accident, and `edits_between` gives up
+    // (returning something enormous) once the two lengths are three apart,
+    // which is the point at which one is not a mishearing of the other.
+    // Two sounds wrong is the ceiling, the same one the rest of the
+    // matching keeps: past that the word is not a mishearing of the name
+    // but a different word, and a question about it is noise.
+    const MOST_EDITS: usize = 2;
+    let edits = crate::text::edits_between(&heard, &wanted);
+    if longest < 4 || edits > MOST_EDITS {
+        return 0.0;
+    }
+    // Kept below every grade `find_app` acts on, so a guess can never
+    // outrank a real match when the two are compared.
+    (1.0 - edits as f32 / longest as f32).min(0.75)
+}
+
 /// Finds an application named in the sentence, with its match score.
 ///
-/// Whole words only, in three grades: named outright, run together with
-/// another word, or one slip away from the name. Bigger mangles stay in
-/// the alias lists — what the recogniser really writes ("shafari",
-/// "cromo") is listed, which is explicit and cannot spread.
+/// Whole words only, in four grades: named outright, run together with
+/// another word, said so that it sounds like the name, or one slip away
+/// from it. Bigger mangles stay in the alias lists — what the recogniser
+/// really writes ("shafari", "grum") is listed, which is explicit and
+/// cannot spread.
 fn find_app(rest: &str) -> Option<(&'static App, f32)> {
+    best_app(rest, false).filter(|(_, score)| *score >= threshold())
+}
+
+/// The application a sentence comes closest to naming, and how closely.
+///
+/// The same search as [`find_app`] without the threshold, so a caller that
+/// only wants to *ask* about a guess can see one that was too weak to act
+/// on. `guessing` adds a fifth, softer grade below the other four: how
+/// much of the word sounds right, a spread rather than a step, so a guess
+/// can be ranked against the commands — "abre za fari" is worth mentioning
+/// and "abre cron" is not. It is never available to `find_app`, because a
+/// word that mostly sounds right is not grounds for doing anything.
+fn best_app(rest: &str, guessing: bool) -> Option<(&'static App, f32)> {
     let words: Vec<&str> = rest.split_whitespace().collect();
     let mut best: Option<(&App, f32)> = None;
     for app in all_apps() {
         for alias in app.aliases {
-            // A plain mention beats a run-together one, which beats a
-            // misheard one; longer aliases beat shorter ones, so "vs code"
-            // wins over a stray "code".
+            // A plain mention beats a run-together one, which beats one
+            // that only sounds right, which beats a misheard one; longer
+            // aliases beat shorter ones, so "vs code" wins over a stray
+            // "code".
             let score = if names_alias(&words, alias) {
                 0.9 + (alias.len() as f32 / 100.0).min(0.09)
             } else if words.iter().any(|word| run_together(word, alias)) {
                 0.9
+            } else if sounds_alias(&words, alias) {
+                0.85
             } else if words.iter().any(|word| near_alias(word, alias)) {
                 0.8
+            } else if guessing {
+                words.iter().map(|word| sounds_near(word, alias)).fold(0.0, f32::max)
             } else {
                 0.0
             };
-            if score >= threshold() && best.is_none_or(|(_, b)| score > b) {
+            if score > 0.0 && best.is_none_or(|(_, b)| score > b) {
                 best = Some((app, score));
             }
         }
@@ -1371,6 +1444,51 @@ pub fn closest_command(phrase: &str) -> Option<(&'static str, f32)> {
         }
     }
     best
+}
+
+/// A guess at the application a phrase was trying to name.
+pub struct AppGuess {
+    /// What would be done about it, read off the verb: "cierra za fari"
+    /// asks to quit, anything else to open.
+    pub decision: Decision,
+    /// The application's name, as the catalogue spells it.
+    pub app: &'static str,
+    /// The word that nearly named it — the one worth learning, rather than
+    /// the whole sentence it was said in.
+    pub spoken: String,
+    pub score: f32,
+}
+
+/// The application a phrase most nearly names, ignoring the threshold.
+///
+/// The companion to [`closest_command`], and used the same way: to suggest
+/// what a phrase that was not understood was probably meant to be. It
+/// always answers, which is useful for a question and dangerous for an
+/// action, so nothing acts on it without being told to.
+pub fn closest_app(phrase: &str) -> Option<AppGuess> {
+    let normalised = normalise(phrase);
+    let rest = strip_wake_word(&normalised).unwrap_or(&normalised);
+    let (app, score) = best_app(rest, true)?;
+
+    // Which of the words was it? The alias that scored is not necessarily
+    // spelled like anything that was said, so the word is found again here.
+    let spoken = rest
+        .split_whitespace()
+        .max_by(|a, b| {
+            let sound = |word: &str| {
+                app.aliases.iter().map(|alias| sounds_near(word, alias)).fold(0.0, f32::max)
+            };
+            sound(a).total_cmp(&sound(b))
+        })?
+        .to_string();
+
+    let leading_verb = keywords(rest).first().cloned();
+    let decision = if leading_verb.is_some_and(|v| QUIT_VERBS.contains(&v.as_str())) {
+        Decision::Quit { name: app.name, bundle_id: app.bundle_id }
+    } else {
+        Decision::Launch { name: app.name, bundle_id: app.bundle_id }
+    };
+    Some(AppGuess { decision, app: app.name, spoken, score })
 }
 
 /// The whole vocabulary, written out for someone to read.
@@ -2236,6 +2354,65 @@ mod tests {
         for command in &vocabulary().commands {
             assert!(catalogue.contains(command.name), "{} should be listed", command.name);
         }
+    }
+
+    #[test]
+    fn an_app_name_is_found_however_it_is_spelled() {
+        // Not in any alias list, and not one edit from anything in one:
+        // these only reach their application because they *sound* like it.
+        // Every spelling the recogniser has produced so far is already
+        // listed by hand, which is exactly what this stops being necessary.
+        for (spoken, app) in [
+            ("minion abre kromo", "Chrome"),
+            ("minion abre crom", "Chrome"),
+            ("minion abre zafari", "Safari"),
+            ("minion abre safary", "Safari"),
+            ("minion abre spotifai", "Spotify"),
+            ("minion abre uasap", "WhatsApp"),
+            ("minion abre klod", "Claude"),
+            ("minion abre faynder", "Finder"),
+        ] {
+            assert_eq!(
+                decide(spoken).0,
+                Decision::Launch {
+                    name: app,
+                    bundle_id: all_apps().find(|a| a.name == app).expect("app").bundle_id,
+                },
+                "«{spoken}» should open {app}"
+            );
+        }
+    }
+
+    #[test]
+    fn sounding_alike_is_not_enough_on_its_own() {
+        // The three the substring search used to get wrong, plus the words
+        // that merely rhyme with an application. Sounds are compared whole
+        // word to whole word, so none of them reaches an application.
+        for spoken in [
+            "minion abre gmail punto com",
+            "minion abre mallorca punto com",
+            "minion abre marca punto com",
+            "minion abre el codo",
+            "minuto abre chrome",
+        ] {
+            assert!(
+                !matches!(decide(spoken).0, Decision::Launch { .. }),
+                "«{spoken}» should not open an application"
+            );
+        }
+        // And the commands that live near an application name still win.
+        assert_eq!(decision("minion cierra la ventana"), Decision::Run("cerrar ventana"));
+        assert_eq!(decision("minion copia esto"), Decision::Run("copiar"));
+    }
+
+    #[test]
+    fn a_name_that_only_sounds_right_scores_below_one_said_outright() {
+        // The grades have to stay in order, or a mishearing outranks the
+        // real thing when both are in the same sentence.
+        let (_, said) = decide("minion abre chrome");
+        let (_, sounded) = decide("minion abre kromo");
+        assert!(sounded < said, "{sounded} should be below {said}");
+        assert!(sounded >= threshold());
     }
 
     #[test]
