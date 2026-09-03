@@ -408,6 +408,14 @@ pub fn energy_decision(
 /// downloaded vocabulary pack cannot ask Minion to run anything, since it
 /// is data that may have come from elsewhere, but a line typed into your
 /// own `config.toml` is not.
+/// A command of your own: what to say, and what it does.
+///
+/// Exactly one of `keys`, `text` and `url` is expected. Unlike a vocabulary
+/// pack's `[[commands]]` (`vocabulary.rs`), there is no `action` naming one
+/// of the built-in `NAMED_ACTIONS` — that table is private to `vocabulary.rs`
+/// on purpose, the same way `macros` are "only read from here": a command
+/// typed by hand in this file can only press keys, type text or open a
+/// page, never reach into the closed set of system actions.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommandConfig {
@@ -422,6 +430,10 @@ pub struct CommandConfig {
     /// A shell command, run via `/bin/sh -c` with stdin closed, its output
     /// logged, and a 30-second ceiling. Never in a terminal window.
     pub shell: Option<String>,
+    /// Text to type into whatever has focus.
+    pub text: Option<String>,
+    /// A page to open.
+    pub url: Option<String>,
 }
 
 /// Another way of saying an existing command.
@@ -639,23 +651,38 @@ struct AliasPhrase {
     phrase: String,
 }
 
-/// Removes the first `[[aliases]]` block whose `phrase` matches (after
-/// [`crate::text::normalise`]) the given phrase, from already-read file
-/// contents. Pure: takes and returns text, touches no file. Leaves the
-/// file untouched if nothing matches.
+/// The `bundle_id` of one `[[apps]]` block, read on its own — see
+/// [`AliasPhrase`].
+#[derive(Deserialize)]
+struct AppBundleId {
+    bundle_id: String,
+}
+
+/// The `name` of one `[[commands]]` block, read on its own — see
+/// [`AliasPhrase`].
+#[derive(Deserialize)]
+struct CommandName {
+    name: String,
+}
+
+/// Removes the first `[[table]]` block that parses as `T` and satisfies
+/// `matches`, from already-read file contents. Pure: takes and returns
+/// text, touches no file. Leaves the file untouched if nothing matches.
 ///
-/// Used by the "Olvidar alias" item in the "Últimas órdenes" menu: an
-/// alias is only ever this file's own `[[aliases]]` entry, never something
-/// from the built-in vocabulary, so there is always exactly one block (or
-/// none) to remove.
-fn without_alias(contents: &str, phrase: &str) -> String {
-    let target = crate::text::normalise(phrase);
+/// Shared by [`without_alias`], [`without_app`] and [`without_command`],
+/// which differ only in the table name and what identifies a block.
+fn without_block<T, F>(contents: &str, table: &str, matches: F) -> String
+where
+    T: serde::de::DeserializeOwned,
+    F: Fn(&T) -> bool,
+{
+    let header = format!("[[{table}]]");
     let lines: Vec<&str> = contents.lines().collect();
 
     let mut blocks: Vec<(usize, usize)> = Vec::new();
     let mut i = 0;
     while i < lines.len() {
-        if lines[i].trim() == "[[aliases]]" {
+        if lines[i].trim() == header {
             let start = i;
             let end = lines
                 .iter()
@@ -669,23 +696,50 @@ fn without_alias(contents: &str, phrase: &str) -> String {
         }
     }
 
-    let matching = blocks.into_iter().find(|(start, end)| {
-        toml::from_str::<AliasPhrase>(&lines[start + 1..*end].join("\n"))
-            .is_ok_and(|alias| crate::text::normalise(&alias.phrase) == target)
+    let found = blocks.into_iter().find(|(start, end)| {
+        toml::from_str::<T>(&lines[start + 1..*end].join("\n")).is_ok_and(|item| matches(&item))
     });
 
-    let Some((start, end)) = matching else {
+    let Some((start, end)) = found else {
         return contents.to_string();
     };
 
     let mut kept: Vec<&str> = lines[..start].to_vec();
     kept.extend(&lines[end..]);
     // A blank line left where the block used to be, at the end of the
-    // file, would otherwise grow by one every time the last alias goes.
+    // file, would otherwise grow by one every time the last entry goes.
     while kept.last().is_some_and(|l| l.trim().is_empty()) {
         kept.pop();
     }
     kept.join("\n") + "\n"
+}
+
+/// Removes the first `[[aliases]]` block whose `phrase` matches (after
+/// [`crate::text::normalise`]) the given phrase, from already-read file
+/// contents. Pure: takes and returns text, touches no file. Leaves the
+/// file untouched if nothing matches.
+///
+/// Used by the "Olvidar alias" item in the "Últimas órdenes" menu: an
+/// alias is only ever this file's own `[[aliases]]` entry, never something
+/// from the built-in vocabulary, so there is always exactly one block (or
+/// none) to remove.
+fn without_alias(contents: &str, phrase: &str) -> String {
+    let target = crate::text::normalise(phrase);
+    without_block::<AliasPhrase, _>(contents, "aliases", |alias| {
+        crate::text::normalise(&alias.phrase) == target
+    })
+}
+
+/// Removes the first `[[apps]]` block with the given `bundle_id` — see
+/// [`without_alias`].
+fn without_app(contents: &str, bundle_id: &str) -> String {
+    without_block::<AppBundleId, _>(contents, "apps", |app| app.bundle_id == bundle_id)
+}
+
+/// Removes the first `[[commands]]` block with the given `name` — see
+/// [`without_alias`].
+fn without_command(contents: &str, name: &str) -> String {
+    without_block::<CommandName, _>(contents, "commands", |command| command.name == name)
 }
 
 /// Removes an alias by its phrase — see [`without_alias`]. Refuses to
@@ -694,6 +748,117 @@ pub fn remove_alias(phrase: &str) -> Result<(), String> {
     let path = path().ok_or("no home directory")?;
     let existing = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
     let updated = parse_checked(without_alias(&existing, phrase))?;
+    write_config(&path, updated)
+}
+
+/// Removes an application by its bundle id — see [`without_app`]. Refuses
+/// to write if the result would not parse. A built-in application has no
+/// `[[apps]]` block in `config.toml` to begin with, so this is a no-op for
+/// anything but one added from here.
+pub fn remove_app(bundle_id: &str) -> Result<(), String> {
+    let path = path().ok_or("no home directory")?;
+    let existing = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let updated = parse_checked(without_app(&existing, bundle_id))?;
+    write_config(&path, updated)
+}
+
+/// Removes a command by its name — see [`without_command`]. Refuses to
+/// write if the result would not parse.
+pub fn remove_command(name: &str) -> Result<(), String> {
+    let path = path().ok_or("no home directory")?;
+    let existing = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let updated = parse_checked(without_command(&existing, name))?;
+    write_config(&path, updated)
+}
+
+/// Appends already-formatted TOML to already-read file contents. Pure.
+/// Refuses (by returning an error) if the result would not parse.
+fn appended(contents: &str, addition: &str) -> Result<String, String> {
+    let mut out = contents.to_string();
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(addition);
+    parse_checked(out)
+}
+
+/// One `[[apps]]` entry, quoted so that whatever was typed or heard parses.
+fn app_block(name: &str, bundle_id: &str, aliases: &[String]) -> String {
+    let aliases: Vec<String> = aliases.iter().map(|a| toml_string(a)).collect();
+    format!(
+        "\n[[apps]]\nname = {}\nbundle_id = {}\naliases = [{}]\n",
+        toml_string(name),
+        toml_string(bundle_id),
+        aliases.join(", ")
+    )
+}
+
+/// Adds an application, appended to `config.toml`. Refuses to write if the
+/// result would not parse — an empty name or bundle id parses fine as a
+/// `Config`, so that is checked by the caller, not here.
+pub fn add_app(name: &str, bundle_id: &str, aliases: &[String]) -> Result<(), String> {
+    let path = path().ok_or("no home directory")?;
+    if let Some(parent) = path.parent() {
+        secure_config_dir(parent)?;
+    }
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let updated = appended(&existing, &app_block(name, bundle_id, aliases))?;
+    write_config(&path, updated)
+}
+
+/// What a command of your own does — see [`CommandConfig`].
+pub enum CommandKind {
+    Keys(String),
+    Text(String),
+    Url(String),
+}
+
+/// One `[[commands]]` entry, quoted so that whatever was typed parses.
+fn command_block(name: &str, phrases: &[String], kind: &CommandKind) -> String {
+    let phrases: Vec<String> = phrases.iter().map(|p| toml_string(p)).collect();
+    let action = match kind {
+        CommandKind::Keys(keys) => format!("keys = {}", toml_string(keys)),
+        CommandKind::Text(text) => format!("text = {}", toml_string(text)),
+        CommandKind::Url(url) => format!("url = {}", toml_string(url)),
+    };
+    format!(
+        "\n[[commands]]\nname = {}\nphrases = [{}]\n{action}\n",
+        toml_string(name),
+        phrases.join(", ")
+    )
+}
+
+/// Adds a command of your own, appended to `config.toml`. Refuses to write
+/// if the result would not parse.
+pub fn add_command(name: &str, phrases: &[String], kind: &CommandKind) -> Result<(), String> {
+    let path = path().ok_or("no home directory")?;
+    if let Some(parent) = path.parent() {
+        secure_config_dir(parent)?;
+    }
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let updated = appended(&existing, &command_block(name, phrases, kind))?;
+    write_config(&path, updated)
+}
+
+/// One `[[aliases]]` entry, quoted so that whatever was typed or heard
+/// parses.
+fn alias_block(command: &str, phrase: &str) -> String {
+    format!(
+        "\n[[aliases]]\ncommand = {}\nphrase = {}\n",
+        toml_string(command),
+        toml_string(phrase)
+    )
+}
+
+/// Adds an alias, appended to `config.toml`. Refuses to write if the
+/// result would not parse.
+pub fn add_alias(command: &str, phrase: &str) -> Result<(), String> {
+    let path = path().ok_or("no home directory")?;
+    if let Some(parent) = path.parent() {
+        secure_config_dir(parent)?;
+    }
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let updated = appended(&existing, &alias_block(command, phrase))?;
     write_config(&path, updated)
 }
 
@@ -840,6 +1005,12 @@ fn command_action(entry: &CommandConfig) -> Option<crate::commands::Action> {
             }
         }
     }
+    if let Some(text) = &entry.text {
+        asked.push(crate::commands::Action::Type(Box::leak(text.clone().into_boxed_str())));
+    }
+    if let Some(url) = &entry.url {
+        asked.push(crate::commands::Action::Open(Box::leak(url.clone().into_boxed_str())));
+    }
     if let Some(script) = &entry.script {
         asked.push(crate::commands::Action::RunScript(Box::leak(
             script.clone().into_boxed_str(),
@@ -854,7 +1025,7 @@ fn command_action(entry: &CommandConfig) -> Option<crate::commands::Action> {
         1 => Some(asked[0]),
         0 => {
             crate::journal::write(&format!(
-                "Ignoring command «{}»: it does nothing — give it keys, script or shell",
+                "Ignoring command «{}»: it does nothing — give it keys, text, url, script or shell",
                 entry.name
             ));
             None
@@ -1679,5 +1850,90 @@ mod tests {
         let two_minutes = Duration::from_secs(BATTERY_MODEL_UNLOAD_MINUTES * 60);
         let decision = energy_decision(EnergyMode::Battery, false, two_minutes, None);
         assert_eq!(decision, EnergyDecision { unload_model: true, unload_speaker: false });
+    }
+
+    #[test]
+    fn an_app_can_be_added_and_removed() {
+        let added = appended("sounds = true\n", &app_block("Notion", "notion.id", &["nocion".into()]))
+            .expect("should parse");
+        let config: Config = toml::from_str(&added).expect("should parse");
+        let apps = config.extra_apps();
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0].name, "Notion");
+        assert_eq!(apps[0].bundle_id, "notion.id");
+        assert!(added.contains("sounds = true"), "the rest of the file survives");
+
+        let removed = without_app(&added, "notion.id");
+        let config: Config = toml::from_str(&removed).expect("should parse");
+        assert!(config.extra_apps().is_empty());
+        assert!(removed.contains("sounds = true"), "the rest of the file survives removal too");
+    }
+
+    #[test]
+    fn removing_an_unknown_app_changes_nothing() {
+        let before = "[[apps]]\nname = \"Notion\"\nbundle_id = \"notion.id\"\naliases = []\n";
+        assert_eq!(without_app(before, "algo.que.no.existe"), before);
+    }
+
+    #[test]
+    fn a_command_can_be_added_with_each_kind_of_action() {
+        let with_keys = appended(
+            "",
+            &command_block("compilar", &["compila".into()], &CommandKind::Keys("cmd-shift-b".into())),
+        )
+        .expect("should parse");
+        let commands = toml::from_str::<Config>(&with_keys).unwrap().extra_commands();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].name, "compilar");
+        assert!(matches!(commands[0].action, crate::commands::Action::Key(_, _)));
+
+        let with_text = appended(
+            "",
+            &command_block("firma", &["pon mi firma".into()], &CommandKind::Text("Saludos, Ana".into())),
+        )
+        .expect("should parse");
+        let commands = toml::from_str::<Config>(&with_text).unwrap().extra_commands();
+        assert!(matches!(commands[0].action, crate::commands::Action::Type("Saludos, Ana")));
+
+        let with_url = appended(
+            "",
+            &command_block("panel", &["abre el panel".into()], &CommandKind::Url("https://example.com".into())),
+        )
+        .expect("should parse");
+        let commands = toml::from_str::<Config>(&with_url).unwrap().extra_commands();
+        assert!(matches!(commands[0].action, crate::commands::Action::Open("https://example.com")));
+    }
+
+    #[test]
+    fn a_command_can_be_removed_by_name() {
+        let before = "\
+             [[commands]]\n\
+             name = \"compilar\"\n\
+             phrases = [\"compila\"]\n\
+             keys = \"cmd-shift-b\"\n\
+             \n\
+             [[commands]]\n\
+             name = \"otro\"\n\
+             phrases = [\"otro\"]\n\
+             keys = \"cmd-k\"\n";
+        let after = without_command(before, "compilar");
+        let commands = toml::from_str::<Config>(&after).unwrap().extra_commands();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].name, "otro");
+    }
+
+    #[test]
+    fn an_alias_can_be_added() {
+        let added = appended("", &alias_block("abrir Chrome", "abre cromo")).expect("should parse");
+        let config: Config = toml::from_str(&added).expect("should parse");
+        assert_eq!(config.extra_aliases(), vec![("abrir Chrome", "abre cromo")]);
+    }
+
+    #[test]
+    fn add_app_and_add_command_refuse_to_write_an_unparsable_addition() {
+        // A stray `"` from an unescaped value would otherwise leave the
+        // whole file unreadable; appended() must catch that before writing.
+        let broken = appended("", "\n[[apps]]\nname = \"x\n");
+        assert!(broken.is_err());
     }
 }
