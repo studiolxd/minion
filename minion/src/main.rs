@@ -643,12 +643,14 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                 &decision,
                 confidence,
                 repeats,
-                seconds,
-                elapsed_ms,
-                log_ignored_speech.load(Ordering::Relaxed),
-                play_sounds.load(Ordering::Relaxed),
-                &acted,
-                &status,
+                &Reporting {
+                    seconds,
+                    elapsed_ms,
+                    log_ignored_speech: log_ignored_speech.load(Ordering::Relaxed),
+                    play_sounds: play_sounds.load(Ordering::Relaxed),
+                    acted: &acted,
+                    status: &status,
+                },
             );
 
             if commands::is_sleep(&decision) {
@@ -678,80 +680,91 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
     Ok(())
 }
 
+/// Everything a report needs beyond the decision itself: what was heard,
+/// how long it took, and where to say so.
+///
+/// Gathered rather than passed one by one — the flags are read per part, as
+/// they were before, so a switch flipped in the preferences window applies
+/// to the very next instruction.
+struct Reporting<'a> {
+    seconds: f32,
+    elapsed_ms: u128,
+    log_ignored_speech: bool,
+    play_sounds: bool,
+    acted: &'a AtomicBool,
+    status: &'a Status,
+}
+
 /// Carries out a decision and writes down what happened.
-#[allow(clippy::too_many_arguments)]
 fn report(
     transcript: &str,
     decision: &Decision,
     confidence: f32,
     repeats: usize,
-    seconds: f32,
-    elapsed_ms: u128,
-    log_ignored_speech: bool,
-    play_sounds: bool,
-    acted: &AtomicBool,
-    status: &Status,
+    at: &Reporting,
 ) {
-        match decision {
-            Decision::Ignored => {
-                // Speech that was not for us. The wording is only written
-                // down when explicitly asked for: see log_ignored_speech.
-                if log_ignored_speech {
-                    note!("heard    «{transcript}»  (not addressed to me)");
-                } else {
-                    note!("heard    {seconds:.1}s of speech, not addressed to me");
-                }
-                set_status(status, &last_utterance_tooltip(transcript, "no era para mí"));
+    let seconds = at.seconds;
+    match decision {
+        Decision::Ignored => {
+            // Speech that was not for us. The wording is only written
+            // down when explicitly asked for: see log_ignored_speech.
+            if at.log_ignored_speech {
+                note!("heard    «{transcript}»  (not addressed to me)");
+            } else {
+                note!("heard    {seconds:.1}s of speech, not addressed to me");
             }
-            Decision::Unrecognised => {
-                note!("unknown  «{transcript}»  ->  not understood");
-                set_status(status, &last_utterance_tooltip(transcript, "no entendido"));
-                if play_sounds {
-                    actions::play_sound(sounds::UNSURE);
-                }
+            set_status(at.status, &last_utterance_tooltip(transcript, "no era para mí"));
+        }
+        Decision::Unrecognised => {
+            note!("unknown  «{transcript}»  ->  not understood");
+            set_status(at.status, &last_utterance_tooltip(transcript, "no entendido"));
+            if at.play_sounds {
+                actions::play_sound(sounds::UNSURE);
             }
-            _ => {
-                let mut outcome = None;
-                for _ in 0..repeats.max(1) {
-                    outcome = commands::perform(decision);
-                }
-                if let Some(done) = outcome {
-                    if done.succeeded {
-                        let again = if repeats > 1 {
-                            format!(" ×{repeats}")
-                        } else {
-                            String::new()
-                        };
-                        note!(
-                            "ran      «{transcript}»  ->  {}{again}  \
-                             [{:.0}% · {seconds:.1}s audio · {elapsed_ms} ms]",
-                            done.description,
-                            confidence * 100.0
-                        );
-                        acted.store(true, Ordering::Relaxed);
-                        set_status(status, &last_utterance_tooltip(transcript, &done.description));
-                        if play_sounds {
-                            actions::play_sound(sounds::DONE);
-                        }
+        }
+        _ => {
+            let mut outcome = None;
+            for _ in 0..repeats.max(1) {
+                outcome = commands::perform(decision);
+            }
+            if let Some(done) = outcome {
+                if done.succeeded {
+                    let again = if repeats > 1 {
+                        format!(" ×{repeats}")
                     } else {
-                        // Understood perfectly and refused by the system.
-                        // Almost always the Accessibility permission.
-                        note!(
-                            "BLOCKED  «{transcript}»  ->  {}  — macOS refused it. \
-                             Grant Accessibility in System Settings.",
-                            done.description
-                        );
-                        set_status(
-                            status,
-                            &last_utterance_tooltip(transcript, "bloqueado por macOS"),
-                        );
-                        if play_sounds {
-                            actions::play_sound(sounds::BLOCKED);
-                        }
+                        String::new()
+                    };
+                    let elapsed_ms = at.elapsed_ms;
+                    note!(
+                        "ran      «{transcript}»  ->  {}{again}  \
+                         [{:.0}% · {seconds:.1}s audio · {elapsed_ms} ms]",
+                        done.description,
+                        confidence * 100.0
+                    );
+                    at.acted.store(true, Ordering::Relaxed);
+                    set_status(at.status, &last_utterance_tooltip(transcript, &done.description));
+                    if at.play_sounds {
+                        actions::play_sound(sounds::DONE);
+                    }
+                } else {
+                    // Understood perfectly and refused by the system.
+                    // Almost always the Accessibility permission.
+                    note!(
+                        "BLOCKED  «{transcript}»  ->  {}  — macOS refused it. \
+                         Grant Accessibility in System Settings.",
+                        done.description
+                    );
+                    set_status(
+                        at.status,
+                        &last_utterance_tooltip(transcript, "bloqueado por macOS"),
+                    );
+                    if at.play_sounds {
+                        actions::play_sound(sounds::BLOCKED);
                     }
                 }
             }
         }
+    }
 }
 
 /// Builds the menu bar item and hands control to AppKit. Never returns.
