@@ -19,8 +19,14 @@ objc2-app-kit = { version = "0.3.2", features = ["NSAlert", "NSWindow", "NSButto
 # The CoreAudio process objects (macOS 14+) that say which processes are
 # recording right now. Already in the tree via cpal at this exact version;
 # taken directly rather than writing extern "C" blocks by hand.
-objc2-core-audio = { version = "0.3.2", default-features = false, features = ["std", "AudioHardware"] }
-objc2-foundation = { version = "0.3.2", features = ["NSTimer", "NSDate", "NSRunLoop", "NSOperation", "NSData", "block2"] }
+objc2-core-audio = { version = "0.3.2", default-features = false, features = ["std", "AudioHardware", "objc2", "objc2-foundation", "objc2-core-audio-types"] }
+# The buffer-list and stream-format structs the process tap's IOProc is
+# handed, and the CFDictionary type its aggregate device is described with.
+# Both are already in the tree via objc2-core-audio; named here because
+# src/loopback.rs writes those types out.
+objc2-core-audio-types = { version = "0.3.2", default-features = false, features = ["std", "objc2"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFDictionary"] }
+objc2-foundation = { version = "0.3.2", features = ["NSTimer", "NSDate", "NSRunLoop", "NSOperation", "NSData", "NSDictionary", "NSArray", "NSString", "NSValue", "NSUUID", "NSObject", "block2"] }
 # CALayer's cornerRadius, for the HUD panel's rounded corners.
 objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["CALayer", "objc2-core-foundation"] }
 ort = "2.0.0-rc.13"

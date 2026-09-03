@@ -438,6 +438,15 @@ pub struct AudioConfig {
     pub vad: Option<String>,
     /// Silero's score above which a frame counts as speech, 0 to 1.
     pub vad_threshold: Option<f32>,
+    /// Discard what the Mac itself is playing, heard back through the
+    /// microphone: Netflix, music, the other side of a call. Off by
+    /// default — it opens a CoreAudio process tap on the system output,
+    /// which is a second audio stream running all the time.
+    pub ignore_own_audio: Option<bool>,
+    /// How alike an utterance and the Mac's own output have to be before
+    /// the utterance is thrown away, 0 to 1. See
+    /// [`crate::loopback::DEFAULT_THRESHOLD`].
+    pub own_audio_threshold: Option<f32>,
 }
 
 /// A name (or other word) the recogniser reliably mangles, and the correct
