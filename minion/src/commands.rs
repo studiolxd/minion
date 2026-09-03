@@ -146,7 +146,7 @@ pub fn wake_words() -> &'static [&'static str] {
 }
 
 /// Confidence required to act.
-fn threshold() -> f32 {
+pub fn threshold() -> f32 {
     *USER_THRESHOLD.get().unwrap_or(&DEFAULT_THRESHOLD)
 }
 
@@ -934,13 +934,40 @@ fn sounds_near(word: &str, alias: &str) -> f32 {
     (1.0 - edits as f32 / longest as f32).min(0.75)
 }
 
+/// How well one spoken sentence matches one alias of an application.
+///
+/// Four grades, in order: named outright, run together with another word,
+/// said so that it sounds like the name, or one slip away from it. Bigger
+/// mangles stay in the alias lists — what the recogniser really writes
+/// ("shafari", "grum") is listed, which is explicit and cannot spread.
+///
+/// `guessing` adds a fifth, softer grade below the other four: how much of
+/// the word sounds right, a spread rather than a step, so a guess can be
+/// ranked against the commands — "abre za fari" is worth mentioning and
+/// "abre cron" is not. It is never available to [`find_app`], because a
+/// word that mostly sounds right is not grounds for doing anything.
+fn alias_score(words: &[&str], alias: &str, guessing: bool) -> f32 {
+    // A plain mention beats a run-together one, which beats one that only
+    // sounds right, which beats a misheard one; longer aliases beat shorter
+    // ones, so "vs code" wins over a stray "code".
+    if names_alias(words, alias) {
+        0.9 + (alias.len() as f32 / 100.0).min(0.09)
+    } else if words.iter().any(|word| run_together(word, alias)) {
+        0.9
+    } else if sounds_alias(words, alias) {
+        0.85
+    } else if words.iter().any(|word| near_alias(word, alias)) {
+        0.8
+    } else if guessing {
+        words.iter().map(|word| sounds_near(word, alias)).fold(0.0, f32::max)
+    } else {
+        0.0
+    }
+}
+
 /// Finds an application named in the sentence, with its match score.
 ///
-/// Whole words only, in four grades: named outright, run together with
-/// another word, said so that it sounds like the name, or one slip away
-/// from it. Bigger mangles stay in the alias lists — what the recogniser
-/// really writes ("shafari", "grum") is listed, which is explicit and
-/// cannot spread.
+/// Whole words only, graded by [`alias_score`].
 fn find_app(rest: &str) -> Option<(&'static App, f32)> {
     best_app(rest, false).filter(|(_, score)| *score >= threshold())
 }
@@ -949,39 +976,88 @@ fn find_app(rest: &str) -> Option<(&'static App, f32)> {
 ///
 /// The same search as [`find_app`] without the threshold, so a caller that
 /// only wants to *ask* about a guess can see one that was too weak to act
-/// on. `guessing` adds a fifth, softer grade below the other four: how
-/// much of the word sounds right, a spread rather than a step, so a guess
-/// can be ranked against the commands — "abre za fari" is worth mentioning
-/// and "abre cron" is not. It is never available to `find_app`, because a
-/// word that mostly sounds right is not grounds for doing anything.
+/// on.
 fn best_app(rest: &str, guessing: bool) -> Option<(&'static App, f32)> {
+    rank_apps(rest, guessing).into_iter().next()
+}
+
+/// Every application the sentence could be naming, best first.
+///
+/// The same search as [`best_app`], kept whole rather than reduced to a
+/// winner, so a caller can see how far ahead that winner actually was.
+/// Sorted stably, which leaves ties in the vocabulary's own order —
+/// exactly what the search did before by only replacing the best on a
+/// strictly better score.
+fn rank_apps(rest: &str, guessing: bool) -> Vec<(&'static App, f32)> {
     let words: Vec<&str> = rest.split_whitespace().collect();
-    let mut best: Option<(&App, f32)> = None;
+    let mut ranked: Vec<(&App, f32)> = Vec::new();
     for app in all_apps() {
-        for alias in app.aliases {
-            // A plain mention beats a run-together one, which beats one
-            // that only sounds right, which beats a misheard one; longer
-            // aliases beat shorter ones, so "vs code" wins over a stray
-            // "code".
-            let score = if names_alias(&words, alias) {
-                0.9 + (alias.len() as f32 / 100.0).min(0.09)
-            } else if words.iter().any(|word| run_together(word, alias)) {
-                0.9
-            } else if sounds_alias(&words, alias) {
-                0.85
-            } else if words.iter().any(|word| near_alias(word, alias)) {
-                0.8
-            } else if guessing {
-                words.iter().map(|word| sounds_near(word, alias)).fold(0.0, f32::max)
-            } else {
-                0.0
-            };
-            if score > 0.0 && best.is_none_or(|(_, b)| score > b) {
-                best = Some((app, score));
-            }
+        let score = app
+            .aliases
+            .iter()
+            .map(|alias| alias_score(&words, alias, guessing))
+            .fold(0.0, f32::max);
+        if score > 0.0 {
+            ranked.push((app, score));
         }
     }
-    best
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+    ranked
+}
+
+/// What the verb a sentence opens with asks to be done to the application
+/// named in it.
+///
+/// Worked out once and passed around: the website route, the application
+/// route and [`candidates`] all need it, and asking three times invites the
+/// three to disagree.
+#[derive(Clone, Copy)]
+struct Intent {
+    /// A verb asking for something to be opened, shown or switched to.
+    open: bool,
+    /// A verb asking for something to be closed.
+    quit: bool,
+    /// A verb we know that asks for neither: the sentence is about
+    /// something else, even if an application happens to be named in it.
+    other: bool,
+    /// Whether it opens with a verb we know at all. A name with no verb in
+    /// front of it ("minion, Safari") still means open it.
+    known_verb: bool,
+}
+
+fn intent_of(spoken_words: &[String]) -> Intent {
+    let leading = spoken_words.first().map(String::as_str);
+    let open = leading.is_some_and(|v| APP_VERBS.contains(&v));
+    let quit = leading.is_some_and(|v| QUIT_VERBS.contains(&v));
+    Intent {
+        open,
+        quit,
+        other: leading.is_some_and(|v| spanish::is_known_verb(v) && !open && !quit),
+        known_verb: leading.is_some_and(spanish::is_known_verb),
+    }
+}
+
+/// What the sentence asks to be done to one application it could be naming,
+/// if anything.
+///
+/// `rival` is the best score anything in the table reached: an application
+/// only acts when it beats that outright, so "cierra la pestaña" closes the
+/// tab rather than an application whose name is somewhere in the sentence.
+fn app_decision(
+    intent: Intent,
+    app: &'static App,
+    score: f32,
+    rival: Option<f32>,
+) -> Option<Decision> {
+    if rival.is_some_and(|best| score <= best) {
+        return None;
+    }
+    if intent.quit {
+        return Some(Decision::Quit { name: app.name, bundle_id: app.bundle_id });
+    }
+    let named_outright = score > 0.85 && !intent.known_verb;
+    ((intent.open || named_outright) && !intent.other)
+        .then_some(Decision::Launch { name: app.name, bundle_id: app.bundle_id })
 }
 
 /// Whether the sentence names one of the known sites outright.
@@ -1174,13 +1250,7 @@ pub fn decide_in(transcript: &str, context: Option<&str>) -> (Decision, f32) {
         }
     }
 
-    let leading_verb = spoken_words.first().map(String::as_str);
-    let asks_to_open = leading_verb.is_some_and(|v| APP_VERBS.contains(&v));
-    let asks_to_quit = leading_verb.is_some_and(|v| QUIT_VERBS.contains(&v));
-    // A verb we know that asks for neither: the sentence is about something
-    // else, even if an application happens to be named in it.
-    let other_verb = leading_verb
-        .is_some_and(|v| spanish::is_known_verb(v) && !asks_to_open && !asks_to_quit);
+    let intent = intent_of(&spoken_words);
 
     // A web address beats an application name: "abre github" means the site,
     // since there is no GitHub app in the table to confuse it with.
@@ -1201,7 +1271,7 @@ pub fn decide_in(transcript: &str, context: Option<&str>) -> (Decision, f32) {
             Some(Website::Domain(url)) => {
                 return (Decision::Browse { url, in_browser: browser_in_front(context) }, 0.9)
             }
-            Some(Website::Named(url)) if asks_to_open => {
+            Some(Website::Named(url)) if intent.open => {
                 return (Decision::Browse { url, in_browser: browser_in_front(context) }, 0.9)
             }
             _ => {}
@@ -1209,20 +1279,8 @@ pub fn decide_in(transcript: &str, context: Option<&str>) -> (Decision, f32) {
     }
 
     if let Some((app, score)) = app {
-        let app_wins = best.is_none_or(|(_, b)| score > b);
-        if asks_to_quit && app_wins {
-            return (
-                Decision::Quit { name: app.name, bundle_id: app.bundle_id },
-                score,
-            );
-        }
-        // Named without a verb ("minion, Safari") still means open it.
-        let named_outright = score > 0.85 && leading_verb.is_none_or(|v| !spanish::is_known_verb(v));
-        if (asks_to_open || named_outright) && !other_verb && app_wins {
-            return (
-                Decision::Launch { name: app.name, bundle_id: app.bundle_id },
-                score,
-            );
+        if let Some(decision) = app_decision(intent, app, score, best.map(|(_, b)| b)) {
+            return (decision, score);
         }
     }
 
@@ -1231,6 +1289,169 @@ pub fn decide_in(transcript: &str, context: Option<&str>) -> (Decision, f32) {
         Some((TableHit::Macro(macro_), score)) => (Decision::Macro(macro_), score),
         None => (Decision::Unrecognised, 0.0),
     }
+}
+
+/// One of the things a sentence could have been asking for, and how well
+/// it fits.
+///
+/// Only ever built by [`candidates`], and only for the routes where two
+/// readings can honestly be confused: applications, table commands, macros
+/// and a named site. A question, a number or a spelled-out domain is
+/// reached by a marker in the sentence rather than by a score, so it has no
+/// runner-up to be mistaken for.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Candidate {
+    pub decision: Decision,
+    /// How to name it out loud: "Chrome", "Chrome Canary", "cerrar pestaña".
+    pub name: String,
+    /// The other ways of saying that name, so an answer picking this one is
+    /// recognised however the recogniser spells it. Empty for anything
+    /// whose only name is the one above.
+    aliases: &'static [&'static str],
+    pub score: f32,
+}
+
+/// The best score any of these phrases reaches, if one reaches the
+/// threshold at all.
+fn best_phrase(rest: &str, phrases: &[&'static str]) -> Option<f32> {
+    let best = phrases.iter().map(|phrase| similarity(rest, phrase)).fold(0.0, f32::max);
+    (best >= threshold()).then_some(best)
+}
+
+/// Everything a sentence could plausibly have been asking for, best first.
+///
+/// This ranks; it does not decide. [`decide_in`] is still the only thing
+/// that says what a phrase means, and it is deliberately not reimplemented
+/// here — what this adds is the runner-up, so a caller can see that the
+/// winner won by nothing at all and ask instead of guessing.
+pub fn candidates(transcript: &str, context: Option<&str>) -> Vec<Candidate> {
+    let normalised = normalise(transcript);
+    let Some(rest) = strip_wake_word(&normalised) else {
+        return Vec::new();
+    };
+    if rest.is_empty() {
+        return Vec::new();
+    }
+    let mut found: Vec<Candidate> = Vec::new();
+    let named = |decision, name: &str, score| Candidate {
+        decision,
+        name: name.to_string(),
+        aliases: &[],
+        score,
+    };
+
+    // The same three pools `decide_in` races against each other: the
+    // application in front, the table, and the macros.
+    if let Some(bundle) = context {
+        for command in &vocabulary().contextual {
+            if !command.bundles.contains(&bundle) {
+                continue;
+            }
+            if let Some(score) = best_phrase(rest, command.phrases) {
+                found.push(named(Decision::RunHere(command.name), command.name, score));
+            }
+        }
+    }
+    for command in &vocabulary().commands {
+        if let Some(score) = best_phrase(rest, command.phrases) {
+            found.push(named(Decision::Run(command.name), command.name, score));
+        }
+    }
+    for macro_ in macros() {
+        if let Some(score) = best_phrase(rest, macro_.phrases) {
+            found.push(named(Decision::Macro(macro_), macro_.name, score));
+        }
+    }
+    let rival = found.iter().map(|c| c.score).fold(0.0, f32::max);
+    let rival = (rival > 0.0).then_some(rival);
+
+    // Applications, each judged by the same verb rule that lets the winner
+    // act: one the sentence merely mentions is no more a candidate here
+    // than it is a decision there.
+    let spoken_words = keywords(rest);
+    let intent = intent_of(&spoken_words);
+    if !names_a_site(&spoken_words) {
+        for (app, score) in rank_apps(rest, false) {
+            if score < threshold() {
+                continue;
+            }
+            if let Some(decision) = app_decision(intent, app, score, rival) {
+                found.push(Candidate {
+                    decision,
+                    name: app.name.to_string(),
+                    aliases: app.aliases,
+                    score,
+                });
+            }
+        }
+    }
+
+    // A site named without its domain, which needs an opening verb here for
+    // the same reason it needs one there. A spelled-out domain is left out
+    // on purpose: "abre marca.com" says which page it wants in so many
+    // letters, so there is nothing to be uncertain between.
+    if intent.open {
+        if let Some(site) = spoken_words
+            .iter()
+            .find_map(|word| vocabulary().sites.iter().find(|site| site.name == word))
+        {
+            found.push(Candidate {
+                decision: Decision::Browse {
+                    url: site.url.to_string(),
+                    in_browser: browser_in_front(context),
+                },
+                name: site.name.to_string(),
+                aliases: std::slice::from_ref(&site.name),
+                score: 0.9,
+            });
+        }
+    }
+
+    found.sort_by(|a, b| b.score.total_cmp(&a.score));
+    found
+}
+
+/// What the sentence was taken to mean, followed by everything else it
+/// could have meant, best first.
+///
+/// The head is always what [`decide_in`] returned, carrying its confidence
+/// rather than the ranking's own — that one is the authority. Empty when
+/// the decision is not one of the ranked kinds, since there is then nothing
+/// it could have been confused with.
+pub fn decide_ranked(transcript: &str, context: Option<&str>) -> Vec<Candidate> {
+    let (decision, confidence) = decide_in(transcript, context);
+    let mut ranked = candidates(transcript, context);
+    let Some(at) = ranked.iter().position(|c| c.decision == decision) else {
+        return Vec::new();
+    };
+    let mut winner = ranked.remove(at);
+    winner.score = confidence;
+    ranked.insert(0, winner);
+    ranked
+}
+
+/// How well a spoken phrase names this candidate, from 0 to 1.
+///
+/// The names are the ones already in the vocabulary, heard the way
+/// [`find_app`] hears them — outright, run together, phonetically, or one
+/// slip away — so answering «cromo» picks Chrome without listing every
+/// spelling of it again here.
+///
+/// A grade rather than a yes: two candidates close enough to be confused in
+/// the first place are close enough for one name to reach both, and
+/// «desactivar wifi» has to pick the one it fits best rather than the one
+/// that happened to be offered first.
+pub fn candidate_score(phrase: &str, candidate: &Candidate) -> f32 {
+    let normalised = normalise(phrase);
+    let words: Vec<&str> = normalised.split_whitespace().collect();
+    let by_alias = candidate
+        .aliases
+        .iter()
+        .map(|alias| alias_score(&words, &normalise(alias), false))
+        .fold(0.0, f32::max);
+    // Anything with no aliases of its own — a command, a macro — answers to
+    // the name the log calls it by.
+    by_alias.max(similarity(&normalised, &normalise(&candidate.name)))
 }
 
 /// The result of carrying out a decision.
@@ -1622,6 +1843,60 @@ pub fn phrase_count() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The phrase Minion is deciding, with nothing in front.
+    fn ranked(phrase: &str) -> Vec<Candidate> {
+        decide_ranked(phrase, None)
+    }
+
+    #[test]
+    fn the_ranking_is_headed_by_what_was_actually_decided() {
+        let (decision, confidence) = decide_in("minion abre Chrome", None);
+        let ranked = ranked("minion abre Chrome");
+        assert_eq!(ranked[0].decision, decision);
+        assert_eq!(ranked[0].name, "Chrome");
+        // The confidence is `decide_in`'s own, not the ranking's.
+        assert_eq!(ranked[0].score, confidence);
+        // Nothing else in the vocabulary comes near it.
+        assert_eq!(ranked.len(), 1, "{ranked:?}");
+    }
+
+    #[test]
+    fn a_phrase_between_two_commands_ranks_both_of_them() {
+        // Run together, this reaches both wifi commands equally, and one
+        // of them is the opposite of what was asked for.
+        let ranked = ranked("minion desactivael wifi");
+        let names: Vec<&str> = ranked.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["activar wifi", "desactivar wifi"]);
+        assert_eq!(ranked[0].score, ranked[1].score, "a dead heat");
+    }
+
+    #[test]
+    fn a_route_reached_by_a_marker_has_nothing_to_be_confused_with() {
+        // A question, a number and dictation are all reached by something
+        // said outright rather than by a score, so they are not ranked.
+        for phrase in ["minion qué hora es", "minion pestaña 7", "minion escribe hola"] {
+            assert!(ranked(phrase).is_empty(), "«{phrase}» should not be ranked");
+        }
+    }
+
+    #[test]
+    fn a_candidate_answers_to_its_own_name_however_it_is_spelled() {
+        let chrome = ranked("minion abre Chrome").remove(0);
+        for said in ["chrome", "cromo", "crum", "abre chrome"] {
+            assert!(candidate_score(said, &chrome) >= threshold(), "«{said}» names Chrome");
+        }
+        for said in ["safari", "el correo", "otra cosa"] {
+            assert!(candidate_score(said, &chrome) < threshold(), "«{said}» does not");
+        }
+        // A command has no aliases: it answers to the name in the log. Its
+        // opposite reaches it too — they share every letter but three —
+        // which is why the answer is graded rather than merely accepted.
+        let mut wifi = ranked("minion desactivael wifi");
+        let (off, on) = (wifi.remove(1), wifi.remove(0));
+        assert!(candidate_score("desactivar wifi", &off) > candidate_score("desactivar wifi", &on));
+        assert!(candidate_score("activar wifi", &on) > candidate_score("activar wifi", &off));
+    }
 
     fn decision(phrase: &str) -> Decision {
         decide(phrase).0
@@ -2552,3 +2827,4 @@ mod tests {
         assert!(matches!(try_macro_step("haz un pino"), StepResult::Refused));
     }
 }
+

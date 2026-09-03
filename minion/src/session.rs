@@ -14,7 +14,7 @@
 use std::time::{Duration, Instant};
 
 use crate::answers;
-use crate::commands::{self, Decision, EditIntent};
+use crate::commands::{self, Candidate, Decision, EditIntent};
 use crate::learn;
 
 /// Something Minion did that it knows how to take back.
@@ -79,31 +79,56 @@ pub struct Session {
     /// Whether to ask at all. Off is what Minion did before there was
     /// anything to ask: say nothing and write the failure down.
     asks: bool,
+    /// How close the runner-up has to be before a near-tie is put to the
+    /// user rather than acted on. Zero never asks, which is what a
+    /// `Session` nobody has configured does.
+    margin: f32,
 }
 
-/// How long a question waits for its answer.
+/// How long a guess waits for its yes or no.
 ///
 /// Long enough to think about, short enough that a "sí" meant for someone
 /// else in the room has usually stopped being plausible by then.
 const QUESTION_SECONDS: Duration = Duration::from_secs(6);
 
+/// How long a choice between two readings waits.
+///
+/// Shorter than a guess on purpose: nothing has happened yet and nothing
+/// will until this is answered, so the silence is in the way rather than
+/// merely unhelpful.
+const CHOICE_SECONDS: Duration = Duration::from_secs(4);
+
+/// What a question is about, and so what an answer to it can be.
+///
+/// The two share everything else — the deadline, the precedence over the
+/// conversation window, being asked exactly once — because they are the
+/// same mechanism pointed at two different problems.
+#[derive(Debug)]
+enum Asked {
+    /// A guess at a phrase nothing acted on. Yes runs it and learns it.
+    Guess(learn::Suggestion),
+    /// Two readings of a phrase that were too close to choose between.
+    /// Neither has run, and neither will until one is picked.
+    Between(Vec<Candidate>),
+}
+
 /// A question Minion asked and has not had an answer to yet.
 #[derive(Debug)]
 struct Pending {
-    /// What was not understood, as it will be written down.
+    /// What was heard, as it will be written down.
     phrase: String,
-    suggestion: learn::Suggestion,
+    asked: Asked,
     deadline: Instant,
 }
 
-/// A question to put to the user, and what saying yes would mean.
+/// A question to put to the user, and what each answer would mean.
 #[derive(Debug)]
 pub struct Question {
     /// The wording, for the synthesiser or a notification.
     pub text: String,
-    /// What it is a guess at: "abrir Safari".
+    /// What it is about: "abrir Safari", "Chrome o Chrome Canary".
     pub description: String,
-    suggestion: learn::Suggestion,
+    asked: Asked,
 }
 
 /// What an utterance did to a question that was waiting.
@@ -111,10 +136,67 @@ pub struct Question {
 pub enum Reply {
     /// Yes: do it, and remember it.
     Yes { phrase: String, suggestion: learn::Suggestion },
+    /// One of the readings that were offered, picked by the user.
+    Chose { phrase: String, candidate: Candidate },
     /// No, or something that was not an answer at all. `answered` tells
     /// the two apart, because only the first has used up the utterance —
     /// anything else still has to be listened to on its own terms.
     No { phrase: String, answered: bool },
+}
+
+/// Words that pick one of two readings by where it came rather than by
+/// name. Kept short and whole, the same way [`answer_in`] is: an answer to
+/// «¿Chrome o Chrome Canary?» is one or two words.
+const FIRST: &[&str] = &["primero", "primera", "primer", "uno"];
+const SECOND: &[&str] = &["segundo", "segunda", "otro", "otra", "dos"];
+
+/// What an utterance does to a choice that was waiting.
+enum Choice {
+    /// The reading at this position.
+    Made(usize),
+    /// Neither of them.
+    Declined,
+    /// Not an answer at all: somebody carried on talking.
+    Elsewhere,
+}
+
+/// Reads an utterance as the answer to «¿esto o lo otro?».
+///
+/// By position first, then by name — an ordinal is unambiguous, while a
+/// name is matched with all the tolerance the recogniser needs, and a
+/// candidate called "otra pestaña" must not swallow «la otra».
+///
+/// A name has to fit one of the two better than the other. Two readings
+/// close enough to be confused are close enough for one name to reach both
+/// — «desactivar wifi» reaches «activar wifi» as well — so a name that
+/// does not choose between them has not answered the question, and the
+/// ordinals are there for exactly that case.
+fn choice_in(phrase: &str, candidates: &[Candidate]) -> Choice {
+    // «no», «ninguno», «déjalo»: the same words that decline a guess.
+    if answer_in(phrase) == Some(false) {
+        return Choice::Declined;
+    }
+    let normalised = crate::text::normalise(phrase);
+    let words: Vec<&str> = normalised.split_whitespace().collect();
+    if words.len() <= 3 {
+        for (forms, at) in [(FIRST, 0), (SECOND, 1)] {
+            if at < candidates.len() && words.iter().any(|word| forms.contains(word)) {
+                return Choice::Made(at);
+            }
+        }
+    }
+    let mut named: Vec<(usize, f32)> = candidates
+        .iter()
+        .enumerate()
+        .map(|(at, candidate)| (at, commands::candidate_score(phrase, candidate)))
+        .filter(|(_, score)| *score >= commands::threshold())
+        .collect();
+    named.sort_by(|a, b| b.1.total_cmp(&a.1));
+    match named.as_slice() {
+        [(at, _)] => Choice::Made(*at),
+        [(at, best), (_, next), ..] if best > next => Choice::Made(*at),
+        _ => Choice::Elsewhere,
+    }
 }
 
 /// Whether a phrase is a yes, a no, or neither.
@@ -142,6 +224,11 @@ fn answer_in(phrase: &str) -> Option<bool> {
 pub struct Resolved {
     pub decision: Decision,
     pub confidence: f32,
+    /// The phrase the decision was actually made from — `part` itself, or
+    /// the same thing with the wake word put back on when the conversation
+    /// window supplied it. Anything wanting to ask a second question about
+    /// the decision has to ask about the words that produced it.
+    pub phrase: String,
     /// Set when the wake word was missing but the window was open and the
     /// prefixed phrase made sense: seconds since the window opened.
     pub window_after: Option<f32>,
@@ -185,8 +272,9 @@ impl Session {
     /// caller had anything more to say to it.
     pub fn resolve(&mut self, part: &str, now: Instant, context: Option<&str>) -> Resolved {
         let (decision, confidence) = commands::decide_in(part, context);
+        let heard = || part.to_string();
         if self.dictating || decision != Decision::Ignored || !self.window_open(now) {
-            return Resolved { decision, confidence, window_after: None };
+            return Resolved { decision, confidence, phrase: heard(), window_after: None };
         }
 
         let wake = commands::wake_words().first().copied().unwrap_or("minion");
@@ -194,13 +282,18 @@ impl Session {
         let (retried, retried_confidence) = commands::decide_in(&prefixed, context);
         if matches!(retried, Decision::Ignored | Decision::Unrecognised) {
             self.close_window();
-            return Resolved { decision, confidence, window_after: None };
+            return Resolved { decision, confidence, phrase: heard(), window_after: None };
         }
 
         let after = self
             .window_opened_at
             .map(|opened| now.saturating_duration_since(opened).as_secs_f32());
-        Resolved { decision: retried, confidence: retried_confidence, window_after: after }
+        Resolved {
+            decision: retried,
+            confidence: retried_confidence,
+            phrase: prefixed,
+            window_after: after,
+        }
     }
 
     /// Decides what one part of an utterance means, and remembers it.
@@ -290,14 +383,20 @@ impl Session {
     /// reaching this was, by construction, said while the shortcut was
     /// held, so the wake word is never required — there is no window to
     /// time out or to log about, unlike [`Session::resolve`].
-    pub fn resolve_held(&mut self, part: &str, context: Option<&str>) -> (Decision, f32) {
+    pub fn resolve_held(&mut self, part: &str, context: Option<&str>) -> Resolved {
         let (decision, confidence) = commands::decide_in(part, context);
         if self.dictating || decision != Decision::Ignored {
-            return (decision, confidence);
+            return Resolved {
+                decision,
+                confidence,
+                phrase: part.to_string(),
+                window_after: None,
+            };
         }
         let wake = commands::wake_words().first().copied().unwrap_or("minion");
         let prefixed = format!("{wake} {part}");
-        commands::decide_in(&prefixed, context)
+        let (decision, confidence) = commands::decide_in(&prefixed, context);
+        Resolved { decision, confidence, phrase: prefixed, window_after: None }
     }
 
     /// Whether to ask about a phrase that was not understood.
@@ -309,6 +408,14 @@ impl Session {
         self.asks = on;
     }
 
+    /// How close a runner-up has to be before the choice is put to the
+    /// user instead of acted on. Read from `disambiguation_margin`, and
+    /// set by the caller for the same reason `asks_before_learning` is: a
+    /// `Session` that has not been told never asks.
+    pub fn disambiguates(&mut self, margin: f32) {
+        self.margin = margin;
+    }
+
     /// The question worth asking about a phrase that was not understood,
     /// if there is one.
     ///
@@ -316,27 +423,94 @@ impl Session {
     /// are the caller's to do — and it only does the second if it managed
     /// the first, since a question nobody heard must not swallow the next
     /// thing said.
-    pub fn ask_about(&self, phrase: &str) -> Option<Question> {
-        if !self.asks || self.dictating {
+    pub fn ask_about(&self, phrase: &str, now: Instant) -> Option<Question> {
+        // A choice already on the table is blocking a command; a guess
+        // only offers one. Asking both at once would leave the next "sí"
+        // answering whichever was asked last, so the guess gives way.
+        if !self.asks || self.dictating || self.choosing(now) {
             return None;
         }
         let suggestion = learn::suggest(phrase)?;
         Some(Question {
             text: format!("¿Querías decir «{}»?", suggestion.description),
             description: suggestion.description.clone(),
-            suggestion,
+            asked: Asked::Guess(suggestion),
         })
+    }
+
+    /// The question to ask when the phrase came as close to a second
+    /// reading as to the one that won.
+    ///
+    /// Neither is carried out: the whole point is that Minion cannot tell
+    /// which was meant, and doing the wrong one and being told so
+    /// afterwards is worse than a four-second question. `phrase` is what
+    /// the decision was made from — [`Resolved::phrase`], not necessarily
+    /// what was said, since the conversation window may have put the wake
+    /// word back on.
+    ///
+    /// Pure: saying it out loud, and opening the window for the answer,
+    /// are the caller's to do.
+    pub fn ask_between(
+        &self,
+        phrase: &str,
+        decision: &Decision,
+        context: Option<&str>,
+    ) -> Option<Question> {
+        if self.dictating || self.margin <= 0.0 {
+            return None;
+        }
+        // Nothing was going to happen anyway, so there is nothing to stop
+        // and ask about. A phrase nobody understood is `ask_about`'s.
+        if matches!(decision, Decision::Ignored | Decision::Unrecognised) {
+            return None;
+        }
+        let ranked = commands::decide_ranked(phrase, context);
+        let [winner, runner_up, ..] = ranked.as_slice() else {
+            return None;
+        };
+        // The ranking has to agree with what is about to be done, or the
+        // question would be about a command nobody asked for.
+        if winner.decision != *decision {
+            return None;
+        }
+        let threshold = commands::threshold();
+        if runner_up.score < threshold || winner.score < threshold {
+            return None;
+        }
+        if winner.score - runner_up.score > self.margin {
+            return None;
+        }
+        Some(Question {
+            text: format!("¿{} o {}?", winner.name, runner_up.name),
+            description: format!("{} o {}", winner.name, runner_up.name),
+            asked: Asked::Between(vec![winner.clone(), runner_up.clone()]),
+        })
+    }
+
+    /// Whether the question waiting is one that is holding a command back.
+    fn choosing(&self, now: Instant) -> bool {
+        self.question_open(now)
+            && matches!(self.pending.as_ref().map(|p| &p.asked), Some(Asked::Between(_)))
     }
 
     /// Starts waiting for the answer to a question that has been asked.
     pub fn open_question(&mut self, phrase: &str, question: Question, now: Instant) {
+        // A choice is holding a command back and a guess is not, so a
+        // guess never displaces one — the same rule `ask_about` applies
+        // before speaking, kept here too so the state cannot be reached
+        // by a caller that asked in some other order.
+        let choosing = matches!(question.asked, Asked::Between(_));
+        if !choosing && self.choosing(now) {
+            return;
+        }
         // A question takes precedence over the conversation window: the
         // next thing said is an answer, not a command without a wake word.
         self.close_window();
+        let waits = if choosing { CHOICE_SECONDS } else { QUESTION_SECONDS };
         self.pending = Some(Pending {
             phrase: phrase.to_string(),
-            suggestion: question.suggestion,
-            deadline: now + QUESTION_SECONDS,
+            asked: question.asked,
+            deadline: now + waits,
         });
     }
 
@@ -365,10 +539,20 @@ impl Session {
             return None;
         }
         let pending = self.pending.take()?;
-        Some(match answer_in(part) {
-            Some(true) => Reply::Yes { phrase: pending.phrase, suggestion: pending.suggestion },
-            Some(false) => Reply::No { phrase: pending.phrase, answered: true },
-            None => Reply::No { phrase: pending.phrase, answered: false },
+        let phrase = pending.phrase;
+        Some(match pending.asked {
+            Asked::Guess(suggestion) => match answer_in(part) {
+                Some(true) => Reply::Yes { phrase, suggestion },
+                Some(false) => Reply::No { phrase, answered: true },
+                None => Reply::No { phrase, answered: false },
+            },
+            Asked::Between(candidates) => match choice_in(part, &candidates) {
+                Choice::Made(at) => {
+                    Reply::Chose { phrase, candidate: candidates[at].clone() }
+                }
+                Choice::Declined => Reply::No { phrase, answered: true },
+                Choice::Elsewhere => Reply::No { phrase, answered: false },
+            },
         })
     }
 
@@ -434,11 +618,156 @@ mod tests {
     /// close enough to guess at and too far to act on.
     const NEARLY: &str = "minion abreza fari";
 
+    /// Two readings the recogniser can leave in a dead heat. With the
+    /// words run together — which is what it does — "desactivael wifi"
+    /// reaches «activar wifi» and «desactivar wifi» with exactly the same
+    /// score, and one of the two is the opposite of what was asked for.
+    const TIED: &str = "minion desactivael wifi";
+
+    /// A session that asks which of two close readings was meant.
+    fn choosing() -> Session {
+        let mut session = Session::new();
+        session.disambiguates(0.08);
+        session
+    }
+
+    /// The question a phrase raises, decided the way the loop decides it.
+    fn between(session: &Session, phrase: &str) -> Option<Question> {
+        let decision = decide(phrase);
+        session.ask_between(phrase, &decision, None)
+    }
+
+    #[test]
+    fn two_readings_too_close_to_choose_between_are_asked_about() {
+        // Nothing hesitated: it was about to turn the wifi back on.
+        assert_eq!(decide(TIED), Decision::Run("activar wifi"));
+        let question = between(&choosing(), TIED).expect("a tie worth asking about");
+        assert_eq!(question.text, "¿activar wifi o desactivar wifi?");
+        assert_eq!(question.description, "activar wifi o desactivar wifi");
+    }
+
+    #[test]
+    fn a_clear_winner_is_carried_out_without_asking() {
+        assert!(between(&choosing(), "minion abre Chrome").is_none());
+        // A phrase nothing acted on is `ask_about`'s to raise, not this
+        // one's: there is no second reading to weigh against a first.
+        assert!(between(&choosing(), NEARLY).is_none());
+        assert!(between(&choosing(), "alguien hablando").is_none());
+        // And with no margin configured, nothing is ever asked.
+        assert!(between(&Session::new(), TIED).is_none());
+    }
+
+    #[test]
+    fn the_margin_says_how_close_is_too_close() {
+        // «apaga la pantalla» matches «apagar pantalla» outright and
+        // «dormir» nearly: close, but not a tie.
+        const NEAR: &str = "minion apaga la pantalla";
+        let mut wide = Session::new();
+        wide.disambiguates(0.2);
+        assert!(between(&wide, NEAR).is_some(), "0.2 is wide enough to notice it");
+        let mut narrow = Session::new();
+        narrow.disambiguates(0.02);
+        assert!(between(&narrow, NEAR).is_none(), "0.02 is not");
+        // A dead heat is one at any margin at all.
+        assert!(between(&narrow, TIED).is_some());
+    }
+
+    #[test]
+    fn every_way_of_picking_one_of_the_two_is_understood() {
+        for (answer, picked) in [
+            ("el primero", "activar wifi"),
+            ("la primera", "activar wifi"),
+            ("el segundo", "desactivar wifi"),
+            ("la segunda", "desactivar wifi"),
+            ("desactivar wifi", "desactivar wifi"),
+        ] {
+            let mut session = choosing();
+            let now = Instant::now();
+            let question = between(&session, TIED).expect("a tie");
+            session.open_question(TIED, question, now);
+            match session.answer_question(answer, now + Duration::from_secs(1)) {
+                Some(Reply::Chose { phrase, candidate }) => {
+                    assert_eq!(candidate.name, picked, "«{answer}»");
+                    assert_eq!(phrase, TIED);
+                }
+                other => panic!("«{answer}» should have picked one, got {other:?}"),
+            }
+            // Asked once: whichever way it was answered, it is over.
+            assert!(!session.question_open(now));
+        }
+    }
+
+    #[test]
+    fn declining_a_choice_runs_neither_of_them() {
+        for answer in ["ninguno", "déjalo", "no"] {
+            let mut session = choosing();
+            let now = Instant::now();
+            let question = between(&session, TIED).expect("a tie");
+            session.open_question(TIED, question, now);
+            assert!(
+                matches!(
+                    session.answer_question(answer, now),
+                    Some(Reply::No { answered: true, .. })
+                ),
+                "«{answer}» declines both"
+            );
+        }
+    }
+
+    #[test]
+    fn a_choice_nobody_makes_times_out_sooner_than_a_guess() {
+        let mut session = choosing();
+        let now = Instant::now();
+        let question = between(&session, TIED).expect("a tie");
+        session.open_question(TIED, question, now);
+
+        assert!(session.question_open(now + Duration::from_secs(3)));
+        let later = now + Duration::from_secs(5);
+        assert!(!session.question_open(later), "four seconds, not six");
+        assert_eq!(session.question_timed_out(later).as_deref(), Some(TIED));
+        // Nothing ran, and there is nothing left to time out.
+        assert_eq!(session.question_timed_out(later), None);
+    }
+
+    #[test]
+    fn a_guess_and_a_choice_are_never_both_open() {
+        let mut session = choosing();
+        session.asks_before_learning(true);
+        let now = Instant::now();
+        let question = between(&session, TIED).expect("a tie");
+        session.open_question(TIED, question, now);
+
+        // The choice is holding a command back and the guess is not, so
+        // the guess is not even asked while one is waiting.
+        assert!(session.ask_about(NEARLY, now).is_none());
+        // And asked out of turn it still cannot displace it: the next
+        // answer belongs to the choice.
+        let guess = asking().ask_about(NEARLY, now).expect("worth asking about");
+        session.open_question(NEARLY, guess, now);
+        assert!(matches!(
+            session.answer_question("el segundo", now),
+            Some(Reply::Chose { .. })
+        ));
+    }
+
+    #[test]
+    fn a_choice_takes_precedence_over_the_conversation_window() {
+        let mut session = choosing();
+        let now = Instant::now();
+        session.open_window(now, Duration::from_secs(5));
+        let question = between(&session, TIED).expect("a tie");
+        session.open_question(TIED, question, now);
+        // Otherwise «el segundo» would be tried as a command without a
+        // wake word before it was tried as the answer it is.
+        assert!(!session.window_open(now));
+        assert!(session.question_open(now));
+    }
+
     #[test]
     fn a_phrase_that_nearly_named_something_is_asked_about() {
         // Nothing acted on it, which is the whole reason to ask.
         assert_eq!(decide(NEARLY), Decision::Unrecognised);
-        let question = asking().ask_about(NEARLY).expect("worth asking about");
+        let question = asking().ask_about(NEARLY, Instant::now()).expect("worth asking about");
         assert_eq!(question.description, "abrir Safari");
         assert_eq!(question.text, "¿Querías decir «abrir Safari»?");
     }
@@ -448,24 +777,29 @@ mod tests {
         // Nothing in the vocabulary is within reach of these, so a
         // question would only be noise.
         for phrase in ["minion de sad", "minion abrecron", "minion escribe"] {
-            assert!(asking().ask_about(phrase).is_none(), "«{phrase}» is not worth a question");
+            assert!(asking().ask_about(phrase, Instant::now()).is_none(), "«{phrase}» is not worth a question");
         }
         // And with the setting off, nothing is ever asked.
-        assert!(Session::new().ask_about(NEARLY).is_none());
+        assert!(Session::new().ask_about(NEARLY, Instant::now()).is_none());
     }
 
     #[test]
     fn nothing_is_asked_while_dictating() {
         let mut session = asking();
+        session.disambiguates(0.08);
         say(&mut session, "minion empieza a dictar");
-        assert!(session.ask_about(NEARLY).is_none(), "everything heard is text right now");
+        assert!(
+            session.ask_about(NEARLY, Instant::now()).is_none(),
+            "everything heard is text right now"
+        );
+        assert!(between(&session, TIED).is_none(), "and so is a phrase that would tie");
     }
 
     #[test]
     fn saying_yes_runs_the_guess_and_remembers_it() {
         let mut session = asking();
         let now = Instant::now();
-        let question = session.ask_about(NEARLY).expect("worth asking about");
+        let question = session.ask_about(NEARLY, now).expect("worth asking about");
         session.open_question(NEARLY, question, now);
 
         let reply = session
@@ -490,7 +824,7 @@ mod tests {
     fn saying_no_declines_and_teaches_nothing() {
         let mut session = asking();
         let now = Instant::now();
-        let question = session.ask_about(NEARLY).expect("worth asking about");
+        let question = session.ask_about(NEARLY, now).expect("worth asking about");
         session.open_question(NEARLY, question, now);
 
         assert!(matches!(
@@ -499,7 +833,7 @@ mod tests {
         ));
         assert!(!session.question_open(now));
         // "eso no" is a no, even though "eso" on its own is a yes.
-        let question = session.ask_about(NEARLY).expect("worth asking about");
+        let question = session.ask_about(NEARLY, now).expect("worth asking about");
         session.open_question(NEARLY, question, now);
         assert!(matches!(
             session.answer_question("eso no", now),
@@ -511,7 +845,7 @@ mod tests {
     fn a_question_nobody_answers_times_out() {
         let mut session = asking();
         let now = Instant::now();
-        let question = session.ask_about(NEARLY).expect("worth asking about");
+        let question = session.ask_about(NEARLY, now).expect("worth asking about");
         session.open_question(NEARLY, question, now);
 
         let later = now + Duration::from_secs(7);
@@ -527,7 +861,7 @@ mod tests {
     fn something_that_is_not_an_answer_is_declined_and_still_obeyed() {
         let mut session = asking();
         let now = Instant::now();
-        let question = session.ask_about(NEARLY).expect("worth asking about");
+        let question = session.ask_about(NEARLY, now).expect("worth asking about");
         session.open_question(NEARLY, question, now);
 
         // Somebody carried on talking. The question is dropped, and what
@@ -548,7 +882,7 @@ mod tests {
         let mut session = asking();
         let now = Instant::now();
         session.open_window(now, Duration::from_secs(5));
-        let question = session.ask_about(NEARLY).expect("worth asking about");
+        let question = session.ask_about(NEARLY, now).expect("worth asking about");
         session.open_question(NEARLY, question, now);
         // Otherwise the next "sí" would be tried as a command without a
         // wake word before it was tried as the answer it is.
@@ -882,14 +1216,14 @@ mod tests {
     #[test]
     fn push_to_talk_never_needs_the_wake_word() {
         let mut session = Session::new();
-        let (decision, _) = session.resolve_held("abre Chrome", None);
+        let decision = session.resolve_held("abre Chrome", None).decision;
         assert!(!matches!(decision, Decision::Ignored | Decision::Unrecognised));
     }
 
     #[test]
     fn push_to_talk_still_says_so_when_nothing_matches() {
         let mut session = Session::new();
-        let (decision, _) = session.resolve_held("so fuddy", None);
+        let decision = session.resolve_held("so fuddy", None).decision;
         assert_eq!(decision, Decision::Unrecognised);
     }
 
@@ -900,7 +1234,7 @@ mod tests {
         session.interpret("minion empieza a dictar", decision, None);
         // Once dictating, resolve_held must not try to prefix the wake
         // word onto what is about to be typed.
-        let (decision, _) = session.resolve_held("abre Chrome", None);
+        let decision = session.resolve_held("abre Chrome", None).decision;
         assert_eq!(decision, decide("abre Chrome"));
     }
 

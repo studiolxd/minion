@@ -578,7 +578,11 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
     let mut session = Session::new();
     // Whether a phrase that was nearly understood is worth a question.
     // Read here rather than passed in: it is only ever wanted by the loop.
-    session.asks_before_learning(config::load().ask_before_learning);
+    let startup = config::load();
+    session.asks_before_learning(startup.ask_before_learning);
+    // And how close a second reading has to be before the choice is put to
+    // the user instead of guessed at. Read from the same file, once.
+    session.disambiguates(startup.disambiguation_margin());
     // Built fresh each time dictation starts, so its state (the pending
     // capital, an open quote) never spans two dictation sessions, and a
     // vocabulary edited while Minion was running takes effect right away.
@@ -615,9 +619,38 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
     let wake = commands::wake_words().first().copied().unwrap_or("minion");
     note!("Listening. Say: «{wake}, abre Chrome»");
 
+    // Puts a question to whoever is there, and says whether anybody could
+    // have heard it. A question that arrives as a silent banner has nobody
+    // waiting for the answer, so only a spoken one is worth opening a
+    // window for — both callers below rely on that `false`.
+    let ask_aloud = |text: &str| -> bool {
+        match &voice_reply {
+            Some(settings) => {
+                speaking.store(true, Ordering::Relaxed);
+                speech::say(
+                    text,
+                    settings.voice.as_deref(),
+                    settings.rate,
+                    settings.device.as_deref(),
+                    &deaf,
+                    speech_tail,
+                );
+                speaking.store(false, Ordering::Relaxed);
+                // Its own voice came back in while it was talking; none of
+                // that is an answer.
+                while listener.utterances.try_recv().is_ok() {}
+                true
+            }
+            None => {
+                notify::post("Minion", text);
+                false
+            }
+        }
+    };
+
     loop {
-        // A question waits six seconds for its answer, and silence is one
-        // of the answers it can get. Checked here as well as on the next
+        // A question waits a few seconds for its answer, and silence is
+        // one of the answers it can get. Checked here as well as on the next
         // utterance, so the log says so when it happens rather than
         // whenever somebody next speaks.
         if let Some(phrase) = session.question_timed_out(Instant::now()) {
@@ -879,6 +912,45 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                     }
                     continue;
                 }
+                Some(Reply::Chose { phrase, candidate }) => {
+                    // One of two readings that were too close to choose
+                    // between, picked out loud. Through `interpret` like
+                    // anything else, so it can be repeated with "otra vez"
+                    // and taken back with "deshaz".
+                    note!("chosen   {} (asked)", candidate.name);
+                    let outcome = session.interpret(
+                        &phrase,
+                        candidate.decision.clone(),
+                        context.as_deref(),
+                    );
+                    let (decision, repeats) = match outcome {
+                        Outcome::Perform { decision, repeats } => (decision, repeats),
+                        _ => (candidate.decision.clone(), 1),
+                    };
+                    let ran = report(
+                        &phrase,
+                        &decision,
+                        candidate.score,
+                        repeats,
+                        &Reporting {
+                            seconds,
+                            elapsed_ms,
+                            log_ignored_speech: log_ignored_speech.load(Ordering::Relaxed),
+                            play_sounds: play_sounds.load(Ordering::Relaxed),
+                            acted: &acted,
+                            status: &status,
+                        },
+                    );
+                    match ran {
+                        Ran::Blocked => session.forget_undo(),
+                        Ran::Yes if !hold_mode => {
+                            session.open_window(now, conversation_window);
+                            window_open.store(session.window_open(now), Ordering::Relaxed);
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
                 Some(Reply::No { phrase, answered }) => {
                     note!("declined «{phrase}»");
                     // A "no" was the answer and is spent. Anything else was
@@ -893,7 +965,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
             // Push-to-talk: every utterance heard was, by definition, said
             // while the shortcut was held, so none of it needs the wake
             // word — there is no window to time out or to log about.
-            let (decision, confidence) = if hold_mode {
+            let resolved = if hold_mode {
                 session.resolve_held(&part, context.as_deref())
             } else {
                 let resolved = session.resolve(&part, now, context.as_deref());
@@ -902,9 +974,30 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                         "window   «{part}»  (no wake word, {after:.1} s after the last command)"
                     );
                 }
-                (resolved.decision, resolved.confidence)
+                resolved
             };
+            let (decision, confidence) = (resolved.decision, resolved.confidence);
             window_open.store(!hold_mode && session.window_open(now), Ordering::Relaxed);
+
+            // Two readings of the same sentence, neither of them clearly
+            // ahead. Asked before anything is carried out, because the
+            // point is that neither should be: doing the wrong one and
+            // being corrected afterwards is worse than a short question.
+            if let Some(question) =
+                session.ask_between(&resolved.phrase, &decision, context.as_deref())
+            {
+                note!("asking   «{part}»  ->  {}?", question.description);
+                // Spoken when there is a voice, a banner when there is
+                // not — and the window opens either way, unlike a guess.
+                // A guess nobody heard must not swallow the next
+                // utterance; a choice has already stopped a command, and
+                // leaving it unanswerable would only lose it. Timed from
+                // after it spoke: the seconds are the ones the person has
+                // to answer in.
+                ask_aloud(&question.text);
+                session.open_question(&resolved.phrase, question, Instant::now());
+                continue;
+            }
 
             match session.interpret(&part, decision, context.as_deref()) {
                 Outcome::EnterDictation => {
@@ -1090,29 +1183,13 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                     // that arrives as a silent banner has nobody waiting
                     // for the answer, so it is left as a notice.
                     if decision == Decision::Unrecognised {
-                        if let Some(question) = session.ask_about(&part) {
+                        if let Some(question) = session.ask_about(&part, Instant::now()) {
                             note!("asking   «{part}»  ->  {}?", question.description);
-                            match &voice_reply {
-                                Some(settings) => {
-                                    speaking.store(true, Ordering::Relaxed);
-                                    speech::say(
-                                        &question.text,
-                                        settings.voice.as_deref(),
-                                        settings.rate,
-                                        settings.device.as_deref(),
-                                        &deaf,
-                                        speech_tail,
-                                    );
-                                    speaking.store(false, Ordering::Relaxed);
-                                    // Its own voice came back in while it
-                                    // was talking; none of that is an answer.
-                                    while listener.utterances.try_recv().is_ok() {}
-                                    // Timed from here, not from before it
-                                    // spoke: the six seconds are the ones
-                                    // the person has to answer in.
-                                    session.open_question(&part, question, Instant::now());
-                                }
-                                None => notify::post("Minion", &question.text),
+                            if ask_aloud(&question.text) {
+                                // Timed from here, not from before it
+                                // spoke: the six seconds are the ones the
+                                // person has to answer in.
+                                session.open_question(&part, question, Instant::now());
                             }
                         }
                     }
