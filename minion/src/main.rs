@@ -302,7 +302,9 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
         let started = Instant::now();
 
         if save_recordings {
-            let name = chrono::Local::now().format("%H-%M-%S").to_string();
+            // The date, not just the time: recordings from different days
+            // otherwise collide and overwrite each other past midnight.
+            let name = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S").to_string();
             match audio::save_recording(&utterance, &name) {
                 Ok(path) => note!("saved    {}", path.display()),
                 Err(e) => note!("could not save the recording: {e}"),

@@ -317,6 +317,22 @@ fn parse_checked(contents: String) -> Result<String, String> {
         .map_err(|e| format!("edit would leave an unparsable config: {e}"))
 }
 
+/// Creates the Application Support directory holding `config.toml` if it is
+/// not there yet, and makes sure it is not readable by other accounts —
+/// aliases and applications in it say something about how this Mac is used.
+fn secure_config_dir(dir: &std::path::Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())
+}
+
+/// Writes `config.toml`, keeping it readable only by the owner.
+fn write_config(path: &std::path::Path, contents: String) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, contents).map_err(|e| e.to_string())?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())
+}
+
 /// Sets an option inside a table, such as `[audio]`.
 ///
 /// Same care as [`set_option`]: the file is edited, not regenerated, so the
@@ -325,11 +341,11 @@ fn parse_checked(contents: String) -> Result<String, String> {
 pub fn set_table_option(table: &str, key: &str, value: &str) -> Result<(), String> {
     let path = path().ok_or("no home directory")?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        secure_config_dir(parent)?;
     }
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     let updated = parse_checked(with_table_option(&existing, table, key, value))?;
-    std::fs::write(&path, updated).map_err(|e| e.to_string())
+    write_config(&path, updated)
 }
 
 /// Sets one top-level option, preserving everything else.
@@ -341,11 +357,11 @@ pub fn set_table_option(table: &str, key: &str, value: &str) -> Result<(), Strin
 pub fn set_option(key: &str, value: &str) -> Result<(), String> {
     let path = path().ok_or("no home directory")?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        secure_config_dir(parent)?;
     }
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     let updated = parse_checked(with_option(&existing, key, value))?;
-    std::fs::write(&path, updated).map_err(|e| e.to_string())
+    write_config(&path, updated)
 }
 
 /// Reads the configuration, or returns the defaults if there is no file.

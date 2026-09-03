@@ -8,6 +8,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -66,12 +67,16 @@ fn handle() -> Option<&'static Mutex<JournalFile>> {
         if fs::metadata(&path).is_ok_and(|m| over_the_limit(m.len())) {
             let _ = fs::rename(&path, path.with_extension("log.1"));
         }
-        OpenOptions::new()
+        let file = OpenOptions::new()
             .create(true)
             .append(true)
+            // Only new files get this mode; an existing one keeps whatever
+            // it already had, so bring that up to date too.
+            .mode(0o600)
             .open(&path)
-            .ok()
-            .map(|file| Mutex::new(JournalFile { file, path }))
+            .ok()?;
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+        Some(Mutex::new(JournalFile { file, path }))
     })
     .as_ref()
 }
@@ -84,7 +89,9 @@ fn handle() -> Option<&'static Mutex<JournalFile>> {
 /// makes the new writes land in a new, empty file.
 fn rotate(journal: &mut JournalFile) {
     let _ = fs::rename(&journal.path, journal.path.with_extension("log.1"));
-    if let Ok(fresh) = OpenOptions::new().create(true).append(true).open(&journal.path) {
+    if let Ok(fresh) =
+        OpenOptions::new().create(true).append(true).mode(0o600).open(&journal.path)
+    {
         journal.file = fresh;
     }
 }

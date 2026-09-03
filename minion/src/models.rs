@@ -56,6 +56,13 @@ pub fn present(directory: &Path) -> bool {
 /// that otherwise makes no network requests at all.
 pub fn fetch<F: Fn(&str)>(directory: &Path, report: F) -> Result<(), String> {
     std::fs::create_dir_all(directory).map_err(|e| format!("no se pudo crear la carpeta: {e}"))?;
+    // The model directory sits inside Application Support/Minion; on a
+    // first run this call is often what creates that folder, so make sure
+    // it — and everything under it — is not readable by other accounts.
+    if let Some(app_support) = directory.parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(app_support, std::fs::Permissions::from_mode(0o700));
+    }
 
     let total: u32 = PIECES.iter().map(|p| p.megabytes).sum();
     let mut done = 0;

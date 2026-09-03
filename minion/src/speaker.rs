@@ -11,6 +11,7 @@
 //! against anyone else; the threshold decides where the line falls.
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Context, Result};
@@ -163,6 +164,9 @@ pub fn save_profile_for(model_dir: &str, embedding: &[f32]) -> Result<()> {
     let path = profile_path().ok_or_else(|| anyhow!("no home directory"))?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
+        // The voice profile identifies the owner; the directory holding it
+        // should not be readable by other accounts on the machine.
+        let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
     }
     let numbers: Vec<String> = embedding.iter().map(|v| format!("{v:.6}")).collect();
     let mut contents = String::new();
@@ -171,6 +175,9 @@ pub fn save_profile_for(model_dir: &str, embedding: &[f32]) -> Result<()> {
     }
     contents.push_str(&numbers.join(" "));
     fs::write(&path, contents).with_context(|| format!("writing {}", path.display()))?;
+    // A biometric embedding, even a lossy one, is worth keeping private.
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("setting permissions on {}", path.display()))?;
     Ok(())
 }
 
