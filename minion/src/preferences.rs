@@ -18,8 +18,9 @@ use std::rc::Rc;
 use objc2::rc::Retained;
 use objc2::MainThreadMarker;
 use objc2_app_kit::{
-    NSAccessibility, NSApplication, NSBackingStoreType, NSButton, NSColor, NSFont, NSLineBreakMode,
-    NSPopUpButton, NSScrollView, NSSlider, NSTextField, NSView, NSWindow, NSWindowStyleMask,
+    NSAccessibility, NSAutoresizingMaskOptions, NSApplication, NSBackingStoreType, NSButton, NSColor, NSFont, NSLineBreakMode,
+    NSPopUpButton, NSScrollView, NSSlider, NSTextField, NSTextView, NSView, NSWindow,
+    NSWindowStyleMask,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
@@ -1055,27 +1056,32 @@ fn install_main_menu(mtm: MainThreadMarker) {
         return;
     }
 
-    /// A menu item: what it says, what it does, and its key equivalent.
-    type Item<'a> = (&'a str, objc2::runtime::Sel, &'a str);
+    /// A menu item: what it says, what it does, its key equivalent, and
+    /// the tag the action reads (only the text finder uses one).
+    type Item<'a> = (&'a str, objc2::runtime::Sel, &'a str, isize);
+
+    /// `NSTextFinderActionShowFindInterface`: open the find bar.
+    const SHOW_FIND: isize = 1;
 
     let sections: [(&str, &[Item]); 2] = [
         (
             "Edición",
             &[
-                ("Deshacer", sel!(undo:), "z"),
-                ("Cortar", sel!(cut:), "x"),
-                ("Copiar", sel!(copy:), "c"),
-                ("Pegar", sel!(paste:), "v"),
-                ("Seleccionar todo", sel!(selectAll:), "a"),
+                ("Deshacer", sel!(undo:), "z", 0),
+                ("Cortar", sel!(cut:), "x", 0),
+                ("Copiar", sel!(copy:), "c", 0),
+                ("Pegar", sel!(paste:), "v", 0),
+                ("Seleccionar todo", sel!(selectAll:), "a", 0),
+                ("Buscar…", sel!(performTextFinderAction:), "f", SHOW_FIND),
             ],
         ),
-        ("Ventana", &[("Cerrar", sel!(performClose:), "w")]),
+        ("Ventana", &[("Cerrar", sel!(performClose:), "w", 0)]),
     ];
 
     let bar = NSMenu::new(mtm);
     for (title, items) in sections {
         let menu = NSMenu::initWithTitle(mtm.alloc(), &NSString::from_str(title));
-        for (name, action, key) in items {
+        for (name, action, key, tag) in items {
             // Safety: the selectors are the standard responder ones; with
             // no target set they travel up the responder chain, so an item
             // nothing answers is simply greyed out.
@@ -1087,6 +1093,7 @@ fn install_main_menu(mtm: MainThreadMarker) {
                     &NSString::from_str(key),
                 )
             };
+            item.setTag(*tag);
             menu.addItem(&item);
         }
         let holder = NSMenuItem::new(mtm);
@@ -1157,7 +1164,7 @@ pub struct KeyCapture {
 /// something to read next to the log, not a demand for attention.
 pub struct Report {
     window: Retained<NSWindow>,
-    text: Retained<NSTextField>,
+    text: Retained<NSTextView>,
 }
 
 impl Report {
@@ -1179,24 +1186,34 @@ impl Report {
         unsafe { window.setReleasedWhenClosed(false) };
         window.center();
 
-        // Inside a scroll view: the command list is longer than any window
-        // anyone wants on screen.
-        let text = label(
-            mtm,
-            "",
-            NSRect::new(
-                NSPoint::new(0.0, 0.0),
-                NSSize::new(size.width - MARGIN * 2.0, size.height - MARGIN * 2.0),
-            ),
-            false,
-        );
+        // A text view rather than a label: a thousand phrases are there to
+        // be searched and copied, and only a text view brings ⌘F, a
+        // selection and the standard Edit menu with it.
+        let inner = NSSize::new(size.width - MARGIN * 2.0, size.height - MARGIN * 2.0);
+        let text = NSTextView::new(mtm);
+        text.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), inner));
+        text.setEditable(false);
+        text.setSelectable(true);
+        text.setRichText(false);
         text.setFont(Some(&NSFont::monospacedSystemFontOfSize_weight(11.0, 0.0)));
+        // Grows downwards inside the scroll view and never sideways, so
+        // the lines wrap instead of running off the right edge.
+        text.setVerticallyResizable(true);
+        text.setHorizontallyResizable(false);
+        text.setMinSize(NSSize::new(0.0, 0.0));
+        text.setMaxSize(NSSize::new(f64::MAX, f64::MAX));
+        text.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+        // Safety: reading the text view's own container, which exists for
+        // a view built the ordinary way.
+        if let Some(container) = unsafe { text.textContainer() } {
+            container.setWidthTracksTextView(true);
+            container.setContainerSize(NSSize::new(inner.width, f64::MAX));
+        }
+        text.setUsesFindBar(true);
+        text.setIncrementalSearchingEnabled(true);
 
         let scroll = NSScrollView::new(mtm);
-        scroll.setFrame(NSRect::new(
-            NSPoint::new(MARGIN, MARGIN),
-            NSSize::new(size.width - MARGIN * 2.0, size.height - MARGIN * 2.0),
-        ));
+        scroll.setFrame(NSRect::new(NSPoint::new(MARGIN, MARGIN), inner));
         scroll.setHasVerticalScroller(true);
         scroll.setDocumentView(Some(&text));
         if let Some(content) = window.contentView() {
@@ -1206,9 +1223,7 @@ impl Report {
     }
 
     pub fn show(&self, body: &str) {
-        self.text.setStringValue(&NSString::from_str(body));
-        // Grow to fit, so the scroll view knows how far it can go.
-        self.text.sizeToFit();
+        self.text.setString(&NSString::from_str(body));
         if let Some(mtm) = MainThreadMarker::new() {
             install_main_menu(mtm);
             let app = NSApplication::sharedApplication(mtm);
