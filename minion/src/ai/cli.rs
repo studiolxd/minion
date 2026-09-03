@@ -628,31 +628,101 @@ fn first_complaint(stderr: &str) -> Option<String> {
 ///
 /// Lenient on purpose: nothing could be observed on this machine (the
 /// account needs `GOOGLE_CLOUD_PROJECT`), so a plain-text answer is
-/// accepted as well as the documented `{"response": "…"}`.
+/// accepted as well as the documented `{"response": "…"}`. Also accepted:
+/// that same shape wrapped in a one-element array — seen for real
+/// (`invalid type: map, expected a sequence`, from an earlier version of
+/// this reader that only looked for a bare object) — and, failing a
+/// `response` field by that exact name, the first string-valued field
+/// there is, since the array shape is not one Gemini's own docs describe.
 pub fn parse_gemini_output(output: &str) -> Result<String, AiError> {
     let trimmed = output.trim();
     if trimmed.is_empty() {
         return Err(AiError::Backend("Gemini no respondió nada".into()));
     }
-    let Some(start) = trimmed.find('{') else {
+    let Some(value) = find_json_value(trimmed) else {
         return Ok(trimmed.to_string());
     };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&trimmed[start..]) else {
-        return Ok(trimmed.to_string());
+    let object = match &value {
+        serde_json::Value::Array(items) => items.first(),
+        serde_json::Value::Object(_) => Some(&value),
+        _ => None,
     };
-    if let Some(message) = value
+    // Unlike finding no JSON at all — plain text, taken as the answer
+    // as-is — finding JSON that parsed but carries nothing usable (an
+    // empty array, a bare number) is something to complain about, not
+    // silently paper over with the raw text.
+    let Some(object) = object else {
+        return Err(AiError::Parse(format!("respuesta inesperada: {trimmed}")));
+    };
+    if let Some(message) = object
         .pointer("/error/message")
-        .or_else(|| value.get("error"))
+        .or_else(|| object.get("error"))
         .and_then(serde_json::Value::as_str)
     {
         return Err(AiError::Backend(message.to_string()));
     }
-    value
+    object
         .get("response")
         .and_then(serde_json::Value::as_str)
+        .or_else(|| object.as_object()?.values().find_map(serde_json::Value::as_str))
         .map(|text| text.trim().to_string())
         .filter(|text| !text.is_empty())
         .ok_or_else(|| AiError::Parse(format!("respuesta inesperada: {trimmed}")))
+}
+
+/// The first top-level JSON value (object or array) `text` parses as,
+/// skipping over anything before it that merely looks like one — Gemini
+/// CLI sometimes prints a `[WARN] …` line, whose own brackets are not
+/// JSON at all, ahead of the real answer.
+fn find_json_value(text: &str) -> Option<serde_json::Value> {
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'{' || bytes[index] == b'[' {
+            if let Some(end) = balanced_end(text, index) {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text[index..=end]) {
+                    return Some(value);
+                }
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+/// The index of the bracket or brace, opened at `start`, that brings its
+/// nesting back to zero — ignoring anything inside a string, so a `{` or
+/// `}` quoted in the answer itself does not end the scan early.
+fn balanced_end(text: &str, start: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, &byte) in bytes[start..].iter().enumerate() {
+        let index = start + offset;
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 // ------------------------------------------------------------- detection
@@ -955,6 +1025,39 @@ mod tests {
     #[test]
     fn plain_text_from_gemini_is_taken_as_the_answer() {
         assert_eq!(parse_gemini_output("  OK  ").unwrap(), "OK");
+    }
+
+    /// What was actually seen in the log: `-o json` wrapped its answer in
+    /// a one-element array instead of the documented bare object, and the
+    /// reader of the day only looked for `{`, so it read this as
+    /// `AiError::Parse("invalid type: map, expected a sequence …")`
+    /// instead of the answer sitting right there.
+    #[test]
+    fn a_response_wrapped_in_an_array_is_still_read() {
+        assert_eq!(
+            parse_gemini_output(r#"[{"response":"El 15 % de 340 es 51."}]"#).unwrap(),
+            "El 15 % de 340 es 51."
+        );
+    }
+
+    #[test]
+    fn an_error_wrapped_in_an_array_is_still_reported() {
+        let output = r#"[{"error":{"type":"ProjectIdRequiredError","message":"This account requires setting GOOGLE_CLOUD_PROJECT"}}]"#;
+        assert_eq!(
+            parse_gemini_output(output),
+            Err(AiError::Backend("This account requires setting GOOGLE_CLOUD_PROJECT".into()))
+        );
+    }
+
+    #[test]
+    fn an_array_entry_without_a_response_key_falls_back_to_a_string_field() {
+        let output = r#"[{"answer":"El 15 % de 340 es 51.","finishReason":"STOP"}]"#;
+        assert_eq!(parse_gemini_output(output).unwrap(), "El 15 % de 340 es 51.");
+    }
+
+    #[test]
+    fn an_empty_array_is_a_parse_error_not_a_panic() {
+        assert!(matches!(parse_gemini_output("[]"), Err(AiError::Parse(_))));
     }
 
     #[test]
