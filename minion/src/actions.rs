@@ -330,6 +330,30 @@ pub fn show_message(text: &str) {
     unsafe { NSOperationQueue::mainQueue().addOperationWithBlock(&work) };
 }
 
+/// Shows a message and returns only once it has been dismissed.
+///
+/// For the moments before the process exits: a message merely queued on
+/// the main thread would be lost to `exit`. From the main thread the alert
+/// runs in place; from any other it is queued and this thread waits for the
+/// click, which needs the main run loop to be going — true wherever this
+/// is called, once the menu bar is up.
+pub fn show_message_and_wait(text: &str) {
+    if let Some(mtm) = MainThreadMarker::new() {
+        alert(mtm, text, None);
+        return;
+    }
+    let (done, dismissed) = std::sync::mpsc::channel();
+    let text = text.to_string();
+    let work = block2::RcBlock::new(move || {
+        if let Some(mtm) = MainThreadMarker::new() {
+            alert(mtm, &text, None);
+        }
+        let _ = done.send(());
+    });
+    unsafe { NSOperationQueue::mainQueue().addOperationWithBlock(&work) };
+    let _ = dismissed.recv();
+}
+
 /// Asks a yes/no question. True when the affirmative button was pressed.
 ///
 /// Runs where it is called, so it has to be called from the main thread —

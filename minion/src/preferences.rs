@@ -1087,7 +1087,6 @@ impl Preferences {
     /// Waiting to be read by the run loop timer in `main.rs`, next to
     /// `take_training_request`; until it is, the button only clears the
     /// window's own prompt.
-    #[allow(dead_code)]
     pub fn take_cancel_request(&self) -> bool {
         self.cancel_requested.replace(false)
     }

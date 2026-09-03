@@ -801,7 +801,7 @@ fn run_menu_bar(
     // Minion from the menu. Until now the menu had no such item.
     let restart = MenuItem::new("Reiniciar", true, None);
     let commands_item = MenuItem::new("Ayuda", true, None);
-    let preferences = MenuItem::new("Preferencias…", true, None);
+    let preferences = MenuItem::new("Ajustes…", true, None);
 
     // The two things you do with the log, together. Kept in scope for the
     // life of the menu, like every other item.
@@ -934,6 +934,12 @@ fn run_menu_bar(
             if let Some(active_session) = session.as_ref() {
                 panel_for_timer
                     .show_training(&active_session.message, active_session.finished);
+            }
+        }
+        // «Cancelar» in the window: forget the session before it finishes.
+        if panel_for_timer.take_cancel_request() {
+            if let Ok(mut session) = training_for_timer.lock() {
+                *session = None;
             }
         }
         // Clear a finished session once its message has been shown.
@@ -1261,7 +1267,9 @@ fn report_permissions() {
 /// killed it.
 fn fatal(message: &str) -> ! {
     note!("fatal    {message}");
-    actions::show_message(message);
+    // Waited for, not merely queued: `exit` would otherwise take the
+    // dialog with it before anyone saw it.
+    actions::show_message_and_wait(message);
     std::process::exit(0)
 }
 
