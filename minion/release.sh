@@ -75,13 +75,16 @@ say "Building the bundle"
 # Falling back to Apple Development keeps this script usable for a local
 # dry run, but the result must never be published, so the warning is loud
 # and the real run refuses to go on to notarisation without it.
+# `|| true`: with no such certificate grep exits 1, and under `set -e` an
+# assignment from a failing pipeline ends the script — silently, right
+# after the build, which is when the warning below matters most.
 IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null \
-  | grep -m1 "Developer ID Application" | awk '{print $2}')
+  | grep -m1 "Developer ID Application" | awk '{print $2}' || true)
 DEVELOPER_ID=1
 if [ -z "$IDENTITY" ]; then
   DEVELOPER_ID=0
   IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null \
-    | grep -m1 "Apple Development" | awk '{print $2}')
+    | grep -m1 "Apple Development" | awk '{print $2}' || true)
   echo "WARNING ============================================================" >&2
   echo "No 'Developer ID Application' certificate in the keychain." >&2
   echo "Signing with Apple Development instead. The result runs here and" >&2
