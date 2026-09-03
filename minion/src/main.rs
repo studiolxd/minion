@@ -1853,6 +1853,15 @@ fn main() -> Result<()> {
         if argument == "learn" {
             let apply = std::env::args().any(|a| a == "--apply");
             let config = config::load();
+    if let Some(problem) = config::problem() {
+        // Said out loud, not just logged: a file that has stopped parsing
+        // means every setting is silently back to its default.
+        note!("config   {problem}");
+        actions::show_message(&format!(
+            "No se puede leer config.toml, así que Minion usa los ajustes por \
+             defecto.\n\n{problem}\n\nCorrige el archivo y reinicia Minion."
+        ));
+    }
             commands::configure(&config);
             learn::run(&config, apply);
             return Ok(());

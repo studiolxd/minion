@@ -496,6 +496,29 @@ pub fn load() -> Config {
     }
 }
 
+/// What is wrong with the configuration file, if anything: the parse
+/// error, for a file that exists and does not parse. `None` when there is
+/// no file or it is fine.
+///
+/// [`load`] falls back to the defaults and says so only in the log, and a
+/// person whose file has just stopped parsing sees a Minion that has
+/// quietly forgotten every setting. This is for telling them.
+pub fn problem() -> Option<String> {
+    let file = path()?;
+    let contents = std::fs::read_to_string(&file).ok()?;
+    toml::from_str::<Config>(&contents).err().map(|e| {
+        let reason = e.message().to_string();
+        let line = e.span().and_then(|span| {
+            let at = contents[..span.start.min(contents.len())].matches('\n').count() + 1;
+            Some(at)
+        });
+        match line {
+            Some(line) => format!("línea {line}: {reason}"),
+            None => reason,
+        }
+    })
+}
+
 /// The range `max_utterance_ms` is allowed to take.
 ///
 /// Anything under a second cuts commands in half; anything over fifteen
@@ -1062,6 +1085,14 @@ mod tests {
     /// Every setting in the shipped example must still be a real field on
     /// [`Config`] — this is what stops `config.example.toml` from drifting
     /// into a stale copy of something else, as it once did.
+    #[test]
+    fn a_problem_names_the_line() {
+        // Not the real file: the same parser over the same kind of mistake.
+        let contents = "sounds = false\n[audio]\ncategory = \"x\"\n";
+        let err = toml::from_str::<Config>(contents).unwrap_err();
+        assert!(err.message().contains("unknown field"), "{err}");
+    }
+
     #[test]
     fn example_config_parses() {
         let config: Config = toml::from_str(include_str!("../config.example.toml"))
