@@ -40,6 +40,15 @@ const SPEAKER_REVISION: &str = "a2f3dcb1c8702caccc7a55ceb57f5e8d1842112b";
 const SPEAKER_URL_BASE: &str = "https://huggingface.co/Wespeaker/wespeaker-ecapa-tdnn512-LM/resolve";
 const SPEAKER_SHA256: &str = "d71b85d9b48058ef68004f04f1b78acebefb9dfcf542e19b976a12a5ad1f10b0";
 
+// snakers4/silero-vad, the voice detector that keeps the two models above
+// from being woken by the dishwasher. Two megabytes, and it lives in a
+// GitHub repository rather than on Hugging Face — same reasoning, a
+// branch is a moving target, so the commit and the hash are both pinned.
+const VAD_REVISION: &str = "867c2aa692646a1f1de3e94a15c9dd9f614c0acb";
+const VAD_URL_BASE: &str = "https://raw.githubusercontent.com/snakers4/silero-vad";
+const VAD_FILE: &str = "src/silero_vad/data/silero_vad.onnx";
+const VAD_SHA256: &str = "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3";
+
 const PIECES: &[Piece] = &[
     Piece {
         remote: "config.json",
@@ -133,8 +142,40 @@ pub fn fetch<F: Fn(&str)>(directory: &Path, report: F) -> Result<(), String> {
         )?;
     }
 
+    // And the voice detector: 2 MB, and the reason the two models above
+    // are not woken up by every noise in the room.
+    if !vad_path(directory).exists() {
+        report("descargando el modelo… 99 %");
+        fetch_vad(directory)?;
+    }
+
     report("modelo descargado");
     Ok(())
+}
+
+/// Where the voice detector lives, once it has been downloaded.
+pub fn vad_path(directory: &Path) -> PathBuf {
+    directory.join("silero_vad.onnx")
+}
+
+/// Fetches the voice detector on its own.
+///
+/// It arrived after the other models, so an installation made before it
+/// has everything except this — and [`present`] is already satisfied, so
+/// [`fetch`] is never called again to notice. Two megabytes, fetched once,
+/// rather than a reason to download 670 again.
+pub fn fetch_vad(directory: &Path) -> Result<PathBuf, String> {
+    let target = vad_path(directory);
+    if target.exists() {
+        return Ok(target);
+    }
+    std::fs::create_dir_all(directory).map_err(|e| format!("no se pudo crear la carpeta: {e}"))?;
+    download(
+        &format!("{VAD_URL_BASE}/{VAD_REVISION}/{VAD_FILE}"),
+        &target,
+        VAD_SHA256,
+    )?;
+    Ok(target)
 }
 
 /// Fetches one file, to a temporary name until it is complete and verified.
@@ -244,6 +285,8 @@ mod tests {
             );
         }
         assert_eq!(SPEAKER_SHA256.len(), 64);
+        assert_eq!(VAD_SHA256.len(), 64);
+        assert!(VAD_SHA256.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 
     #[test]
@@ -253,6 +296,9 @@ mod tests {
             assert!(!url.contains("/resolve/main/"), "must not resolve against a moving branch");
             assert!(url.contains(SPEECH_REVISION));
         }
+        let vad = format!("{VAD_URL_BASE}/{VAD_REVISION}/{VAD_FILE}");
+        assert!(!vad.contains("/master/") && !vad.contains("/main/"));
+        assert!(vad.contains(VAD_REVISION));
     }
 
     #[test]

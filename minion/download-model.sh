@@ -22,6 +22,9 @@ BASE="https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/$SPEECH
 SPEAKER_REVISION="a2f3dcb1c8702caccc7a55ceb57f5e8d1842112b"
 SPEAKER_URL="https://huggingface.co/Wespeaker/wespeaker-ecapa-tdnn512-LM/resolve/$SPEAKER_REVISION/voxceleb_ECAPA512_LM.onnx"
 SPEAKER_SHA256="d71b85d9b48058ef68004f04f1b78acebefb9dfcf542e19b976a12a5ad1f10b0"
+VAD_REVISION="867c2aa692646a1f1de3e94a15c9dd9f614c0acb"
+VAD_URL="https://raw.githubusercontent.com/snakers4/silero-vad/$VAD_REVISION/src/silero_vad/data/silero_vad.onnx"
+VAD_SHA256="1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3"
 
 mkdir -p "$DIR"
 chmod 700 "$DIR/.." 2>/dev/null || true
@@ -66,6 +69,18 @@ if [ ! -f speaker.onnx ]; then
   mv speaker.onnx.partial speaker.onnx
 else
   echo "  ✓ speaker.onnx (already here)"
+fi
+
+# Voice detector: 2 MB, and the reason the models above are not woken by
+# the dishwasher. Optional — without it the energy detector decides alone.
+if [ ! -f silero_vad.onnx ]; then
+  echo "  ↓ silero_vad.onnx"
+  curl -fL --proto '=https' --tlsv1.2 --max-time 3600 --progress-bar \
+    -o silero_vad.onnx.partial "$VAD_URL"
+  echo "$VAD_SHA256  silero_vad.onnx.partial" | shasum -a 256 -c - >/dev/null
+  mv silero_vad.onnx.partial silero_vad.onnx
+else
+  echo "  ✓ silero_vad.onnx (already here)"
 fi
 
 echo

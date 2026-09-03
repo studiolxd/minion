@@ -140,7 +140,15 @@ pub fn run(model_path: &str) -> Result<()> {
     let active = Arc::new(AtomicBool::new(true));
     // Nothing speaks during enrolment, so nothing ever goes deaf.
     let deaf = Arc::new(AtomicBool::new(false));
-    let listener = audio::start(audio::Settings::default(), Arc::clone(&active), microphone, deaf)?;
+    // Same detector as the listening loop: a voice profile built out of
+    // whatever noise the room made would be worse than none.
+    let listener = audio::start(
+        audio::Settings::default(),
+        Arc::clone(&active),
+        microphone,
+        deaf,
+        Some(model_path.to_string()),
+    )?;
 
     let mut collected = Vec::new();
     for (number, prompt) in PROMPTS.iter().enumerate().take(SENTENCES) {

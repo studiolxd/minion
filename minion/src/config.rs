@@ -247,6 +247,11 @@ pub struct AudioConfig {
     pub silence_end_ms: Option<usize>,
     pub min_speech_ms: Option<usize>,
     pub max_utterance_ms: Option<usize>,
+    /// Which detector decides speech from noise: `"silero"` (the default,
+    /// when the model is on disk) or `"energy"`.
+    pub vad: Option<String>,
+    /// Silero's score above which a frame counts as speech, 0 to 1.
+    pub vad_threshold: Option<f32>,
 }
 
 /// A name (or other word) the recogniser reliably mangles, and the correct
@@ -601,6 +606,23 @@ pub fn problem() -> Option<String> {
 const MIN_UTTERANCE_MS: usize = 1_000;
 const MAX_UTTERANCE_MS: usize = 15_000;
 
+/// Reads the `vad` setting. `None` leaves the default in place, which is
+/// also what an unrecognised name does — a typo should not make Minion
+/// deaf to the difference between a voice and the dishwasher.
+fn vad_named(name: Option<&str>) -> Option<audio::Vad> {
+    let name = name?.trim();
+    if name.eq_ignore_ascii_case("energy") {
+        return Some(audio::Vad::Energy);
+    }
+    if name.eq_ignore_ascii_case("silero") {
+        return Some(audio::Vad::Silero);
+    }
+    crate::journal::write(&format!(
+        "config.toml: vad = «{name}» is neither «silero» nor «energy»; ignoring it."
+    ));
+    None
+}
+
 impl Config {
     /// Audio settings, with anything unset left at its default.
     pub fn audio_settings(&self) -> audio::Settings {
@@ -618,6 +640,14 @@ impl Config {
                 .max_utterance_ms
                 .unwrap_or(defaults.max_utterance_ms)
                 .clamp(MIN_UTTERANCE_MS, MAX_UTTERANCE_MS),
+            vad: vad_named(self.audio.vad.as_deref()).unwrap_or(defaults.vad),
+            // A threshold outside 0..1 is not a threshold: every frame
+            // would be speech, or none would.
+            vad_threshold: self
+                .audio
+                .vad_threshold
+                .unwrap_or(defaults.vad_threshold)
+                .clamp(0.0, 1.0),
         }
     }
 
