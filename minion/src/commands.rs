@@ -688,17 +688,62 @@ fn find_website(transcript: &str, words: &[String]) -> Option<Website> {
         .map(|(_, url)| Website::Named((*url).to_string()))
 }
 
+/// Whether the words of `alias` appear, in order, as whole words of the
+/// sentence.
+///
+/// Whole words, not a substring: "mail" is inside "gmail" and "orca" is
+/// inside "mallorca", and both used to launch an application instead of
+/// opening the page that was asked for.
+fn names_alias(words: &[&str], alias: &str) -> bool {
+    let wanted: Vec<&str> = alias.split_whitespace().collect();
+    if wanted.is_empty() || wanted.len() > words.len() {
+        return false;
+    }
+    words.windows(wanted.len()).any(|window| window == wanted)
+}
+
+/// Whether `word` is the alias with another whole word stuck to it.
+///
+/// The recogniser runs words together — "abrecrome" is "abre" + "crome" —
+/// and the application name is still in there. The leftover has to be a
+/// word in its own right, which is what tells "abrecrome" apart from
+/// "editorial" ("editor" plus "ial") and "gmail" ("g" plus "mail").
+fn run_together(word: &str, alias: &str) -> bool {
+    if word.len() <= alias.len() {
+        return false;
+    }
+    let Some(at) = word.find(alias) else {
+        return false;
+    };
+    let head = &word[..at];
+    let tail = &word[at + alias.len()..];
+    let is_word = |part: &str| {
+        part.is_empty()
+            || spanish::is_known_verb(part)
+            || spanish::is_filler(part)
+            || sounds_like_wake_word(part)
+    };
+    is_word(head) && is_word(tail)
+}
+
 /// Finds an application named in the sentence, with its match score.
+///
+/// Only whole words count. Fuzziness lives in the alias lists instead:
+/// what the recogniser really writes ("shafari", "cromo") is listed, which
+/// is explicit and cannot reach a word that merely contains a name.
 fn find_app(rest: &str) -> Option<(&'static App, f32)> {
+    let words: Vec<&str> = rest.split_whitespace().collect();
     let mut best: Option<(&App, f32)> = None;
     for app in all_apps() {
         for alias in app.aliases {
-            // A literal mention beats a fuzzy one; longer aliases beat
+            // A plain mention beats a run-together one; longer aliases beat
             // shorter ones, so "vs code" wins over a stray "code".
-            let score = if rest.contains(alias) {
+            let score = if names_alias(&words, alias) {
                 0.9 + (alias.len() as f32 / 100.0).min(0.09)
+            } else if words.iter().any(|word| run_together(word, alias)) {
+                0.9
             } else {
-                similarity(rest, alias)
+                0.0
             };
             if score >= threshold() && best.is_none_or(|(_, b)| score > b) {
                 best = Some((app, score));
@@ -706,6 +751,16 @@ fn find_app(rest: &str) -> Option<(&'static App, f32)> {
         }
     }
     best
+}
+
+/// Whether the sentence names one of the known sites outright.
+///
+/// Checked before applications: a site's own name must not be eaten by an
+/// application alias that happens to be part of it.
+fn names_a_site(words: &[String]) -> bool {
+    words
+        .iter()
+        .any(|word| SITES.iter().any(|(name, _)| name == word))
 }
 
 /// Works out what a transcription means with no application context.
@@ -843,7 +898,15 @@ pub fn decide_in(transcript: &str, context: Option<&str>) -> (Decision, f32) {
     // A spelled-out domain does not need a verb in front. The recogniser
     // runs words together — "abremarca.com", "iramarca.com" — and there is
     // then no verb left to recognise, but the intent is unmistakable.
-    if find_app(rest).is_none() {
+    // Worked out once: the website route and the application route both
+    // need to know, and asking twice invites the two to disagree.
+    let app = if names_a_site(&spoken_words) {
+        None
+    } else {
+        find_app(rest)
+    };
+
+    if app.is_none() {
         match find_website(transcript, &spoken_words) {
             Some(Website::Domain(url)) => {
                 return (Decision::Browse { url, in_browser: browser_in_front(context) }, 0.9)
@@ -855,7 +918,7 @@ pub fn decide_in(transcript: &str, context: Option<&str>) -> (Decision, f32) {
         }
     }
 
-    if let Some((app, score)) = find_app(rest) {
+    if let Some((app, score)) = app {
         let app_wins = best.is_none_or(|(_, b)| score > b);
         if asks_to_quit && app_wins {
             return (
@@ -1332,6 +1395,16 @@ mod tests {
     fn opens_well_known_sites_by_name() {
         browses("minion abre youtube", "https://www.youtube.com");
         browses("minion ve a wikipedia", "https://es.wikipedia.org");
+    }
+
+    #[test]
+    fn an_app_name_inside_a_word_is_not_that_app() {
+        // All three used to launch an application: "mail" is inside
+        // "gmail", "orca" inside "mallorca", "editor" inside "editorial".
+        browses("minion abre gmail", "https://mail.google.com");
+        browses("minion ve a gmail punto com", "https://gmail.com");
+        browses("minion ve a mallorca punto com", "https://mallorca.com");
+        assert_eq!(decision("minion abre el editorial"), Decision::Unrecognised);
     }
 
     #[test]
