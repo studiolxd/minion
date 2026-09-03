@@ -482,7 +482,11 @@ impl Window {
             if self.left_press.clicked() && !self.voice_started.get() {
                 if let Ok(mut session) = self.training.lock() {
                     if session.is_none() {
-                        *session = Some(crate::enroll::Session::starting(self.model_path.clone()));
+                        // The assistant enrols the owner under the configured
+                        // name (or «yo»); more voices are added from Ajustes.
+                        let name = crate::config::load().voice_name();
+                        *session =
+                            Some(crate::enroll::Session::starting(self.model_path.clone(), &name));
                         self.voice_started.set(true);
                     }
                 }

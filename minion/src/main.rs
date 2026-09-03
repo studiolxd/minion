@@ -823,8 +823,8 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                     let started = Instant::now();
                     match speaker::Speaker::load(&model_path) {
                         Ok(model) => {
-                            let profile = speaker::load_profile_for(&model_path).unwrap_or_default();
-                            voice = Some(Voice { model, profile, threshold: config_voice_threshold() });
+                            let profiles = speaker::load_profiles_for(&model_path);
+                            voice = Some(Voice { model, profiles, threshold: config_voice_threshold() });
                             voice_unloaded_for_idle = false;
                             note!(
                                 "Speech starting — speaker model reloaded in {} ms.",
