@@ -8,8 +8,24 @@
 //! life of a dictation session (built fresh on `Outcome::EnterDictation`,
 //! dropped on `Outcome::LeaveDictation`) and feeds it every `Outcome::Type`.
 
+use crate::commands::EditIntent;
 use crate::config::Config;
 use crate::text;
+
+/// An exact instruction for what to type next, computed from what has
+/// actually reached the keyboard so far — never from what was spoken,
+/// which spoken punctuation, capitalisation and personal vocabulary may
+/// have turned into something a different length. `main.rs` carries this
+/// out with `actions::press(key::DELETE)` and, for `Retype`, a `type_text`
+/// straight after.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Edit {
+    /// Press ⌫ this many times, and nothing else.
+    DeleteChars(usize),
+    /// Press ⌫ this many times, then type this instead (`main.rs` adds
+    /// the trailing space, as it does for an ordinary `Outcome::Type`).
+    Retype { delete: usize, text: String },
+}
 
 /// One word as it arrived from the recogniser, or one already resolved by
 /// the personal vocabulary and no longer open to further interpretation.
@@ -48,6 +64,12 @@ pub struct Transformer {
     vocabulary: Vec<(Vec<String>, String)>,
     capitalize_next: bool,
     quote_open: bool,
+    /// What was actually typed, one rendered chunk per call to `render`,
+    /// oldest first, never including the trailing space `main.rs` types
+    /// after each one. What an edit command ("borra la última palabra")
+    /// works from, since it must delete exactly what reached the
+    /// keyboard, not what was spoken.
+    history: Vec<String>,
 }
 
 impl Transformer {
@@ -62,12 +84,24 @@ impl Transformer {
             // The very first word of a dictation session starts a sentence.
             capitalize_next: true,
             quote_open: false,
+            history: Vec::new(),
         }
     }
 
     /// Renders one chunk of what was heard while dictating. `main.rs` types
     /// exactly what comes back, followed by its own single space.
+    ///
+    /// Also remembers it: an edit command a later chunk asks for
+    /// (`edit`) is resolved against this, not against what was spoken.
     pub fn render(&mut self, spoken: &str) -> String {
+        let rendered = self.render_uncached(spoken);
+        if !rendered.is_empty() {
+            self.history.push(rendered.clone());
+        }
+        rendered
+    }
+
+    fn render_uncached(&mut self, spoken: &str) -> String {
         if let Some(digits) = self.try_number(spoken) {
             return digits;
         }
@@ -80,6 +114,52 @@ impl Transformer {
         let toks = self.apply_vocabulary(&words);
         let atoms = self.build_atoms(toks);
         assemble(&atoms)
+    }
+
+    /// Turns a spoken edit command into an exact edit against what has
+    /// actually been typed. `Err` is what to say instead, when there is
+    /// nothing to act on: nothing typed yet, or a «cambia X por Y» whose
+    /// X is not in the last chunk.
+    pub fn edit(&mut self, intent: &EditIntent) -> Result<Edit, String> {
+        match intent {
+            EditIntent::DeleteLastWord => {
+                let chunk = self.history.last().ok_or("nothing typed yet")?;
+                let last_word_chars = match chunk.rfind(char::is_whitespace) {
+                    Some(byte) => chunk[byte + 1..].chars().count(),
+                    None => chunk.chars().count(),
+                };
+                self.truncate_last_chunk(last_word_chars);
+                Ok(Edit::DeleteChars(last_word_chars + 1))
+            }
+            EditIntent::DeleteLastPhrase => {
+                let chunk = self.history.pop().ok_or("nothing typed yet")?;
+                Ok(Edit::DeleteChars(chunk.chars().count() + 1))
+            }
+            EditIntent::Replace { find, replace } => {
+                let chunk = self.history.last().ok_or_else(|| not_found(find))?.clone();
+                let (start, end) =
+                    find_last_words(&chunk, find).ok_or_else(|| not_found(find))?;
+                let chars: Vec<char> = chunk.chars().collect();
+                let kept: String = chars[..start].iter().collect();
+                let tail: String = chars[end..].iter().collect();
+                let delete = chars.len() - start + 1; // plus the trailing space typed after the chunk
+                let text = format!("{replace}{tail}");
+                *self.history.last_mut().expect("checked above") = format!("{kept}{text}");
+                Ok(Edit::Retype { delete, text })
+            }
+        }
+    }
+
+    /// Drops the last `chars` characters from the last chunk of history,
+    /// so a further edit sees exactly what is left on screen. Removes the
+    /// chunk entirely once nothing of it remains.
+    fn truncate_last_chunk(&mut self, chars: usize) {
+        let Some(last) = self.history.last_mut() else { return };
+        let keep = last.chars().count().saturating_sub(chars);
+        *last = last.chars().take(keep).collect();
+        if last.is_empty() {
+            self.history.pop();
+        }
     }
 
     /// «número cuarenta y dos», or a chunk that is nothing but a number
@@ -301,6 +381,58 @@ fn opening(text: &str) -> Atom {
 /// `-` `@` `#` `/`, for handles, hashtags and addresses.
 fn fused(text: &str) -> Atom {
     Atom { text: text.to_string(), glue_before: true, no_space_after: true }
+}
+
+/// What «cambia X por Y» says when X is not in the last chunk.
+fn not_found(find: &str) -> String {
+    format!("no encuentro «{find}»")
+}
+
+/// The char range of the *last* run of words in `haystack` that matches
+/// `needle`, word for word, normalised (accents, case and any attached
+/// punctuation dropped) — so "tal" still finds "tal," or "Tal". `needle`
+/// may be several words; the match is a contiguous run of exactly that
+/// many.
+fn find_last_words(haystack: &str, needle: &str) -> Option<(usize, usize)> {
+    let needle_words: Vec<String> =
+        text::normalise(needle).split_whitespace().map(str::to_string).collect();
+    if needle_words.is_empty() {
+        return None;
+    }
+
+    // char-index spans of each whitespace-delimited word in `haystack`,
+    // since `split_whitespace` alone throws the positions away.
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut start: Option<usize> = None;
+    let mut chars = 0;
+    for c in haystack.chars() {
+        if c.is_whitespace() {
+            if let Some(s) = start.take() {
+                spans.push((s, chars));
+            }
+        } else if start.is_none() {
+            start = Some(chars);
+        }
+        chars += 1;
+    }
+    if let Some(s) = start {
+        spans.push((s, chars));
+    }
+
+    let haystack_chars: Vec<char> = haystack.chars().collect();
+    let words: Vec<String> = spans
+        .iter()
+        .map(|&(s, e)| text::normalise(&haystack_chars[s..e].iter().collect::<String>()))
+        .collect();
+
+    let n = needle_words.len();
+    if n == 0 || n > words.len() {
+        return None;
+    }
+    (0..=words.len() - n)
+        .rev()
+        .find(|&i| words[i..i + n] == needle_words[..])
+        .map(|i| (spans[i].0, spans[i + n - 1].1))
 }
 
 fn capitalize_first(word: &str) -> String {
@@ -611,5 +743,90 @@ mod tests {
         let config = Config { spoken_punctuation: false, ..Config::default() };
         let mut t = Transformer::new(&config);
         assert_eq!(t.render("hola que tal"), "Hola que tal");
+    }
+
+    #[test]
+    fn borra_la_ultima_palabra_deletes_exactly_the_last_rendered_word() {
+        let mut t = transformer();
+        // "Hola, que tal" is 13 characters, plus the space `main.rs` types
+        // after it: 14 characters reach the keyboard, as the brief spells
+        // out. The edit removes only "tal" and the space after it — 4.
+        let rendered = t.render("hola coma que tal");
+        assert_eq!(rendered, "Hola, que tal");
+        assert_eq!(rendered.chars().count() + 1, 14);
+        assert_eq!(t.edit(&EditIntent::DeleteLastWord), Ok(Edit::DeleteChars(4)));
+    }
+
+    #[test]
+    fn borra_la_ultima_palabra_can_consume_a_whole_one_word_chunk() {
+        let mut t = transformer();
+        t.render("hola");
+        t.render("mundo");
+        // "mundo" (5) plus its trailing space.
+        assert_eq!(t.edit(&EditIntent::DeleteLastWord), Ok(Edit::DeleteChars(6)));
+        // With that chunk gone, the next call reaches into "hola".
+        assert_eq!(t.edit(&EditIntent::DeleteLastWord), Ok(Edit::DeleteChars(5)));
+        // And with nothing left, there is nothing more to take back.
+        assert_eq!(t.edit(&EditIntent::DeleteLastWord), Err("nothing typed yet".to_string()));
+    }
+
+    #[test]
+    fn borra_la_ultima_frase_deletes_the_whole_last_chunk() {
+        let mut t = transformer();
+        let rendered = t.render("hola coma que tal");
+        assert_eq!(
+            t.edit(&EditIntent::DeleteLastPhrase),
+            Ok(Edit::DeleteChars(rendered.chars().count() + 1))
+        );
+        // The chunk is gone: a further edit has nothing left to act on.
+        assert_eq!(t.edit(&EditIntent::DeleteLastWord), Err("nothing typed yet".to_string()));
+    }
+
+    #[test]
+    fn cambia_replaces_the_last_occurrence_and_keeps_what_follows_it() {
+        let mut t = transformer();
+        let rendered = t.render("el mundo es grande");
+        assert_eq!(rendered, "El mundo es grande");
+        let edit = t.edit(&EditIntent::Replace {
+            find: "mundo".to_string(),
+            replace: "planeta".to_string(),
+        });
+        assert_eq!(
+            edit,
+            Ok(Edit::Retype { delete: 16, text: "planeta es grande".to_string() })
+        );
+    }
+
+    #[test]
+    fn cambia_matches_the_last_occurrence_when_the_word_repeats() {
+        let mut t = transformer();
+        t.render("gato come gato");
+        let edit = t.edit(&EditIntent::Replace {
+            find: "gato".to_string(),
+            replace: "perro".to_string(),
+        });
+        // Only the trailing "gato" is replaced: nothing follows it, so
+        // deleting back to it takes 5 characters (the word and its space).
+        assert_eq!(edit, Ok(Edit::Retype { delete: 5, text: "perro".to_string() }));
+    }
+
+    #[test]
+    fn cambia_says_so_when_it_cannot_find_the_word() {
+        let mut t = transformer();
+        t.render("el mundo es grande");
+        assert_eq!(
+            t.edit(&EditIntent::Replace {
+                find: "marte".to_string(),
+                replace: "venus".to_string()
+            }),
+            Err("no encuentro «marte»".to_string())
+        );
+    }
+
+    #[test]
+    fn an_edit_with_nothing_dictated_yet_says_so() {
+        let mut t = transformer();
+        assert_eq!(t.edit(&EditIntent::DeleteLastWord), Err("nothing typed yet".to_string()));
+        assert_eq!(t.edit(&EditIntent::DeleteLastPhrase), Err("nothing typed yet".to_string()));
     }
 }

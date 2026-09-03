@@ -14,7 +14,7 @@
 use std::time::{Duration, Instant};
 
 use crate::answers;
-use crate::commands::{self, Decision};
+use crate::commands::{self, Decision, EditIntent};
 
 /// Something Minion did that it knows how to take back.
 ///
@@ -43,6 +43,11 @@ pub enum Outcome {
     NotDictating,
     /// While dictating: type this word for word, and a space after it.
     Type(String),
+    /// An edit command, heard while dictating instead of more text to
+    /// type: what it asks for, purely — `main.rs` resolves it against
+    /// the transformer's history of what was actually typed, and carries
+    /// it out.
+    EditDictation(EditIntent),
     /// Heard while dictating, but there was nothing in it to type.
     Nothing,
     /// A question to be answered aloud.
@@ -152,6 +157,14 @@ impl Session {
             if decision == Decision::StopDictation {
                 self.dictating = false;
                 return Outcome::LeaveDictation;
+            }
+            if let Some(intent) = commands::dictation_edit(part) {
+                // An edit is not itself undoable yet, and it may reach
+                // back past what "deshaz" was pointing at — simplest and
+                // safest is to drop it rather than leave it referring to
+                // text that is no longer there.
+                self.undoable = None;
+                return Outcome::EditDictation(intent);
             }
             let typed = part.trim().to_string();
             if typed.is_empty() {
@@ -410,6 +423,51 @@ mod tests {
         assert_eq!(
             say(&mut session, "minion deshaz lo que has hecho"),
             vec![Outcome::Undo(Some(Undoable::Typed(12)))]
+        );
+    }
+
+    #[test]
+    fn an_edit_command_while_dictating_is_obeyed_rather_than_typed() {
+        let mut session = Session::new();
+        say(&mut session, "minion empieza a dictar");
+        say(&mut session, "hola");
+        assert_eq!(
+            say(&mut session, "minion borra la última palabra"),
+            vec![Outcome::EditDictation(EditIntent::DeleteLastWord)]
+        );
+        assert_eq!(
+            say(&mut session, "borra la última frase"),
+            vec![Outcome::EditDictation(EditIntent::DeleteLastPhrase)]
+        );
+        assert_eq!(
+            say(&mut session, "cambia hola por adiós"),
+            vec![Outcome::EditDictation(EditIntent::Replace {
+                find: "hola".to_string(),
+                replace: "adiós".to_string(),
+            })]
+        );
+    }
+
+    #[test]
+    fn a_sentence_that_merely_contains_the_edit_words_is_dictated_as_text() {
+        let mut session = Session::new();
+        say(&mut session, "minion empieza a dictar");
+        assert_eq!(
+            say(&mut session, "borra la última palabra que dije"),
+            vec![Outcome::Type("borra la última palabra que dije".to_string())]
+        );
+    }
+
+    #[test]
+    fn an_edit_clears_what_deshaz_would_take_back() {
+        let mut session = Session::new();
+        say(&mut session, "minion empieza a dictar");
+        say(&mut session, "hola");
+        say(&mut session, "minion borra la última palabra");
+        say(&mut session, "minion deja de dictar");
+        assert_eq!(
+            say(&mut session, "minion deshaz lo que has hecho"),
+            vec![Outcome::Undo(None)]
         );
     }
 

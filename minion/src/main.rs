@@ -809,6 +809,41 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                         Err(reason) => note!("BLOCKED  «{rendered}»  ->  escribir texto: {reason}"),
                     }
                 }
+                Outcome::EditDictation(intent) => {
+                    let press_deletes = |n: usize| -> Result<(), String> {
+                        for _ in 0..n {
+                            actions::press(actions::key::DELETE, actions::Mods::NONE)?;
+                        }
+                        Ok(())
+                    };
+                    match transformer.as_mut().map(|t| t.edit(&intent)) {
+                        Some(Ok(dictation::Edit::DeleteChars(n))) => match press_deletes(n) {
+                            Ok(()) => {
+                                note!("edited   deleted {n} characters");
+                                acted.store(true, Ordering::Relaxed);
+                            }
+                            Err(reason) => note!("BLOCKED  edit ({n} characters): {reason}"),
+                        },
+                        Some(Ok(dictation::Edit::Retype { delete, text })) => {
+                            match press_deletes(delete) {
+                                Ok(()) => match actions::type_text(&format!("{text} ")) {
+                                    Ok(()) => {
+                                        note!("edited   retyped «{text}»");
+                                        acted.store(true, Ordering::Relaxed);
+                                    }
+                                    Err(reason) => note!(
+                                        "BLOCKED  «{text}»  ->  escribir texto: {reason}"
+                                    ),
+                                },
+                                Err(reason) => {
+                                    note!("BLOCKED  edit ({delete} characters): {reason}")
+                                }
+                            }
+                        }
+                        Some(Err(reason)) => note!("edit     {reason}"),
+                        None => note!("edit     not dictating"),
+                    }
+                }
                 Outcome::Answer(question) => {
                     // "¿Qué puedes hacer?" is answered by showing the list.
                     if question == answers::Question::Help {
