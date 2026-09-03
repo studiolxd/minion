@@ -15,9 +15,12 @@ use crate::text::{keywords, normalise, similarity};
 
 /// Words that mark a sentence as a command. Only counted at the start.
 /// Includes what the recogniser actually produces for the name, not just
-/// its spelling: said in Spanish it comes out as "minion", "minión" or
-/// "miñón", and normalisation flattens the accents but not the ñ.
-pub const DEFAULT_WAKE_WORDS: &[&str] = &["minion", "minions", "minon", "miñon"];
+/// its spelling: said in Spanish it comes out as "minion", "minión",
+/// "miñón", "minial", "mini" — normalisation flattens the accents but not
+/// the rest. Anything close enough is accepted anyway; see
+/// [`sounds_like_wake_word`].
+pub const DEFAULT_WAKE_WORDS: &[&str] =
+    &["minion", "minions", "minon", "miñon", "minial", "mini", "minio"];
 
 /// Set once at startup from the configuration file. Absent means defaults.
 static USER_APPS: OnceLock<Vec<App>> = OnceLock::new();
@@ -468,12 +471,40 @@ pub enum Decision {
     Ignored,
 }
 
+/// Whether the first word was meant to be the wake word.
+///
+/// Matched loosely, and it took a log to see why: everything else in the
+/// vocabulary is matched with tolerance, while the word that gates all of
+/// it was compared literally. "Minion" comes back as "Minial" or "Mini"
+/// often enough that whole sentences were being discarded after being
+/// understood perfectly.
+///
+/// The tolerance is bounded — two edits at most, and the first two letters
+/// must agree — so an ordinary word cannot open a command by accident.
+fn sounds_like_wake_word(word: &str) -> bool {
+    let words = wake_words();
+    if words.contains(&word) {
+        return true;
+    }
+    words.iter().any(|wake| {
+        let shortest = word.len().min(wake.len());
+        if shortest < 4 {
+            return false;
+        }
+        // Three letters of shared opening. Two was not enough: "millón"
+        // is two edits from "minion" and starts with "mi", so half of
+        // "un millón de gracias" would have opened a command.
+        let prefix = 3.min(wake.len().saturating_sub(1)).max(1);
+        let same_start = word.chars().take(prefix).eq(wake.chars().take(prefix));
+        let allowance = if shortest >= 5 { 2 } else { 1 };
+        same_start && crate::text::edits_between(word, wake) <= allowance
+    })
+}
+
 /// Strips the wake word. Returns `None` if the sentence is not a command.
 fn strip_wake_word(phrase: &str) -> Option<&str> {
     let first = phrase.split_whitespace().next()?;
-    wake_words()
-        .contains(&first)
-        .then(|| phrase[first.len()..].trim())
+    sounds_like_wake_word(first).then(|| phrase[first.len()..].trim())
 }
 
 /// Reads "otra vez", "repite", "hazlo tres veces" and the like.
@@ -923,7 +954,7 @@ pub fn closest_command(phrase: &str) -> Option<(&'static str, f32)> {
 
 /// Whether a word is one of the wake words in force.
 pub fn is_wake_word(word: &str) -> bool {
-    wake_words().contains(&word)
+    sounds_like_wake_word(word)
 }
 
 /// The whole vocabulary, written out for someone to read.
@@ -1075,6 +1106,44 @@ mod tests {
         assert_eq!(decision("Minion, guarda esto."), Decision::Run("guardar"));
         assert_eq!(decision("Minion, sube el volumen."), Decision::Run("subir volumen"));
         assert_eq!(decision("Minion, pantalla completa."), Decision::Run("pantalla completa"));
+    }
+
+    #[test]
+    fn the_wake_word_survives_being_misheard() {
+        // Straight from the log. Each of these was a command understood
+        // perfectly and then thrown away, because the first word did not
+        // match a short list letter for letter.
+        for spoken in [
+            "Minial Shafari.",
+            "Mini Chrome.",
+            "Minión, ¿qué hora es?",
+            "Minio abre chrome",
+            "Miñón abre safari",
+        ] {
+            assert_ne!(
+                decide(spoken).0,
+                Decision::Ignored,
+                "«{spoken}» should be taken as a command"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ordinary_word_does_not_open_a_command() {
+        // The tolerance has to stop somewhere, or conversation starts
+        // running things. Two edits and a shared opening is the limit.
+        for spoken in [
+            "millón de gracias",
+            "misión cumplida",
+            "camión abre chrome",
+            "opinión abre chrome",
+        ] {
+            assert_eq!(
+                decide(spoken).0,
+                Decision::Ignored,
+                "«{spoken}» should not be a command"
+            );
+        }
     }
 
     #[test]

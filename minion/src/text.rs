@@ -132,6 +132,11 @@ fn words_match(a: &str, b: &str, strict: bool) -> bool {
     edit_distance(a, b) <= 1
 }
 
+/// How many single-character edits separate two words.
+pub fn edits_between(a: &str, b: &str) -> usize {
+    edit_distance(a, b)
+}
+
 /// Levenshtein distance, bailing out once the length gap alone exceeds two.
 fn edit_distance(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
