@@ -436,6 +436,7 @@ pub struct Preferences {
     window: Retained<NSWindow>,
     sounds: Switch,
     log_voices: Switch,
+    recordings: Switch,
     at_login: Switch,
     speak: Switch,
     wake_word: Retained<NSTextField>,
@@ -580,6 +581,15 @@ impl Preferences {
         layout.hint(
             "Con el micrófono abierto se transcribe todo lo que se habla cerca. \
              Normalmente solo se cuenta cuánto se oyó, no qué se dijo.",
+            INDENT,
+        );
+        let recordings = layout.checkbox(
+            "Guardar lo que oye en archivos de audio",
+            settings.save_recordings,
+        );
+        layout.hint(
+            "Guarda cada frase como WAV en ~/Library/Application \
+             Support/Minion/recordings. Actívalo solo mientras depuras.",
             INDENT,
         );
         let at_login = layout.checkbox("Abrir al iniciar sesión", startup::enabled());
@@ -803,6 +813,7 @@ impl Preferences {
             window,
             sounds,
             log_voices,
+            recordings,
             at_login,
             speak,
             wake_word,
@@ -896,6 +907,10 @@ impl Preferences {
         }
         if let Some(on) = self.log_voices.toggled() {
             save("log_ignored_speech", if on { "true" } else { "false" });
+            changed = true;
+        }
+        if let Some(on) = self.recordings.toggled() {
+            save("save_recordings", if on { "true" } else { "false" });
             changed = true;
         }
         if let Some(on) = self.at_login.toggled() {
