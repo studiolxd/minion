@@ -2826,5 +2826,26 @@ mod tests {
         // decides to `Unrecognised`.
         assert!(matches!(try_macro_step("haz un pino"), StepResult::Refused));
     }
+    #[test]
+    fn opposites_do_not_tie_when_said_clearly() {
+        // «activar» is contained in «desactivar»; containment must not make
+        // the two commands tie, or every «desactiva el wifi» would ask.
+        for (spoken, expected) in [
+            ("minion desactiva el wifi", "desactivar wifi"),
+            ("minion activa el wifi", "activar wifi"),
+        ] {
+            let ranked = decide_ranked(spoken, None);
+            let best = ranked.first().expect("a winner");
+            let second = ranked.get(1).map(|c| c.score).unwrap_or(0.0);
+            assert_eq!(best.decision, Decision::Run(expected), "{spoken}: {ranked:?}");
+            assert!(
+                best.score - second >= 0.1,
+                "{spoken} must win clearly, got {:.2} vs {:.2}: {ranked:?}",
+                best.score,
+                second
+            );
+        }
+    }
+
 }
 
