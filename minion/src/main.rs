@@ -1458,7 +1458,11 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                             note!("ai       «{text}»  ->  límite diario alcanzado");
                             ai::AiError::Budget.to_string()
                         }
-                        Err(why) => why.to_string(),
+                        Err(ai::AiError::NotConfigured(why)) => why,
+                        // The detail is already in the log (ai.rs writes
+                        // it); reading a parser error or a stack trace
+                        // aloud helps nobody.
+                        Err(_) => "No se ha entendido la respuesta de la IA.".to_string(),
                     };
                     set_status(&status, &last_utterance_tooltip(&part, &reply));
                     hud::push_update(hud::Update {
