@@ -562,12 +562,36 @@ fn repeat_request(rest: &str) -> Option<usize> {
     Some(times.min(MAX_REPEATS))
 }
 
+/// Whether the sentence asks for what follows to be typed out.
+///
+/// Wake word, then a dictation verb. Everything after that is content, so
+/// nothing in it may be read as a command — chaining included.
+fn is_dictation_phrase(transcript: &str) -> bool {
+    let words: Vec<&str> = transcript.split_whitespace().collect();
+    let (Some(first), Some(second)) = (words.first(), words.get(1)) else {
+        return false;
+    };
+    if !wake_words().contains(&normalise(first).as_str()) {
+        return false;
+    }
+    let verb = spanish::canonical_verb(&normalise(second)).to_string();
+    DICTATION_VERBS.contains(&verb.as_str())
+}
+
 /// Splits a sentence that holds more than one instruction.
 ///
 /// The wake word is carried onto each part, since only the first was
 /// spoken with it: "minion cierra la pestaña y luego recarga" becomes
 /// two sentences that each stand on their own.
-pub fn split_chain(transcript: &str) -> Vec<String> {
+///
+/// Nothing is split while dictating, and nothing is split unless the first
+/// half is itself an instruction — it opens with the wake word and is not
+/// a dictation. Otherwise "escribe hola y luego adiós" lost its text and
+/// the words the user was dictating came back as commands.
+pub fn split_chain(transcript: &str, dictating: bool) -> Vec<String> {
+    if dictating {
+        return vec![transcript.to_string()];
+    }
     let lowered = transcript.to_lowercase();
     let Some(joiner) = CHAIN_JOINERS.iter().find(|j| lowered.contains(*j)) else {
         return vec![transcript.to_string()];
@@ -582,9 +606,14 @@ pub fn split_chain(transcript: &str) -> Vec<String> {
     let Some(wake) = head.split_whitespace().next() else {
         return vec![transcript.to_string()];
     };
+    // Only an instruction can be chained: the head has to be addressed to
+    // Minion, and must not be dictation.
+    if strip_wake_word(&normalise(&head)).is_none() || is_dictation_phrase(&head) {
+        return vec![transcript.to_string()];
+    }
     let mut parts = vec![head.clone()];
     // The rest may itself be a chain.
-    for piece in split_chain(&format!("{wake} {tail}")) {
+    for piece in split_chain(&format!("{wake} {tail}"), false) {
         parts.push(piece);
     }
     parts
@@ -617,14 +646,7 @@ fn music_query(transcript: &str) -> Option<String> {
 /// them is content, however much it looks like a command.
 fn dictation_text(transcript: &str) -> Option<String> {
     let words: Vec<&str> = transcript.split_whitespace().collect();
-    if words.len() < 3 {
-        return None;
-    }
-    if !wake_words().contains(&normalise(words[0]).as_str()) {
-        return None;
-    }
-    let verb = spanish::canonical_verb(&normalise(words[1])).to_string();
-    if !DICTATION_VERBS.contains(&verb.as_str()) {
+    if words.len() < 3 || !is_dictation_phrase(transcript) {
         return None;
     }
     let text = words[2..].join(" ");
@@ -1655,12 +1677,12 @@ mod tests {
     #[test]
     fn splits_chained_instructions() {
         assert_eq!(
-            split_chain("Minion cierra la pestaña y luego recarga"),
+            split_chain("Minion cierra la pestaña y luego recarga", false),
             vec!["Minion cierra la pestaña", "Minion recarga"]
         );
         // Three in a row.
         assert_eq!(
-            split_chain("Minion copia esto y luego abre Chrome y después pega esto"),
+            split_chain("Minion copia esto y luego abre Chrome y después pega esto", false),
             vec![
                 "Minion copia esto",
                 "Minion abre Chrome",
@@ -1674,14 +1696,34 @@ mod tests {
         // Titles and dictated text are full of "y"; only explicit joiners
         // count, or "pon la canción tú y yo" would become two commands.
         assert_eq!(
-            split_chain("Minion pon la canción tú y yo"),
+            split_chain("Minion pon la canción tú y yo", false),
             vec!["Minion pon la canción tú y yo"]
         );
     }
 
     #[test]
+    fn dictated_text_is_never_chopped_into_commands() {
+        // The text is content: "y luego" belongs to it, not to Minion.
+        assert_eq!(
+            split_chain("Minion escribe hola y luego adiós", false),
+            vec!["Minion escribe hola y luego adiós"]
+        );
+        // And while dictating, nothing is a chain at all — this used to
+        // type "hola hola adiós".
+        assert_eq!(
+            split_chain("hola y luego adiós", true),
+            vec!["hola y luego adiós"]
+        );
+        // A sentence not addressed to Minion is left whole as well.
+        assert_eq!(
+            split_chain("quedamos y luego vemos", false),
+            vec!["quedamos y luego vemos"]
+        );
+    }
+
+    #[test]
     fn each_part_of_a_chain_still_resolves() {
-        let parts = split_chain("Minion cierra la pestaña y luego recarga");
+        let parts = split_chain("Minion cierra la pestaña y luego recarga", false);
         assert_eq!(decide(&parts[0]).0, Decision::Run("cerrar pestaña"));
         assert_eq!(decide(&parts[1]).0, Decision::Run("recargar"));
     }
