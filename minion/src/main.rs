@@ -8,6 +8,7 @@
 //! on its own.
 
 mod actions;
+mod ai;
 mod answers;
 mod api;
 mod audio;
@@ -2221,6 +2222,10 @@ fn main() -> Result<()> {
                  minion say \"texto\"          lo dice en voz alta\n  \
                  minion status               si Minion está escuchando o en pausa\n  \
                  minion mic                  qué apps usan ahora el micrófono\n  \
+                 minion ai \"pregunta\"        la responde con la IA configurada\n  \
+                 minion ai status            qué backend de IA hay y qué agentes\n  \
+                 minion ai set-key <prov>    guarda una clave en el llavero (por\n  \
+                 la entrada estándar)\n  \
                  minion stats [--days N]     informe de reconocimiento (todo el \
                  registro, o los últimos N días)\n  \
                  minion --help               esto\n\n\
@@ -2275,6 +2280,32 @@ fn main() -> Result<()> {
         }
         if argument == "status" {
             api::print_status();
+            return Ok(());
+        }
+        // The AI layer, from the terminal: the same engine a spoken
+        // question would reach, reading the same `[ai]` settings and
+        // spending from the same daily budget, with none of the audio
+        // machinery in the way.
+        if argument == "ai" {
+            ai::configure(&config::load());
+            match std::env::args().nth(2).as_deref() {
+                Some("status") | None => println!("{}", ai::status_text()),
+                Some("set-key") => {
+                    let Some(provider) = std::env::args().nth(3) else {
+                        eprintln!("Uso: minion ai set-key <proveedor>   (la clave se lee de la entrada estándar)");
+                        std::process::exit(1);
+                    };
+                    // The key is read from stdin, never from an argument:
+                    // `ps` shows every argument on this machine to every
+                    // process on it.
+                    if let Err(reason) = ai::set_key_from_stdin(&provider) {
+                        eprintln!("No se pudo guardar la clave: {reason}");
+                        std::process::exit(1);
+                    }
+                    println!("Clave guardada en el llavero para «{provider}».");
+                }
+                Some(text) => ai::run_from_terminal(text),
+            }
             return Ok(());
         }
         // For checking the automatic pause by hand: pick up a call, run

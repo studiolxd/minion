@@ -208,6 +208,84 @@ pub struct Config {
     /// a timer or a "¿qué suena?" would otherwise have nowhere to land.
     #[serde(default = "yes")]
     pub notifications: bool,
+
+    /// The optional AI layer — see `ai.rs`. Off unless `[ai] backend` names
+    /// something.
+    ///
+    /// Last in this struct on purpose, and last in the file it is read
+    /// from: this is a table, and a top-level key written after a table
+    /// header belongs to that table, which `deny_unknown_fields` then
+    /// rejects — taking every other setting down with it.
+    #[serde(default)]
+    pub ai: AiConfig,
+}
+
+/// The `[ai]` table: which model answers what the vocabulary cannot, and
+/// how much of it is allowed.
+///
+/// Everything optional, and `backend` empty by default, because sending
+/// what was said in a room to a service over the network is not something
+/// an always-on microphone should start doing on its own.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AiConfig {
+    /// Which backend: a CLI agent already installed and paid for
+    /// ("claude-code", "codex", "gemini-cli"), or an HTTP provider
+    /// ("openai", "anthropic", "deepseek", "mistral", "groq",
+    /// "openrouter", "xai", "gemini", "ollama", "lmstudio"). Empty turns
+    /// the whole thing off.
+    #[serde(default)]
+    pub backend: String,
+
+    /// Which model. Empty takes the backend's own default.
+    #[serde(default)]
+    pub model: String,
+
+    /// What the AI is allowed to be used for: "questions" (a question the
+    /// built-in answers could not handle) and "unknown" (a phrase the
+    /// vocabulary did not recognise, which the model may be able to match
+    /// to a command). Named `use` in the file.
+    #[serde(rename = "use", default = "default_ai_uses")]
+    pub uses: Vec<String>,
+
+    /// Requests allowed per day, counted in `ai-usage.toml` next to this
+    /// file. Zero means no limit.
+    pub daily_limit: Option<u32>,
+
+    /// Minutes without a question before the conversation — and any warm
+    /// agent process behind it — is dropped, the same way the speech model
+    /// is unloaded when nobody is talking.
+    pub idle_minutes: Option<u64>,
+
+    /// The key for an HTTP provider, either written here or the word
+    /// "keychain" to read it from the macOS keychain instead (put it there
+    /// with `minion ai set-key <backend>`).
+    #[serde(default)]
+    pub api_key: String,
+
+    /// Overrides the provider's base URL, for one that is not in the list
+    /// or a proxy in front of one that is.
+    #[serde(default)]
+    pub base_url: String,
+}
+
+/// What `[ai] use` means when the table does not say.
+fn default_ai_uses() -> Vec<String> {
+    vec!["questions".to_string()]
+}
+
+impl Default for AiConfig {
+    fn default() -> Self {
+        Self {
+            backend: String::new(),
+            model: String::new(),
+            uses: default_ai_uses(),
+            daily_limit: None,
+            idle_minutes: None,
+            api_key: String::new(),
+            base_url: String::new(),
+        }
+    }
 }
 
 /// How Minion decides when to listen.
@@ -316,6 +394,7 @@ impl Default for Config {
             search_engine: None,
             ask_before_learning: true,
             notifications: true,
+            ai: AiConfig::default(),
         }
     }
 }

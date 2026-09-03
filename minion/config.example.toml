@@ -214,3 +214,58 @@
 # (or YouTube, Wikipedia, Amazon, or "el Finder") always names its own,
 # regardless of this setting. Default "google".
 # search_engine = "google"
+
+# ---------------------------------------------------------------------
+# The AI layer. Optional, and off unless "backend" names something.
+#
+# What is sent is text — the transcript the recogniser already produced,
+# the same thing that already goes in the log — never audio. Every
+# request is written down as:
+#   ai       «¿cuánto es el 15 % de 340?»  ->  claude-code (2.1 s)
+#
+# This whole section must stay at the END of the file. A top-level key
+# written after a table header belongs to that table, and one that does
+# not belong there invalidates the whole file.
+
+# [ai]
+
+# Which backend. Either an agent you already have installed and pay for:
+#   "claude-code"   Claude Code, kept warm as one process, keeps context
+#   "codex"         Codex, one process per question, no context
+#   "gemini-cli"    Gemini CLI, one process per question, no context
+# or an HTTP provider (these need "api_key"):
+#   "openai" "anthropic" "deepseek" "mistral" "groq" "openrouter" "xai"
+#   "gemini"
+# or one running on this machine (no key needed):
+#   "ollama"        http://localhost:11434/v1
+#   "lmstudio"      http://localhost:1234/v1
+# backend = "claude-code"
+
+# Which model. Empty (or absent) takes the backend's own default —
+# "claude-opus-5" for "anthropic", the fast small model for the rest.
+# model = ""
+
+# What the AI is allowed to be used for:
+#   "questions"  a question the built-in answers could not handle
+#   "unknown"    a phrase the vocabulary did not recognise, which the
+#                model may be able to match to a command you already have
+# Default ["questions"].
+# use = ["questions"]
+
+# Requests allowed per day. Counted in ai-usage.toml, next to this file,
+# and reset on the first request of a new day. 0 means no limit.
+# daily_limit = 200
+
+# Minutes without a question before the conversation is forgotten and any
+# warm agent process is closed — the same idea as unload_after_minutes
+# for the speech model. The next question then starts from nothing.
+# idle_minutes = 10
+
+# The key, for an HTTP provider. Either written here, or the word
+# "keychain" to keep it in the macOS keychain instead:
+#   pbpaste | minion ai set-key openai
+# api_key = "keychain"
+
+# Overrides the provider's base URL — for one that is not in the list, or
+# a proxy in front of one that is. Empty uses the provider's own.
+# base_url = ""
