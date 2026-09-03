@@ -270,8 +270,12 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
     let mut undoable: Option<Undoable> = None;
     note!("Model loaded. {}", resident_memory());
 
+    // How long to stay deaf after speaking: the segmenter needs
+    // `silence_end_ms` of quiet before it closes an utterance, so anything
+    // shorter hands Minion its own answer just after the flag comes down.
+    let speech_tail = Duration::from_millis(settings.silence_end_ms as u64 + 200);
     let listener =
-        audio::start(settings, Arc::clone(&active), microphone)
+        audio::start(settings, Arc::clone(&active), microphone, Arc::clone(&deaf))
             .context("opening the microphone")?;
     note!(
         "Microphone: {} Hz, {} channel(s). {} phrases understood.",
@@ -495,6 +499,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                                 settings.rate,
                                 settings.device.as_deref(),
                                 &deaf,
+                                speech_tail,
                             );
                             // Whatever arrived while it was talking is its
                             // own voice, or was said over it. Either way it

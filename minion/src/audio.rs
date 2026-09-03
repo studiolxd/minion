@@ -464,14 +464,35 @@ impl Segmenter {
             speech_end: self.speech_end.max(self.speech_start),
             samples,
         };
+        self.reset();
+
+        long_enough.then_some(utterance)
+    }
+
+    /// Forgets whatever was being collected.
+    fn reset(&mut self) {
+        self.current.clear();
         self.speaking = false;
         self.speech_blocks = 0;
         self.silence_blocks = 0;
         self.speech_start = 0;
         self.speech_end = 0;
         self.preroll.clear();
+    }
 
-        long_enough.then_some(utterance)
+    /// Feeds one block unless Minion is talking.
+    ///
+    /// It listens continuously, so its own answers come straight back in
+    /// through the microphone. Discarding the blocks is not enough on its
+    /// own: an utterance that was already open when it started speaking
+    /// would otherwise be closed by the reply and handed on as if someone
+    /// had said it, so that one is dropped too.
+    fn push_unless_deaf(&mut self, block: &[f32], deaf: bool) -> Option<Utterance> {
+        if deaf {
+            self.reset();
+            return None;
+        }
+        self.push(block)
     }
 }
 
@@ -566,6 +587,7 @@ pub fn start(
     settings: Settings,
     active: Arc<AtomicBool>,
     preferred: Option<String>,
+    deaf: Arc<AtomicBool>,
 ) -> Result<Listener> {
     let queue = Arc::new(Mutex::new(Vec::<f32>::new()));
     let (stream, source_hz, channels, device_id) =
@@ -640,8 +662,9 @@ pub fn start(
                 continue;
             }
 
+            let speaking_now = deaf.load(Ordering::Relaxed);
             for block in pending.chunks(BLOCK_SAMPLES) {
-                let utterance = segmenter.push(block);
+                let utterance = segmenter.push_unless_deaf(block, speaking_now);
                 // Announced while it is still being spoken, not when it
                 // ends: whoever is waiting has work it can start now.
                 if segmenter.speaking {
@@ -756,6 +779,29 @@ mod tests {
             speech_end: 3,
         };
         assert!(backwards.speech().is_empty());
+    }
+
+    #[test]
+    fn nothing_heard_while_minion_is_speaking_becomes_an_utterance() {
+        // Its own voice, arriving through the microphone while it talks.
+        let mut segmenter = Segmenter::new(Settings::default());
+        for block in blocks_of(0.2, 100) {
+            assert!(segmenter.push_unless_deaf(&block, true).is_none());
+        }
+        // And the silence that follows must not close anything either:
+        // there is nothing open to close.
+        let done = feed(&mut segmenter, blocks_of(0.0, 80));
+        assert!(done.is_empty(), "its own voice must not become an order");
+    }
+
+    #[test]
+    fn an_utterance_open_when_minion_starts_speaking_is_dropped() {
+        // Half a sentence plus Minion's reply is not a sentence.
+        let mut segmenter = Segmenter::new(Settings::default());
+        feed(&mut segmenter, blocks_of(0.2, 50));
+        assert!(segmenter.push_unless_deaf(&vec![0.2; BLOCK_SAMPLES], true).is_none());
+        let done = feed(&mut segmenter, blocks_of(0.0, 80));
+        assert!(done.is_empty(), "what was half-said should be forgotten");
     }
 
     #[test]

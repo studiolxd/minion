@@ -129,7 +129,9 @@ pub fn run(model_path: &str) -> Result<()> {
     println!("con tu tono normal y a la distancia a la que sueles hablarle.\n");
 
     let active = Arc::new(AtomicBool::new(true));
-    let listener = audio::start(audio::Settings::default(), Arc::clone(&active), None)?;
+    // Nothing speaks during enrolment, so nothing ever goes deaf.
+    let deaf = Arc::new(AtomicBool::new(false));
+    let listener = audio::start(audio::Settings::default(), Arc::clone(&active), None, deaf)?;
 
     let mut collected = Vec::new();
     for (number, prompt) in PROMPTS.iter().enumerate().take(SENTENCES) {
