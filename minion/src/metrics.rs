@@ -80,7 +80,11 @@ fn parse_line(line: &str) -> Option<(&str, Event<'_>)> {
         }
     } else if rest.starts_with("blank    ") {
         Event::Blank
-    } else if let Some(after) = rest.strip_prefix("voice    matched at ") {
+    } else if let Some(after) = rest
+        .strip_prefix("voice    ")
+        .and_then(|line| line.split_once("matched at "))
+        .map(|(_, score)| score)
+    {
         let likeness: f32 = after.trim().parse().ok()?;
         Event::VoiceMatched { likeness }
     } else if rest.starts_with("window   «") {
@@ -615,6 +619,16 @@ mod tests {
 2026-09-01 12:00:00  ran      «Minion Chrome.»  ->  abrir Chrome  [100% · 1.0s audio · 100 ms]\n\
 2026-09-01 12:00:01  voice    matched at 0.90\n";
         assert!(advice(&analyse(comfortable, None, 0.32)).contains("Todo va bien"));
+    }
+
+    #[test]
+    fn a_voice_match_reads_with_or_without_a_name() {
+        // Profiles have names now — "voice    Ana matched at 0.61" — but a
+        // log written before they did is still the same file.
+        let named = "2026-09-01 12:00:01  voice    Ana matched at 0.35\n";
+        assert!(advice(&analyse(named, None, 0.32)).contains("margen de voz"));
+        let unnamed = "2026-09-01 12:00:01  voice    matched at 0.35\n";
+        assert!(advice(&analyse(unnamed, None, 0.32)).contains("margen de voz"));
     }
 
     #[test]

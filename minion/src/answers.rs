@@ -35,6 +35,8 @@ pub enum Question {
     Volume,
     Listening,
     Activity,
+    /// "¿quién soy?" — which enrolled voice the speaker check just matched.
+    WhoAmI,
     /// What can I say? Opens the list rather than reciting it.
     Help,
     /// "pon un temporizador de cinco minutos" — how long, and the words
@@ -76,6 +78,7 @@ const ASKED: &[(Question, &[&str])] = &[
     (Question::Volume, &["que volumen tengo", "como esta el volumen"]),
     (Question::Listening, &["me oyes", "me escuchas", "estas ahi"]),
     (Question::Activity, &["que he dicho hoy", "cuantas ordenes llevo"]),
+    (Question::WhoAmI, &["quien soy", "sabes quien soy", "quien te esta hablando"]),
     (Question::CancelTimer, &["cancela el temporizador", "cancela la alarma", "quita el temporizador"]),
     (Question::TimeLeft, &["cuanto queda", "cuanto falta", "cuanto queda del temporizador"]),
     (Question::NowPlaying, &["que suena", "que esta sonando", "que cancion es esta", "que se esta escuchando"]),
@@ -167,6 +170,14 @@ pub fn answer(question: Question, listening: bool) -> String {
             if listening { "Sí, te escucho." } else { "Estoy en pausa." }.to_string()
         }
         Question::Activity => activity(),
+        // Whoever the speaker check recognised last, which for the
+        // utterance carrying this question is the person asking. No
+        // profiles, or a voice let through unchecked, and there is nobody
+        // to name — better said plainly than guessed at.
+        Question::WhoAmI => match crate::speaker::last_matched() {
+            Some(name) => format!("Eres {name}."),
+            None => "Todavía no sé quién eres; no tengo tu voz registrada.".into(),
+        },
         // Answered by opening the window: reading forty commands aloud
         // would be worse than useless.
         Question::Help => "Te abro la lista.".into(),

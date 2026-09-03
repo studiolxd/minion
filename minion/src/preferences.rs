@@ -500,6 +500,52 @@ impl Press {
     }
 }
 
+/// How many enrolled voices the window shows.
+///
+/// A household, not a call centre: six rows is more than anyone has asked
+/// for, and the rest — if there ever are any — still work, they are simply
+/// managed by deleting a file. The rows are built with the window, so this
+/// is a fixed number rather than a list that grows.
+const MAX_VOICE_ROWS: usize = 6;
+
+/// What the line above the list says about who Minion knows.
+fn voices_summary(enrolled: &[String]) -> String {
+    match enrolled {
+        [] => "Ahora obedece a cualquiera que diga la palabra clave.".to_string(),
+        [only] => format!("Minion solo obedece a {only}."),
+        many => format!("Minion obedece a {} voces.", many.len()),
+    }
+}
+
+/// One enrolled voice in the list: the name, and the way to forget it.
+struct ProfileRow {
+    name: std::cell::RefCell<String>,
+    label: Retained<NSTextField>,
+    forget: Press,
+}
+
+impl ProfileRow {
+    /// Shows this row as `name`, or hides it when there is nobody left.
+    fn show(&self, name: Option<&str>) {
+        match name {
+            Some(name) => {
+                *self.name.borrow_mut() = name.to_string();
+                self.label.setStringValue(&NSString::from_str(name));
+                self.label.setHidden(false);
+                self.forget.control.setHidden(false);
+                self.forget.control.setAccessibilityLabel(Some(&NSString::from_str(
+                    &format!("Olvidar la voz de {name}"),
+                )));
+            }
+            None => {
+                self.name.borrow_mut().clear();
+                self.label.setHidden(true);
+                self.forget.control.setHidden(true);
+            }
+        }
+    }
+}
+
 pub struct Preferences {
     window: Retained<NSWindow>,
     sounds: Switch,
@@ -545,8 +591,15 @@ pub struct Preferences {
     cancel_train: Press,
     cancel_requested: Cell<bool>,
     restart_requested: Cell<bool>,
-    /// Deletes the voice profile, after asking.
-    forget: Press,
+    /// The name to file the voice about to be trained under.
+    new_name: Retained<NSTextField>,
+    /// One row per enrolled voice: who it is, and a button to forget them.
+    ///
+    /// Built once, since the window is too: the rows beyond the voices
+    /// currently enrolled are hidden rather than absent, and
+    /// [`Preferences::show_profiles`] fills them in again whenever the list
+    /// changes.
+    profiles: Vec<ProfileRow>,
     /// The button's state last time it was read, to notice a click without
     /// an Objective-C target — see the note at the top of this file.
     button_clicks: Cell<isize>,
@@ -679,16 +732,23 @@ impl Preferences {
         // Directly under the behaviour it changes, and above the fold: in
         // a window that scrolls, a section at the bottom is one nobody
         // finds, and this is the one that decides who Minion obeys.
-        layout.heading("Tu voz");
-        let trained = crate::speaker::has_profile();
+        layout.heading("Voces");
+        let enrolled = crate::speaker::profile_names();
+        layout.field_label("Nombre de la voz");
+        let new_name = NSTextField::new(mtm);
+        new_name.setStringValue(&NSString::from_str(if enrolled.is_empty() {
+            crate::speaker::DEFAULT_NAME
+        } else {
+            ""
+        }));
+        new_name.setFrame(narrow(layout.place(spacing::FIELD, 0.0), 170.0));
+        layout.add_control(&new_name, "Nombre de la voz");
+        layout.gap(spacing::SIBLING);
+
         // Safety: no target and no action, so nothing is called back into.
         let train = unsafe {
             NSButton::buttonWithTitle_target_action(
-                &NSString::from_str(if trained {
-                    "Volver a entrenar"
-                } else {
-                    "Entrenar mi voz"
-                }),
+                &NSString::from_str("Añadir una voz…"),
                 None,
                 None,
                 mtm,
@@ -696,7 +756,7 @@ impl Preferences {
         };
         let voice_row = layout.place(spacing::BUTTON, 0.0);
         train.setFrame(narrow(voice_row, 170.0));
-        layout.add_control(&train, "Entrenar mi voz");
+        layout.add_control(&train, "Añadir una voz");
         // Safety: no target and no action, so nothing is called back into.
         let cancel_train = unsafe {
             NSButton::buttonWithTitle_target_action(
@@ -722,31 +782,46 @@ impl Preferences {
         };
         let train_status = plain_label(
             mtm,
-            if trained {
-                "Minion solo obedece a tu voz."
-            } else {
-                "Ahora obedece a cualquiera que diga la palabra clave."
-            },
+            &voices_summary(&enrolled),
             train_status_frame,
         );
         train_status.setFont(Some(&NSFont::systemFontOfSize(13.0)));
         layout.add(&train_status);
         layout.gap(spacing::SIBLING);
 
-        // Safety: no target and no action, so nothing is called back into.
-        let forget = unsafe {
-            NSButton::buttonWithTitle_target_action(
-                &NSString::from_str("Olvidar mi voz"),
-                None,
-                None,
-                mtm,
-            )
-        };
-        forget.setFrame(narrow(layout.place(spacing::BUTTON, 0.0), 170.0));
-        layout.add_control(&forget, "Olvidar mi voz");
+        // One row per voice, plus a spare: the window is built once and its
+        // layout is fixed, so a voice added while it is open needs a row
+        // waiting for it. Only the spare is ever blank — reserving six rows
+        // for a household that has one would leave a hole in the window.
+        let rows = (enrolled.len() + 1).min(MAX_VOICE_ROWS);
+        let mut profiles = Vec::with_capacity(rows);
+        for index in 0..rows {
+            let row = layout.place(spacing::BUTTON, 0.0);
+            let label = plain_label(mtm, "", narrow(row, 170.0));
+            layout.add(&label);
+            // Safety: no target and no action, so nothing is called back into.
+            let button = unsafe {
+                NSButton::buttonWithTitle_target_action(
+                    &NSString::from_str("Olvidar"),
+                    None,
+                    None,
+                    mtm,
+                )
+            };
+            button.setFrame(beside(row, 170.0, 110.0));
+            layout.add(&button);
+            layout.gap(spacing::SIBLING);
+            let entry = ProfileRow {
+                name: std::cell::RefCell::new(String::new()),
+                label,
+                forget: Press::new(button),
+            };
+            entry.show(enrolled.get(index).map(String::as_str));
+            profiles.push(entry);
+        }
         layout.hint(
-            "Borra el perfil de voz. Minion volverá a obedecer a cualquiera \
-             que diga la palabra clave.",
+            "Cada voz se entrena diciendo cinco frases. Todas pueden hacer lo \
+             mismo: el nombre solo sirve para el registro y para «¿quién soy?».",
             0.0,
         );
 
@@ -1001,7 +1076,8 @@ impl Preferences {
             cancel_train: Press::new(cancel_train),
             cancel_requested: Cell::new(false),
             restart_requested: Cell::new(false),
-            forget: Press::new(forget),
+            new_name,
+            profiles,
         };
         preferences.update_readouts();
         preferences
@@ -1229,12 +1305,25 @@ impl Preferences {
             self.cancel_requested.set(true);
             self.cancel_train.control.setHidden(true);
             // Not through `show_training`: a cancelled session leaves the
-            // button saying «Entrenar mi voz», since nothing was learned.
+            // list as it was, since nothing was learned.
             self.train_status
                 .setStringValue(&NSString::from_str("Entrenamiento cancelado."));
         }
-        if self.forget.clicked() {
-            self.forget_voice();
+        // Each voice has its own «Olvidar»: forgetting one must not touch
+        // the rest, which a single button for "the profile" could not do.
+        // Every row is read, not just up to the first click: a `Press` that
+        // is not polled keeps the state it was left in and reports the
+        // click again on the next tick.
+        let mut forgotten: Option<String> = None;
+        for row in &self.profiles {
+            let clicked = row.forget.clicked();
+            let name = row.name.borrow().clone();
+            if clicked && forgotten.is_none() && !name.is_empty() {
+                forgotten = Some(name);
+            }
+        }
+        if let Some(name) = forgotten {
+            self.forget_voice(&name);
             changed = true;
         }
 
@@ -1266,11 +1355,13 @@ impl Preferences {
         self.restart_requested.replace(false)
     }
 
-    /// Whether the person just asked to train their voice.
+    /// Who the person just asked to train, if they did.
     ///
     /// Cleared by asking, since only the loop that owns the microphone can
-    /// act on it.
-    pub fn take_training_request(&self) -> bool {
+    /// act on it. The name comes from the field beside the button; an empty
+    /// one becomes «yo», which is also what the profile of the versions
+    /// before names is called.
+    pub fn take_training_request(&self) -> Option<String> {
         let clicks = self.train.state();
         if clicks != self.train_clicks.get() {
             self.train_clicks.set(clicks);
@@ -1278,7 +1369,13 @@ impl Preferences {
                 self.train_requested.set(true);
             }
         }
-        self.train_requested.replace(false)
+        if !self.train_requested.replace(false) {
+            return None;
+        }
+        let typed = self.new_name.stringValue().to_string();
+        let name = crate::speaker::tidy_name(&typed);
+        self.new_name.setStringValue(&NSString::from_str(&name));
+        Some(name)
     }
 
     /// Shows how training is going.
@@ -1288,8 +1385,27 @@ impl Preferences {
         // of: five phrases is long enough to change your mind.
         self.cancel_train.control.setHidden(finished);
         if finished {
-            self.train
-                .setTitle(&NSString::from_str("Volver a entrenar"));
+            // A voice may have just joined the list, so read it again
+            // rather than assuming what is in it.
+            self.show_profiles();
+        }
+    }
+
+    /// Fills the list of voices in from what is on disk.
+    ///
+    /// There are only so many rows — see [`MAX_VOICE_ROWS`] — and the rest,
+    /// if a machine ever has that many people on it, are managed by
+    /// deleting a file in `voices/`.
+    fn show_profiles(&self) {
+        let enrolled = crate::speaker::profile_names();
+        for (index, row) in self.profiles.iter().enumerate() {
+            row.show(enrolled.get(index).map(String::as_str));
+        }
+        if enrolled.len() > self.profiles.len() {
+            crate::journal::write(&format!(
+                "{} voices enrolled, more than the settings window shows",
+                enrolled.len()
+            ));
         }
     }
 
@@ -1305,37 +1421,40 @@ impl Preferences {
         self.cancel_requested.replace(false)
     }
 
-    /// Deletes the voice profile, once.
+    /// Deletes one voice profile, once.
     ///
     /// Asked about first: it is the one setting here that cannot be undone
-    /// without saying five phrases again.
-    fn forget_voice(&self) {
-        let Some(path) = crate::speaker::profile_path() else {
-            return;
-        };
-        if !path.exists() {
-            self.show_training("No hay ninguna voz que olvidar.", true);
-            return;
-        }
+    /// without saying five phrases again. Forgetting the last one leaves
+    /// Minion obeying anybody again, so that case says so.
+    fn forget_voice(&self, name: &str) {
         if !crate::actions::ask(
-            "¿Olvidar tu voz? Minion volverá a obedecer a cualquiera que diga \
-             la palabra clave.",
+            &format!("¿Olvidar la voz de {name}? Habrá que volver a entrenarla."),
             "Olvidar",
         ) {
             return;
         }
-        match std::fs::remove_file(&path) {
+        match crate::speaker::forget_profile(name) {
             Ok(()) => {
-                crate::journal::write("voice profile deleted from the settings window");
-                self.train.setTitle(&NSString::from_str("Entrenar mi voz"));
-                self.show_training(
-                    "Voz olvidada. Reinicia Minion para que deje de reconocerte.",
-                    true,
-                );
+                crate::journal::write(&format!(
+                    "voice profile «{name}» deleted from the settings window"
+                ));
+                self.show_profiles();
+                let left = crate::speaker::profile_names();
+                self.train_status.setStringValue(&NSString::from_str(
+                    &if left.is_empty() {
+                        "Voz olvidada. Reinicia Minion: volverá a obedecer a \
+                         cualquiera que diga la palabra clave."
+                            .to_string()
+                    } else {
+                        format!("{name} olvidada. Reinicia Minion para que deje de reconocerla.")
+                    },
+                ));
             }
             Err(e) => {
                 crate::journal::write(&format!("could not delete the voice profile: {e}"));
-                self.show_training("No se pudo borrar el perfil de voz.", true);
+                self.train_status.setStringValue(&NSString::from_str(
+                    "No se pudo borrar el perfil de voz.",
+                ));
             }
         }
     }

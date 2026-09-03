@@ -478,7 +478,8 @@ fn load_model(model_path: &str) -> Result<ParakeetTDT> {
 
 struct Voice {
     model: speaker::Speaker,
-    profile: speaker::Embedding,
+    /// Everyone enrolled. Empty means nobody is, and anyone is obeyed.
+    profiles: Vec<speaker::Profile>,
     threshold: f32,
 }
 
@@ -779,7 +780,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                     Ok(model) => {
                         voice = Some(Voice {
                             model,
-                            profile: Vec::new(),
+                            profiles: Vec::new(),
                             threshold: f32::MAX, // nothing matches until trained
                         });
                     }
@@ -797,10 +798,13 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                 if let Some(active_session) = session.as_mut() {
                     if active_session.accept(embedding) {
                         note!("voice training finished");
-                        // Adopt what was just learned, without a restart.
-                        if let Some(profile) = speaker::load_profile_for(&model_path) {
+                        // Adopt what was just learned, without a restart —
+                        // and re-read the lot, since the new voice joins
+                        // whoever was already enrolled.
+                        let profiles = speaker::load_profiles_for(&model_path);
+                        if !profiles.is_empty() {
                             if let Some(v) = voice.as_mut() {
-                                v.profile = profile;
+                                v.profiles = profiles;
                                 v.threshold = config_voice_threshold();
                             }
                         }
@@ -815,11 +819,19 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
         if let Some(voice) = voice.as_mut() {
             // A model loaded for training but with no profile yet means
             // there is nothing to compare against, so anyone is obeyed.
-            let known_voice = !voice.profile.is_empty();
+            let known_voice = !voice.profiles.is_empty();
             if known_voice {
                 match voice.model.embed(utterance.speech()) {
                     Some(heard) => {
-                        let likeness = speaker::similarity(&heard, &voice.profile);
+                        // Whoever it sounds most like, and only then whether
+                        // it sounds like them enough. Everyone enrolled may
+                        // do everything: the name is for the log and for
+                        // «¿quién soy?», never a permission.
+                        let Some((name, likeness)) =
+                            speaker::best_match(&voice.profiles, &heard)
+                        else {
+                            continue;
+                        };
                         if likeness < voice.threshold {
                             note!("heard    {seconds:.1}s in another voice ({likeness:.2})");
                             continue;
@@ -827,7 +839,8 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                         // Logged on the way through as well: without both
                         // sides, there is no way to tell a threshold that
                         // is too high from a profile that is wrong.
-                        note!("voice    matched at {likeness:.2}");
+                        note!("voice    {name} matched at {likeness:.2}");
+                        speaker::remember_match(name);
                     }
                     // Under the hard floor: a cough, a door, half a
                     // syllable. Let through, but say so, because this is
@@ -1788,9 +1801,9 @@ fn run_menu_bar(
             std::process::exit(0);
         }
         // Voice training: the window asks, the listening loop answers.
-        if panel_for_timer.take_training_request() {
+        if let Some(name) = panel_for_timer.take_training_request() {
             if let Ok(mut session) = training_for_timer.lock() {
-                *session = Some(enroll::Session::starting(training_model_path.clone()));
+                *session = Some(enroll::Session::starting(training_model_path.clone(), &name));
                 panel_for_timer.show_training(
                     &session.as_ref().map_or(String::new(), |s| s.message.clone()),
                     false,
@@ -2439,7 +2452,8 @@ fn main() -> Result<()> {
                  minion                      escucha y obedece (el uso normal)\n  \
                  minion <ruta-al-modelo>     igual, con el modelo de esa carpeta\n  \
                  minion learn [--apply]      convierte en alias lo que no entendió\n  \
-                 minion enroll               aprende tu voz desde la terminal\n  \
+                 minion enroll [nombre]      aprende una voz desde la terminal\n\
+                 \x20                            (sin nombre, la guarda como «yo»)\n  \
                  minion export-icon <dir>    guarda el icono como .iconset\n  \
                  minion run \"orden\"          la ejecuta, como si la hubieras dicho\n  \
                  minion say \"texto\"          lo dice en voz alta\n  \
@@ -2475,7 +2489,12 @@ fn main() -> Result<()> {
         }
         if argument == "enroll" {
             let model_path = locate_model(None)?;
-            return enroll::run(&model_path);
+            // Without a name the profile is «yo», which is what the single
+            // profile of earlier versions becomes when it is migrated.
+            let name = std::env::args()
+                .nth(2)
+                .unwrap_or_else(|| speaker::DEFAULT_NAME.to_string());
+            return enroll::run(&model_path, &name);
         }
         if argument == "learn" {
             let apply = std::env::args().any(|a| a == "--apply");
@@ -2605,18 +2624,24 @@ fn main() -> Result<()> {
     let training: Training = Arc::new(Mutex::new(None));
     let worker_training = Arc::clone(&training);
 
-    let voice = match speaker::load_profile_for(&model_path) {
-        Some(profile) => match speaker::Speaker::load(&model_path) {
+    let profiles = speaker::load_profiles_for(&model_path);
+    let voice = if profiles.is_empty() {
+        None
+    } else {
+        match speaker::Speaker::load(&model_path) {
             Ok(model) => {
-                note!("Voice profile loaded — only your voice will be obeyed.");
-                Some(Voice { model, profile, threshold: config.voice_threshold() })
+                let names: Vec<&str> = profiles.iter().map(|p| p.name.as_str()).collect();
+                note!(
+                    "Voice profiles loaded ({}) — only these voices will be obeyed.",
+                    names.join(", ")
+                );
+                Some(Voice { model, profiles, threshold: config.voice_threshold() })
             }
             Err(e) => {
-                note!("Voice profile found but the speaker model would not load: {e:#}");
+                note!("Voice profiles found but the speaker model would not load: {e:#}");
                 None
             }
-        },
-        None => None,
+        }
     };
 
     note!("Minion starting — loading model…");

@@ -67,7 +67,7 @@ run to Application Support; the bundle is ~29 MB.
 | What | Path |
 |---|---|
 | Config | `~/Library/Application Support/Minion/config.toml` |
-| Voice profile | `~/Library/Application Support/Minion/voice.txt` |
+| Voice profiles | `~/Library/Application Support/Minion/voices/<name>.txt` (the older single `voice.txt` is copied into it on first run and kept) |
 | Models | `~/Library/Application Support/Minion/model/` |
 | Single-instance lock | `~/Library/Application Support/Minion/running.lock` |
 | Log | `~/Library/Logs/minion.log` |
@@ -86,7 +86,7 @@ ran      «Minion Chrome.»  ->  abrir Chrome  [100% · 1.6s audio · 142 ms]
 unknown  «Minium so fuddy.»  ->  not understood      # wake word ok, command not
 heard    1.5s of speech, not addressed to me          # wake word not recognised
 heard    4.8s in another voice (-0.01)                # speaker check failed
-voice    matched at 0.58                              # speaker check passed
+voice    Ana matched at 0.58                          # speaker check passed
 blank    1.8s of audio, nothing recognised            # Parakeet returned nothing
 ```
 
@@ -216,7 +216,9 @@ was considered and rejected on that data.
   dropping fillers: "para" is both a filler and the imperative of "parar",
   and dropping first turned "para la música" into just `[musica]`, which
   paused Spotify instead of opening it.
-- `speaker.rs` — ECAPA-TDNN embeddings, cosine similarity, threshold
+- `speaker.rs` — ECAPA-TDNN embeddings, cosine similarity, one file per
+  enrolled voice in `voices/` (the best match above the threshold decides
+  who spoke; every voice may do everything, there are no tiers), threshold
   **0.32** (measured on real mic audio: worst 0.38, avg 0.57; 0.45 rejected
   the owner). Verifies short clips by tiling them up to a working length
   instead of waving them through unchecked, and embeds only the speech
