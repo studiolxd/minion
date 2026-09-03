@@ -468,11 +468,6 @@ fn take_request() -> Option<bool> {
 /// second line while dictating.
 static DICTATION_TEXT: OnceLock<Mutex<String>> = OnceLock::new();
 
-// Not called yet — see the wiring note above. A binary crate has no public
-// API of its own, so an unwired `pub fn` reads as dead code until the
-// listening loop's one line is added; suppressed rather than left as a
-// warning nobody asked for.
-#[allow(dead_code)]
 pub fn set_dictation_text(text: &str) {
     let cell = DICTATION_TEXT.get_or_init(|| Mutex::new(String::new()));
     if let Ok(mut slot) = cell.lock() {
@@ -497,8 +492,6 @@ fn dictation_text() -> String {
 /// `Some(_)`, or `session.question_timed_out` returning `Some(_)`.
 static QUESTION_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-// Not called yet either — same wiring note as `set_dictation_text`.
-#[allow(dead_code)]
 pub fn set_question_pending(pending: bool) {
     QUESTION_PENDING.store(pending, std::sync::atomic::Ordering::Relaxed);
 }

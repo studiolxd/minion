@@ -674,6 +674,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
         // whenever somebody next speaks.
         if let Some(phrase) = session.question_timed_out(Instant::now()) {
             note!("declined «{phrase}»  ->  no answer");
+            hud::set_question_pending(false);
         }
         // A bounded wait, so idleness can be noticed while nothing is being
         // said. A plain recv() would block until the next utterance, and
@@ -885,6 +886,11 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
             let now = Instant::now();
             if let Some(phrase) = session.question_timed_out(now) {
                 note!("declined «{phrase}»  ->  no answer");
+                hud::set_question_pending(false);
+            }
+            // Whatever was said now, the pending question is over.
+            if session.question_open(now) {
+                hud::set_question_pending(false);
             }
             // A question that is still open takes precedence over
             // everything else, the conversation window included: what was
@@ -1015,6 +1021,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                 // to answer in.
                 ask_aloud(&question.text);
                 session.open_question(&resolved.phrase, question, Instant::now());
+                hud::set_question_pending(true);
                 continue;
             }
 
@@ -1027,6 +1034,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                 }
                 Outcome::LeaveDictation => {
                     transformer = None;
+                    hud::set_dictation_text("");
                     dictating.store(false, Ordering::Relaxed);
                     note!("dictation ended");
                 }
@@ -1044,6 +1052,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                         .as_mut()
                         .map(|t| t.render(&typed))
                         .unwrap_or_else(|| typed.clone());
+                    hud::set_dictation_text(&rendered);
                     match actions::type_text(&format!("{rendered} ")) {
                         Ok(()) => {
                             note!("typed    «{rendered}»");
@@ -1209,6 +1218,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                                 // spoke: the six seconds are the ones the
                                 // person has to answer in.
                                 session.open_question(&part, question, Instant::now());
+                                hud::set_question_pending(true);
                             }
                         }
                     }
