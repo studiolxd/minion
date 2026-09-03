@@ -14,8 +14,9 @@ when paused. No Dock icon.
 The menu holds one toggle (Pausar / Escuchar), an *Últimas órdenes* submenu
 (the last five things heard, each with *Repetir*, *Crear alias…* and
 *Olvidar alias* — the last two only where it applies), a *Registro* submenu
-(*Aprender*, *Ver el registro*), *Ajustes…*, *Reiniciar*, *Ayuda*, and
-Salir.
+(*Aprender*, *Ver el registro*, *Estadísticas…*), *Vocabulario…*,
+*Actualizar vocabulario…*, *Ajustes…*, *Buscar actualizaciones…*,
+*Reiniciar*, *Ayuda* (with *Asistente…* above it), and Salir.
 
 The icon is a template image drawn once as SVG, rendered for the menu bar
 at run time and for the app at build time, so the two cannot drift apart.
@@ -37,6 +38,7 @@ point and there is nowhere else to put it.
 «minion, ¿cuánta batería queda?»   → «68% y cargando»
 «minion, ¿qué volumen tengo?»
 «minion, ¿me oyes?»                → «Sí, te escucho»
+«minion, ¿quién soy?»              → «Ana» (the last enrolled voice that matched)
 «minion, ¿qué he dicho hoy?»       → «40 órdenes hoy, y 3 que no entendí»
 «minion, ¿qué suena?»              → «Vértigo de Ela Minus»
 «minion, ¿qué apps tengo abiertas?»
@@ -121,6 +123,66 @@ application is in front: Google Meet in a background browser tab counts,
 Teams in the foreground with no call does not. Needs macOS 14 (Sonoma) or
 later; on macOS 13 the option does nothing and says so once in the log.
 
+**Ignorar lo que suena el Mac** — with `[audio] ignore_own_audio = true`,
+Minion opens a CoreAudio process tap on the system output (macOS 14.2+)
+and throws away any utterance whose loudness contour matches the last
+twelve seconds of what the Mac itself was playing — Netflix, a song, the
+other side of a call, coming back in through the microphone. Off by
+default, since it is a second audio stream running all the time and the
+speaker check already catches most of this; worth turning on if you
+listen to speech through the speakers, or if the log fills with `heard …
+in another voice` lines that are really the television. `minion
+loopback [segundos]` records the Mac's own output and prints its level —
+the quickest way to check the tap actually works on this machine.
+
+**Cuando dos órdenes se parecen igual de bien** — if the best match and
+the runner-up are both above the confidence threshold and close enough
+to each other (within `disambiguation_margin`, 0.08 by default), Minion
+asks instead of guessing: «¿la primera o la segunda?», naming both.
+Answer with «la primera»/«uno» or «la segunda»/«dos», no wake word
+needed. Set `disambiguation_margin = 0.0` to turn this off and always
+run the best match, the way earlier versions did.
+
+**La ventana "qué te oigo"** — a small panel, top-right of the screen,
+showing the current face, the last thing heard and what came of it, and
+the text as it is typed while dictating. Off by default, and shown for
+`hud_seconds` (4 by default) after anything worth reporting, or kept up
+for the length of an AI question or a pending yes/no; «muestra lo que
+oyes» / «esconde lo que oyes» toggles it on the spot, and `show_hud =
+true` keeps it up permanently. Separate from the menu bar's tooltip on
+purpose: a tooltip only appears on hover, nowhere near where you are
+looking while talking to the machine.
+
+## Preguntando a la IA
+
+Optional, and off until `[ai] backend` in `config.toml` names something —
+see **Configuration** below. What is sent is always **text**, never
+audio: the transcript Parakeet already produced, the same thing that
+already goes to the log.
+
+```
+«minion, pregunta a la IA cuánto es el 15% de 340»   → «51»
+«minion, pregúntale a la IA qué día cae Pascua»
+«minion, IA, resume esto»
+«minion, olvida la conversación»                      → drops the AI layer's memory
+```
+
+A question the built-in answers cannot handle also reaches the AI layer
+on its own, without saying «pregunta a la IA» — that is what `[ai] use =
+["questions"]` (the default) means. With `"unknown"` also listed, a
+phrase the vocabulary does not recognise at all is matched against a
+catalogue of Minion's own commands instead of guessed at by hand;
+Minion asks before acting on it («¿Quieres que abra Spotify?»), the same
+sí/no pattern as active learning.
+
+Every request is written to the log as `ai       «…»  ->  <backend>
+(1.8 s)`, so it is always visible how often the room turned into a
+request over the network. From a terminal: `minion ai "pregunta"`,
+`minion ai status` (which backend, which agents are installed and
+authenticated), `minion ai set-key <proveedor>` (reads the key from
+standard input, never a command-line argument — those are visible to
+every process on the machine via `ps`).
+
 ## Ajustes
 
 A native window, opened from the menu (called *Ajustes* — macOS 13+'s name
@@ -140,9 +202,10 @@ documentation:
   typing its name; a modifier is required, Escape cancels the capture, and
   **Ninguno** turns the shortcut off entirely — default is `ctrl-alt-m`
   (not ⌥Space, which Alfred, Raycast and Spotlight commonly remap)
-- **tu voz** — enrol or forget the voice profile Minion checks commands
-  against; *Olvidar mi voz* deletes it after confirming, and Minion goes
-  back to obeying whoever speaks
+- **tu voz** — *Añadir una voz…* enrols a new profile (five sentences,
+  named for the log and «¿quién soy?»); every enrolled voice may do
+  everything Minion does, there are no tiers. *Olvidar*, next to each
+  one, deletes just that profile after confirming
 - **modo de escucha** — siempre, or only while the shortcut above is held
 - **conversación** — how many seconds after a command the wake word can be
   skipped
@@ -152,6 +215,13 @@ documentation:
 - **avisos** — Notification Center banners for answers and timers
 - **búsqueda** — which engine a bare «busca X» reaches (Google, YouTube,
   Wikipedia, Amazon)
+- **IA** — turn the optional AI layer on, pick a backend, whether it also
+  matches phrases the vocabulary missed, a daily request limit, and a
+  *Probar* button that shows requests used today. API keys are never
+  typed here — see `minion ai set-key` below
+- *Vocabulario…*, a separate window from the same menu, for adding or
+  forgetting your own applications, commands and aliases without opening
+  `config.toml` by hand — see **Adding commands and applications**
 
 The menu bar's tooltip mirrors this without opening anything: it says
 whether Minion is listening or paused, and after each utterance shows the
@@ -210,6 +280,13 @@ added. Both are macOS's own prompt for the `osascript` call underneath —
 grant them from *Ajustes del Sistema → Privacidad y seguridad* the same
 way as the others.
 
+Turning on `[audio] ignore_own_audio` opens a CoreAudio process tap on the
+system output, which macOS also gates behind a privacy prompt on first
+use (`AudioHardwareCreateProcessTap`) — expect it under *Privacidad y
+seguridad*, though which exact entry macOS files it under has not been
+confirmed against a real prompt in this pass; `minion loopback` is the
+quickest way to check the tap is actually working once it is granted.
+
 The permission is granted **per binary**, so rebuilding invalidates it.
 Install to /Applications and grant it there, rather than granting it to a
 copy in the project folder that you will replace on the next build. Keep
@@ -233,16 +310,33 @@ data — voice profile, config, recordings, logs — behind, the same way
 quitting an app does not erase its documents. `./uninstall.sh --purge`
 deletes that too, after a typed confirmation.
 
-Other ways to reach Minion from a terminal:
+Other ways to reach Minion from a terminal — `minion --help` is the source
+of truth this table is generated from:
 
 ```bash
-minion --help                       # this, in Spanish
-minion enroll                       # record a voice profile without the window
-minion export-icon <directory>      # write the menu-bar face as a .iconset
-minion learn [--apply]              # turn `unknown` log lines into aliases
-minion run "abre chrome"            # runs an order, as if you had said it
-minion say "hola"                   # speaks (or notifies) some text
-minion status                       # whether the running copy is listening
+minion                               # listen and obey (the normal way to run it)
+minion <ruta-al-modelo>               # same, with the model in that folder
+minion learn [--apply]                # turn `unknown` log lines into aliases
+minion enroll [nombre]                # record a voice profile from the terminal
+                                       # (no name: saves it as "yo")
+minion export-icon <dir>              # write the menu-bar face as a .iconset
+minion run "orden"                    # runs it, as if you had said it
+minion say "texto"                    # speaks it aloud
+minion status                         # whether the running copy is listening
+minion packs update                   # download the community vocabulary
+minion mic                            # which apps are using the microphone right now
+minion loopback [seg]                 # measures what the Mac is currently sounding
+minion ai "pregunta"                  # answers it with the configured AI
+minion ai status                      # which AI backend, and which agents are found
+minion ai set-key <proveedor>         # saves a key to the keychain (from stdin)
+minion stats [--days N]               # recognition report (the whole log, or N days)
+minion corpus <carpeta> [--save]      # measures recognition against a recordings
+                                       # corpus (see minion/corpus/README.md)
+minion corpus --from-log <grabaciones> <destino>
+                                       # bootstraps a corpus.toml from a folder of
+                                       # recordings and the log
+minion --version                      # the installed version
+minion --help                         # this, in Spanish
 ```
 
 ## Local API
@@ -272,6 +366,20 @@ already proven who is at the keyboard.
 
 **Atajos (Shortcuts.app)** — a "Run Shell Script" action calling the same
 binary and arguments, bound to whatever trigger you like.
+
+## Updating Minion
+
+With `check_updates = true` (the default), Minion looks once a day for a
+newer release and offers to install it — silent unless there is one.
+*Buscar actualizaciones…* in the menu asks straight away either way.
+`minion --version` prints the installed version.
+
+An update never copies over the running app: the new bundle is unpacked
+next to the old one, the old one is renamed to `Minion.app.previous`, and
+only then does the new one take its place, so a failure at any point
+still leaves a complete Minion on disk. Releases are published, signed
+and notarised, by `./release.sh` — see the comments at its top for the
+one-time notarisation setup.
 
 ## How it works
 
@@ -391,6 +499,22 @@ rather than the normalised form used for matching, and it is sent as a
 Unicode string rather than as keystrokes, so ñ and á do not depend on the
 keyboard layout.
 
+### Dictando en otra aplicación
+
+Only «dictar» — never «escribe» — also opens a destination first:
+
+```
+«minion, dicta una nota»                → Notas, a new note, then dictation begins
+«minion, dicta un correo a Ana»         → Mail, a new message addressed to Ana
+«minion, dicta un mensaje a Ana»        → Messages, a new message to Ana
+«minion, dicta en el documento»         → dictates into whatever is already in front
+```
+
+*correo* and *mensaje* take a recipient — everything after "a" — and move
+the cursor into the body once the app is ready (Mail: subject, then body;
+Messages: the suggestion is accepted, then the body). *documento* opens
+nothing; it is for an app already in front with a cursor waiting.
+
 ### Dictado
 
 "minion, **empieza a dictar**" (also *modo dictado*) opens a longer
@@ -504,7 +628,15 @@ did with it, whichever way the app was started:
 This is the tool for tuning. `unknown` lines show what the recogniser
 really produces from your voice, which is what should go into the alias
 list. Frequent `heard` lines when nobody is speaking mean
-`speech_threshold` is too low.
+`speech_threshold` is too low (or, with `[audio] vad = "energy"`, worth
+switching to `"silero"`).
+
+A few other lines worth knowing: `voice    Ana matched at 0.58` says
+which enrolled profile a command is credited to; `own      2.1s of the
+Mac's own audio (0.83)` is `ignore_own_audio` discarding something the
+Mac itself just played; `asking   «…»  ->  abrir Safari?` is the near-miss
+question being asked out loud; `ai       «…»  ->  claude-code (2.1 s)` is
+a request the AI layer sent out.
 
 **Speech not addressed to Minion is counted, not transcribed.** With the
 microphone always on, everything said nearby passes through the recogniser,
@@ -573,9 +705,15 @@ single bad entry — one typo costs that line, not the rest.
 `vocabulary/local.example.toml` holds the three applications that only
 exist on the machine Minion was written on; copy it if you have them.
 
-Not done yet: a separate community repository of vocabulary packs, and an
-«Actualizar vocabulario» item in the menu to fetch them. For now, packs are
-files you put in that directory yourself.
+**Community packs.** *Actualizar vocabulario…* in the menu, or `minion
+packs update` from a terminal, downloads whatever
+[studiolxd/minion-vocabulary](https://github.com/studiolxd/minion-vocabulary)
+publishes straight into that directory — restart Minion afterwards to load
+them, same as a hand-copied file. Every pack is checked against a hash
+published alongside it before it is kept; there is still no way for a
+downloaded pack to run a script or a shell command, only `keys`, `action`,
+`text` and `url`. The repository is private while it is being built out,
+so an update may say there is nothing to fetch yet.
 
 ## Configuration
 
@@ -607,21 +745,62 @@ falls back to every default, says so in the log, and — since a config that
 has quietly gone back to defaults is easy to miss — also puts up a dialog
 on screen naming the problem, in Spanish, once at startup.
 
-Beyond the wake words, threshold and audio numbers above, the keys this
-round of work added, with their defaults:
+Every top-level key, with its default — `config.example.toml` is the same
+list, commented, and the one to copy from:
 
 | Key | Default | What it does |
 |---|---|---|
+| `wake_words` | `["minion", "minions", "minon", "miñon", "minial", "mini", "minio"]` | words that open a command; setting this replaces the list, not adds to it |
+| `threshold` | `0.7` | confidence needed before acting, `0.3`–`1.0` |
+| `log_ignored_speech` | `false` | write down speech not addressed to Minion, not just count it |
+| `sounds` | `true` | a short sound on a command running, and on a not-understood one |
+| `unload_after_minutes` | `5` | idle minutes before the speech model is released from memory; `0` never unloads |
+| `energy` | `"auto"` | `"auto"` uses `unload_after_minutes` on power, shorter fixed thresholds on battery; `"battery"` always behaves as on battery; `"performance"` never unloads |
+| `voice_threshold` | `0.32` | how alike a voice must sound before Minion listens to it |
+| `microphone` | *(system default)* | which input device to listen through |
+| `speaker` | *(system default)* | which output device to speak through |
+| `save_recordings` | `false` | keep a WAV of everything heard, for tuning or building a corpus |
+| `speak` | `true` | whether questions get a spoken answer at all (commands stay quiet either way) |
+| `ask_before_learning` | `true` | ask «¿Querías decir…?» about a near-miss, instead of only logging it |
+| `notifications` | `true` | Notification Center banners for answers, timers and blocked commands |
+| `show_hud` | `false` | keep the "qué te oigo" panel on screen permanently |
+| `hud_seconds` | `4` | seconds the HUD stays up after the last thing worth showing |
+| `check_updates` | `true` | look once a day for a newer Minion and offer to install it |
+| `voice` | *(auto: a Spanish one)* | which system voice reads answers aloud |
+| `speech_rate` | `190` | words per minute, `120`–`320` |
 | `conversation_seconds` | `5` | seconds after a command the wake word can be skipped; `0` disables it |
 | `listen_mode` | `"always"` | `"hold"` for push-to-talk on `resume_shortcut` |
 | `pause_when_microphone_busy` | `true` | pause while another process is recording (macOS 14+) |
+| `resume_shortcut` | `"ctrl-alt-m"` | keyboard shortcut that pauses/resumes; empty disables it |
 | `spoken_punctuation` | `true` | turn spoken signs into punctuation while dictating |
 | `auto_capitalise` | `true` | capitalise sentence starts and «mayúscula» while dictating |
-| `ask_before_learning` | `true` | ask «¿Querías decir…?» about a near-miss, instead of only logging it |
-| `notifications` | `true` | Notification Center banners for answers, timers and blocked commands |
+| `disambiguation_margin` | `0.08` | how close a runner-up must be to the winner before Minion asks which was meant; `0.0` never asks |
 | `search_engine` | `"google"` | which engine a bare «busca X» reaches |
 | `dictation_words` | *(none)* | `[[dictation_words]]`, names the recogniser reliably mangles |
 | `macros` | *(none)* | `[[macros]]`, named sequences of phrases |
+
+`[audio]` adds, beyond `speech_threshold`, `silence_end_ms`, `min_speech_ms`
+and `max_utterance_ms`:
+
+| Key | Default | What it does |
+|---|---|---|
+| `vad` | `"silero"` | `"silero"` asks a small neural net whether a sound is a voice, after the energy gate; `"energy"` is loudness alone |
+| `vad_threshold` | `0.5` | Silero's own score, above which a frame counts as speech |
+| `ignore_own_audio` | `false` | discard an utterance that matches what the Mac itself was just playing (macOS 14.2+) |
+| `own_audio_threshold` | `0.6` | how alike an utterance and the Mac's own output must be before it is thrown away |
+
+`[ai]`, entirely optional and must stay the last thing in the file (see
+**Preguntando a la IA** above for what it does):
+
+| Key | Default | What it does |
+|---|---|---|
+| `backend` | *(empty — AI off)* | `"claude-code"`, `"codex"`, `"gemini-cli"`; an HTTP provider (`"openai"`, `"anthropic"`, `"deepseek"`, `"mistral"`, `"groq"`, `"openrouter"`, `"xai"`, `"gemini"`); or a local one (`"ollama"`, `"lmstudio"`) |
+| `model` | *(backend's own default)* | which model, when the backend offers a choice |
+| `use` | `["questions"]` | `"questions"` and/or `"unknown"` (also try matching a phrase the vocabulary missed) |
+| `daily_limit` | `200` | requests per day, counted in `ai-usage.toml`; `0` means no limit |
+| `idle_minutes` | `10` | minutes without a question before the conversation is forgotten |
+| `api_key` | *(none)* | an HTTP provider's key, or `"keychain"` to read it from the macOS keychain (`minion ai set-key <backend>`) |
+| `base_url` | *(provider's own)* | overrides the provider's base URL |
 
 ## Tuning
 
@@ -703,14 +882,26 @@ what is still missing rather than everything that ever failed.
 cargo test
 ```
 
-383 tests (1 ignored). The ones that matter most check that ordinary conversation is
-ignored, that every declared phrase reaches its own command, and that no
-two commands claim the same phrase.
+596 tests (2 ignored). The ones that matter most check that ordinary
+conversation is ignored, that every declared phrase reaches its own
+command, and that no two commands claim the same phrase.
 
 They have already earned their keep: they caught "cortar" being executed as
 "copiar", "cierra la ventana" running "cerrar pestaña", and "rehaz" landing
 on "deshacer" — all from an edit-distance allowance that was one step too
 generous.
+
+## Measuring recognition
+
+`minion stats [--days N]` (also *Registro → Estadísticas…*) turns the log
+into a report: how many commands ran, how many phrases went
+unrecognised, how the speaker check scored. `minion corpus` goes further,
+replaying a fixed set of recordings against a known-good transcript and
+decision for each, so a change to matching, audio or the models shows up
+as a number rather than a feeling — see `minion/corpus/README.md` for how
+to build one. `tests/corpus.rs` runs the same comparison against a
+committed baseline as part of `cargo test`, skipped where there is no
+corpus or model on disk.
 
 ## Signing
 
@@ -725,12 +916,9 @@ rebuilding.
 ## Not done yet
 
 - **A tighter memory floor.** 405 MB idle is what ONNX Runtime gives back.
-- **Real VAD.** Energy cannot tell speech from a door slam, and background
-  music keeps it triggering. Silero VAD is the next step.
-
-- **Developer ID signing**, so the app can be shared with other machines.
-  The ad-hoc signature is enough for this one.
-
-- **A community vocabulary repository**, and an «Actualizar vocabulario»
-  menu item to pull packs from it. The loader already reads whatever is in
-  `~/Library/Application Support/Minion/vocabulary/`; nothing fetches it.
+- **Other languages.** Catalan cannot happen — it is not one of the 25
+  languages the recognition model covers — but Spanish/English is judged
+  feasible. Neither CoreML/Neural Engine acceleration nor an embedded LLM
+  are worth building: see `docs/feasibility-2026-09.md` for the reasoning
+  and the recommended alternative (Ollama, for anyone who wants a fully
+  local AI backend) behind each.

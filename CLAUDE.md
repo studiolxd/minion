@@ -39,6 +39,13 @@ Do not resurrect 1 or 2. The user chose Rust deliberately over Python/Go.
 - Commands are never gated by voice similarity beyond the single 0.32
   `voice_threshold` check — the user rejected escalating that per command
   (e.g. a higher bar for dictation or quitting apps). One check, one number.
+- The AI layer is optional and text-only: `[ai] backend` is empty by
+  default, and even on, only the transcript goes out — never audio.
+- `script`/`shell` command actions are read only from the user's own
+  `config.toml`, never from a built-in or downloaded vocabulary file.
+- Vocabulary packs are data, never code: a `[[commands]]` entry can bind a
+  key, an action from the closed list, text or a URL — nothing that runs
+  arbitrary code, downloaded or not.
 
 ## Build, test, install
 
@@ -47,7 +54,7 @@ Do not resurrect 1 or 2. The user chose Rust deliberately over Python/Go.
 ```sh
 export PATH="/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:$PATH"
 cd /Users/suvi/Dev/talon/minion
-cargo test                 # 383 tests (1 ignored), must all pass
+cargo test                 # 596 tests (2 ignored), must all pass
 cargo clippy --all-targets # 5 pre-existing warnings (new clippy); add none
 ./build-app.sh             # cargo build --release + Minion.app, signed with
                            # the user's Apple Development certificate
@@ -144,13 +151,22 @@ was considered and rejected on that data.
   matched **phonetically**: `text::phonetic()` reduces both the alias and
   what was heard to how they'd sound said in Spanish ("cromo"), so "crum"
   and "cromo" match "Chrome" without listing every mangling by hand.
+  `decide_ranked()` re-runs matching and returns every candidate, best
+  first, with the actual `decide_in()` result spliced in as the head — the
+  ranking's own score for that entry is not trusted, `decide_in`'s is. Also
+  recognises «dicta …» aimed at a named destination (nota, correo, mensaje,
+  documento) from `[[destinations]]`, distinct from plain «escribe …».
 - `session.rs` — the per-utterance state machine: dictation mode, undo,
   "otra vez", chain splitting, the conversation window (no wake word needed
   for a few seconds after a command), and active learning — a phrase heard
   close to a known one but not close enough sets a `Pending` question
   ("¿Querías decir «abrir Safari»?") with a 6-second deadline, answered with
   «sí»/«no» and no wake word; a yes is written to `config.toml` as an alias.
-  Pure and unit-tested; `main.rs` matches on `Outcome` and does the IO.
+  Spoken disambiguation lives here too: when the winner and runner-up from
+  `commands::decide_ranked` both clear the threshold and sit within
+  `disambiguation_margin` of each other, it asks («¿la primera o la
+  segunda?») instead of guessing. Pure and unit-tested; `main.rs` matches on
+  `Outcome` and does the IO.
 - `dictation.rs` — what continuous dictation does to words before they are
   typed: spoken punctuation, capitalisation, personal vocabulary
   (`[[dictation_words]]`), numbers up to 999,999. `Transformer` is pure and
@@ -206,7 +222,21 @@ was considered and rejected on that data.
   app is in front" (a guess that got calls in background windows wrong and
   foreground chat windows wrong). Never called from the audio callback,
   since a CoreAudio property read can block; polled from the idle tick
-  (~250 ms) and cached for a second.
+  (~250 ms) and cached for a second. `pause_when_microphone_busy` (default
+  on) uses the same signal to auto-pause while a call is live and resume
+  when it hangs up; the property does not exist before macOS 14, so the
+  option is a silent no-op there, logged once.
+- `loopback.rs` — what the Mac itself is playing, so hearing it back through
+  the microphone is not mistaken for a command. Builds a `CATapDescription`
+  on the system output (macOS 14.2+), wraps it in a private aggregate
+  device, and reads that aggregate's *input* stream with an IOProc. The tap
+  auto-starts only while something is actually playing, so silence arrives
+  as *no callbacks at all*, not blocks of zeros — `Ring` pads the gap
+  instead of assuming the buffer is continuous. Comparison is on loudness
+  **envelopes**, not samples: the mic hears the room's delayed, filtered,
+  mixed version, and only the syllable-scale contour survives that. Off by
+  default (`ignore_own_audio`); `minion loopback` measures whether the tap
+  works at all here.
 - `text.rs` — normalise, keyword F1 similarity, `words_match` (≤1 edit, or
   a shared stem ≥6 letters covering ¾ of the shorter word) with a real
   `strict` mode — a single-keyword command gets no edit-distance slack at
@@ -220,16 +250,84 @@ was considered and rejected on that data.
   enrolled voice in `voices/` (the best match above the threshold decides
   who spoke; every voice may do everything, there are no tiers), threshold
   **0.32** (measured on real mic audio: worst 0.38, avg 0.57; 0.45 rejected
-  the owner). Verifies short clips by tiling them up to a working length
-  instead of waving them through unchecked, and embeds only the speech
-  slice of the utterance (via `Utterance.speech_start/end`), not the
-  preroll and silence around it. `fbank.rs` is the Kaldi-compatible mel
-  frontend.
+  the owner). There can be more than one voice: every utterance is scored
+  against all of them, and the name is only for the log, «¿quién soy?» and
+  forgetting one voice without forgetting the rest. Verifies short clips by
+  tiling them up to a working length instead of waving them through
+  unchecked, and embeds only the speech slice of the utterance (via
+  `Utterance.speech_start/end`), not the preroll and silence around it.
+  `fbank.rs` is the Kaldi-compatible mel frontend.
+- `silero.rs` — a 2 MB Silero VAD network, asked after the energy gate
+  (`[audio] vad`, default `"silero"`) so background noise no longer wakes
+  the speaker model and Parakeet. Fixed 512-sample frames (32 ms at 16 kHz)
+  carry an LSTM state and the last 64 samples of audio between calls; both
+  must be reset when the audio jumps, and skipping the 64-sample context is
+  not optional — bare frames score clear speech at ≈0.2.
+- `hud.rs` — the "what did it hear" floating panel (`show_hud`, spoken
+  «muestra/esconde lo que oyes», `hud_seconds`), deliberately separate from
+  the menu-bar tooltip since that only appears on hover. `Visibility` is a
+  small pure state machine with no AppKit in it; the listening loop feeds
+  it dictation text and pending-question state through two module-level
+  functions rather than a struct field, since that loop's state is not this
+  file's to change.
+- `metrics.rs` — recognition metrics (`minion stats`, «Registro →
+  Estadísticas…») computed by re-parsing the journal's text; pure, and
+  deliberately does not share a parser with `learn.rs`'s phrase counter —
+  both read `unknown  «…»` lines, but this one counts a dozen other line
+  shapes besides.
+- `corpus.rs` — `minion corpus`: replays a fixed set of recordings
+  (`minion/corpus/`, see its README) against `corpus.toml`'s expected
+  transcript and decision, and diffs the result against a committed
+  `baseline.toml` so a recognition regression shows up in `git diff` as
+  well as `cargo test` (`tests/corpus.rs`). WAV files are never committed —
+  only the corpus definition and the baseline numbers are.
+- `packs.rs` — downloads community vocabulary from
+  `github.com/studiolxd/minion-vocabulary` (`minion packs update`,
+  «Actualizar vocabulario…») via `/usr/bin/curl`, the same shape as
+  `models.rs`. The manifest is the trust boundary: a pack's bytes are kept
+  only once they hash to what `manifest.toml` says, fetched from the same
+  release — weaker than `models.rs`'s hand-verified pins, but a pack cannot
+  do anything a model file can, since a `[[commands]]` entry is data, never
+  a script. The repo is private for now, so a 404 on the release is an
+  expected `Outcome::NotPublicYet`, not an error.
+- `vocabulary_editor.rs` — «Vocabulario…» window. Edits only this file's own
+  `[[apps]]`/`[[commands]]`/`[[aliases]]` in `config.toml`, through the same
+  pure `config.rs` functions `preferences.rs` and `learn.rs` already use;
+  the built-in vocabulary and downloaded packs stay read-only. No
+  `NSTableView` — every control here is polled, never a delegate/data-source
+  class, so the list is built from `preferences::Layout` rows inside a
+  plain `NSScrollView` instead.
+- `onboarding.rs` — the first-run assistant («Ayuda → Asistente…»),
+  replacing the old single dialog. Split like `session.rs`: `Wizard` is the
+  pure, unit-tested state machine (which step, whether the voice step was
+  skipped, whether the test passed); `Window` is the AppKit shell with no
+  logic of its own worth testing.
+- `updater.rs` — updates Minion itself (`check_updates`, «Buscar
+  actualizaciones…», `minion --version`), the same shape as `packs.rs`:
+  curl over https, nothing kept until it hashes to what `release.sh`
+  published. Never copies over the running app — the new bundle unpacks
+  next to the old one, the old one is renamed to `Minion.app.previous`, and
+  only then does the new one take its place, so a failure at any point
+  still leaves a complete Minion on disk.
+- `ai/` — the optional AI layer (`[ai]`, `minion ai …`), off unless
+  `backend` names something. Sends **text only** — the transcript Parakeet
+  already produced, never audio — through `/usr/bin/curl` with the whole
+  request (headers, key, body) on stdin, so a key never appears in `ps`.
+  Two backend kinds: HTTP (OpenAI-compatible providers plus Anthropic's own
+  API, including the no-key local `ollama`/`lmstudio` presets) and CLI
+  sessions (Claude Code kept warm as one process, Codex/Gemini CLI one
+  process per question). `[ai] use` separates `questions` from `unknown`
+  (a phrase the vocabulary missed, matched against a closed command
+  catalogue and discarded if the model's answer isn't in it); an API key
+  can live in the macOS keychain instead of the config file.
 - `answers.rs` / `speech.rs` — spoken answers: time, date, battery, volume,
   help, timers/alarms, read-aloud (selection or clipboard, one sentence at
   a time so it can actually be interrupted), reminders and calendar
   (delegating the parsing to `reminders.rs`), now-playing, open apps, disk
   space, connectivity — via the system synthesiser, killable mid-sentence.
+  The default voice matches any `es_*` prefix, not just the literal
+  `"es_ES"`, so a Mac with only `es_MX`/`es_AR` voices still gets Spanish
+  rather than falling back to English.
 - `preferences.rs` — AppKit window; controls are **polled** by an NSTimer in
   `NSRunLoopCommonModes` (not Objective-C targets — documented at the top).
 - `hotkey.rs` — CGEventTap on its own thread (an `NSEvent` global monitor on
@@ -301,10 +399,39 @@ was considered and rejected on that data.
   anything on its own" forbids. `system::EMPTY_TRASH` never uses it:
   it activates Finder and sends ⇧⌘⌫ instead, so the same dialog a person
   emptying the Trash by hand would see still appears.
+- CoreAudio serialises IOProc creation across the whole client, so the
+  output tap in `loopback.rs` is opened **after** the microphone stream —
+  the one stream that must not be made to wait its turn.
+- A keep-both merge can also duplicate a `let` flag declaration and leave
+  the copies out of sync — not just misplace a struct's fields (see the
+  `24f2581` note above). Happened for real in `1a5eaf3`: two merges each
+  declared the menu's request flags, the assistant window captured the
+  first set, and the menu/run-loop timer used the second, so «Abrir
+  Ajustes» from the assistant could never reach the preferences window.
+  Check `main.rs`'s request flags and `Config` itself, not just that the
+  crate builds, after resolving any merge that touches either.
+- Silero's frame processing needs the last 64 samples of the *previous*
+  frame prepended to the next one, not just the LSTM state carried over.
+  Skipping it looks like it works — it still runs — but scores clear
+  speech at ≈0.2, which rejects everything as noise.
 
 ## Open items
 
-- `blank` lines: voice matched, Parakeet returned no text. Seen a few times
-  per round; if it grows, lengthen the preroll.
-- Not planned unless asked: lowering
-  the 405 MB idle floor.
+What `docs/feasibility-2026-09.md` (Sept. 2026) found, asked of the code as
+it stood before this doc pass:
+
+- **Catalan is blocked by the model, not the architecture.** Parakeet TDT
+  0.6b v3 covers 25 European languages; Catalan (and Basque, Galician)
+  is not one of them. Adding a *second* language Parakeet already speaks
+  (English, Portuguese) is comparatively cheap — see the study for the
+  `Language` trait / `lang/<code>.toml` split it proposes.
+- **CoreML/Neural Engine: no-go.** `parakeet-rs`'s own source and README
+  say CoreML runs this model's shape (dynamic input lengths, int8 weights)
+  slower and less reliably than plain CPU — and the latency being chased
+  is already ~142 ms, below where anyone would notice a 2× win anyway.
+- **An embedded LLM: no-go, recommend Ollama instead.** A 1–3B model
+  in-process adds 1.3–2 GB of resident memory to a program judged on
+  exactly that number, plus a C++ toolchain in an otherwise pure-Rust
+  build and a model licence to take a position on. `ollama`/`lmstudio` in
+  `ai/` already cover the same ground out-of-process, for free, visible
+  and killable in Activity Monitor.
