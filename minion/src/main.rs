@@ -952,7 +952,29 @@ fn run_menu_bar(
     let quit_requested = Arc::new(AtomicBool::new(false));
     let restart_for_timer = Arc::clone(&restart_requested);
     let quit_for_timer = Arc::clone(&quit_requested);
+    // How many times the timer has fired since it started, kept apart from
+    // the UI throttle's own counter so the two gates — "once a second" and
+    // whatever the throttle needs — can be reasoned about, and changed,
+    // independently of each other.
+    let request_check_ticks: Cell<u32> = Cell::new(0);
+    let request_check_period = ticks_per_second(UI_REFRESH_SECONDS);
     let repaint = RcBlock::new(move |_timer: NonNull<NSTimer>| {
+        // A second copy that lost the single-instance lock left this
+        // instead of opening a window of its own — see
+        // `request_settings_open`. Checked on a schedule, not every tick:
+        // metadata() is cheap, but the timer fires far more often than the
+        // file could plausibly appear.
+        let request_check_tick = request_check_ticks.get().wrapping_add(1);
+        request_check_ticks.set(request_check_tick);
+        if on_schedule(request_check_tick, request_check_period) {
+            if let Some(path) = open_settings_request_path() {
+                if std::fs::metadata(&path).is_ok() {
+                    let _ = std::fs::remove_file(&path);
+                    open_for_timer.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+
         if open_for_timer.swap(false, Ordering::Relaxed) {
             panel_for_timer.show();
         }
@@ -1244,6 +1266,55 @@ fn claim_sole_instance() -> bool {
     locked
 }
 
+/// Where a second copy leaves its "open the settings" request for the
+/// running one to find.
+///
+/// Next to the config file rather than its own new folder: the directory
+/// is already there and already private to this user.
+fn open_settings_request_path() -> Option<std::path::PathBuf> {
+    let mut path = config::path()?;
+    path.set_file_name("open-settings");
+    Some(path)
+}
+
+/// Leaves the request for the running copy, in place of doing anything
+/// itself.
+///
+/// A double-click that finds Minion already running has nowhere else to
+/// go: it cannot open a window, because the window belongs to the copy
+/// that is about to keep running, not this one.
+fn request_settings_open() {
+    if cfg!(test) {
+        return;
+    }
+    let Some(path) = open_settings_request_path() else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, "");
+}
+
+/// How many ticks of the UI timer make up about a second.
+///
+/// Pure, so the "once a second" gate below can be tested without a real
+/// timer.
+fn ticks_per_second(refresh_seconds: f64) -> u32 {
+    if refresh_seconds <= 0.0 {
+        1
+    } else {
+        (1.0 / refresh_seconds).round().max(1.0) as u32
+    }
+}
+
+/// Whether this tick of the UI timer is one of the ones that does
+/// something, given how many ticks make up one period.
+///
+/// Used by the settings-request check below (about once a second); the UI
+/// throttle reuses it for its own, shorter period.
+fn on_schedule(tick: u32, period_ticks: u32) -> bool {
+    period_ticks > 0 && tick.is_multiple_of(period_ticks)
+}
+
 /// When this Mac last started, in seconds since the epoch.
 ///
 /// Used as the name of the current login session: it changes at every
@@ -1421,6 +1492,7 @@ fn main() -> Result<()> {
 
     if !claim_sole_instance() {
         eprintln!("Minion ya se está ejecutando.");
+        request_settings_open();
         return Ok(());
     }
 
@@ -1664,5 +1736,28 @@ mod tests {
                 Path::new("../model"),
             ]
         );
+    }
+
+    #[test]
+    fn twenty_ticks_of_fifty_milliseconds_make_a_second() {
+        assert_eq!(ticks_per_second(UI_REFRESH_SECONDS), 20);
+    }
+
+    #[test]
+    fn a_schedule_fires_on_its_multiples_only() {
+        assert!(!on_schedule(1, 20));
+        assert!(!on_schedule(19, 20));
+        assert!(on_schedule(20, 20));
+        assert!(on_schedule(40, 20));
+    }
+
+    #[test]
+    fn the_settings_request_lives_beside_the_config_file() {
+        // Reads HOME to build the path but touches no filesystem — same as
+        // `config::path()`, which this is deliberately built alongside.
+        let request = open_settings_request_path().expect("HOME is set while testing");
+        let config = config::path().expect("HOME is set while testing");
+        assert_eq!(request.parent(), config.parent());
+        assert_eq!(request.file_name().unwrap(), "open-settings");
     }
 }
