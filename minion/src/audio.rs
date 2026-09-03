@@ -197,6 +197,12 @@ pub struct Listener {
     /// a second to load, so the loop can use the news to start loading
     /// while the sentence is still being said rather than after it.
     pub speech_started: Arc<AtomicBool>,
+    /// True for as long as an utterance is open — from the block that opens
+    /// it to the block that closes it — unlike [`Self::speech_started`],
+    /// which is a one-shot latch cleared by whoever reads it. The HUD polls
+    /// this one on every tick to show itself the moment speech begins,
+    /// rather than waiting for the transcript.
+    pub speech_open: Arc<AtomicBool>,
     pub source_hz: u32,
     pub channels: usize,
     /// Raised once when the microphone delivered nothing but exact zeros
@@ -874,6 +880,8 @@ pub fn start(
     let segment_queue = Arc::clone(&queue);
     let speech_started = Arc::new(AtomicBool::new(false));
     let segment_started = Arc::clone(&speech_started);
+    let speech_open = Arc::new(AtomicBool::new(false));
+    let segment_open = Arc::clone(&speech_open);
 
     std::thread::spawn(move || {
         // Loaded here, on the segmenter's own thread: the CoreAudio
@@ -906,6 +914,11 @@ pub fn start(
                 if segmenter.speaking {
                     segment_started.store(true, Ordering::Relaxed);
                 }
+                // Continuous, unlike `segment_started` above: true exactly
+                // while an utterance is open, so the HUD can tell "still
+                // talking" apart from "closed, now transcribing" without
+                // its own copy of the segmenter's state.
+                segment_open.store(segmenter.speaking, Ordering::Relaxed);
                 if let Some(utterance) = utterance {
                     if send.send(utterance).is_err() {
                         return; // nobody is listening any more
@@ -919,6 +932,7 @@ pub fn start(
         _stream: stream,
         utterances,
         speech_started,
+        speech_open,
         source_hz,
         channels,
         silent,
