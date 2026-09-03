@@ -1,9 +1,15 @@
 # Rust build output
 target/
 
-# Speech model: ~640 MB, fetched with oyente/download-model.sh
-oyente/model/*.onnx
-oyente/model/*.onnx.data
+# Models: ~670 MB, downloaded on first run into Application Support, or
+# ahead of time with minion/download-model.sh. Never in git.
+minion/model/
+*.onnx
+*.onnx.data
 
-# Logs
+# Built application bundle: produced by minion/build-app.sh.
+minion/Minion.app/
+
+# Logs and the local audit notes
 *.log
+AUDITORIA.md

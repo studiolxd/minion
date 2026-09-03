@@ -249,9 +249,21 @@ mod tests {
 
     /// The model lives beside the speech model and is not in the
     /// repository, so these skip rather than fail when it is absent.
+    /// The speaker model, from the repo's `model/` directory or from the
+    /// copy Minion downloaded for itself. Read only: nothing is written.
+    /// Absent, and the test that asked is skipped rather than failed —
+    /// the model is not in git.
     fn model_if_present() -> Option<Speaker> {
-        let path = std::path::Path::new("model/speaker.onnx");
-        path.exists().then(|| Speaker::load("model").ok()).flatten()
+        let mut candidates = vec![std::path::PathBuf::from("model")];
+        if let Some(home) = std::env::var_os("HOME") {
+            candidates.push(
+                std::path::PathBuf::from(home).join("Library/Application Support/Minion/model"),
+            );
+        }
+        candidates
+            .into_iter()
+            .find(|dir| dir.join("speaker.onnx").exists())
+            .and_then(|dir| Speaker::load(&dir.to_string_lossy()).ok())
     }
 
     /// A crude voiced sound: a pitch with harmonics, which is closer to
