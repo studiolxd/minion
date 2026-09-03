@@ -180,7 +180,11 @@ fn download(url: &str, target: &Path, expected_sha256: &str) -> Result<(), Strin
 
 /// SHA-256 of a file's contents, read in chunks so a 650 MB model does not
 /// have to be held in memory twice over.
-fn hash_file(path: &Path) -> std::io::Result<[u8; 32]> {
+///
+/// `pub(crate)`: `packs.rs` verifies downloaded vocabulary packs against
+/// the same hash the manifest publishes, and reaches for this rather than
+/// hashing a second way.
+pub(crate) fn hash_file(path: &Path) -> std::io::Result<[u8; 32]> {
     let mut file = std::fs::File::open(path)?;
     let mut hasher = hmac_sha256::Hash::new();
     let mut buffer = [0u8; 64 * 1024];
@@ -195,7 +199,10 @@ fn hash_file(path: &Path) -> std::io::Result<[u8; 32]> {
 }
 
 /// Lower-case hex, to match what `shasum -a 256` prints.
-fn hex(bytes: &[u8; 32]) -> String {
+///
+/// `pub(crate)`: `packs.rs` prints the same shape of hash when a manifest
+/// entry does not match.
+pub(crate) fn hex(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 

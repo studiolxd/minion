@@ -183,6 +183,25 @@ fn category_from(source: &str) -> String {
     source.trim_end_matches(".toml").to_string()
 }
 
+/// Every `.toml` file under `dir`, recursing into subdirectories. A
+/// directory that cannot be read (missing, or not a directory at all)
+/// contributes nothing rather than being an error — see `merge_dir`.
+fn collect_toml(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            found.extend(collect_toml(&path));
+        } else if path.extension().is_some_and(|e| e == "toml") {
+            found.push(path);
+        }
+    }
+    found
+}
+
 /// Replaces the entry of the same name, or appends a new one.
 ///
 /// Replacing in place rather than pushing to the end keeps the order of
@@ -240,24 +259,20 @@ impl Vocabulary {
         }
     }
 
-    /// Merges every `*.toml` in a directory. A missing directory is fine —
-    /// most installations will never have one.
+    /// Merges every `*.toml` under a directory, including subdirectories —
+    /// a downloaded pack collection groups related files together (e.g.
+    /// `community/adobe.toml`), and a flat scan would silently skip them.
+    /// A missing directory is fine — most installations will never have
+    /// one.
     pub fn merge_dir(&mut self, dir: &Path) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
+        let mut files = collect_toml(dir);
         // Sorted, so which pack wins does not depend on the order the
         // filesystem happens to hand the names back in.
-        let mut files: Vec<PathBuf> = entries
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().is_some_and(|e| e == "toml"))
-            .collect();
         files.sort();
         for path in files {
             let name = path
-                .file_name()
-                .map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+                .strip_prefix(dir)
+                .map_or_else(|_| path.display().to_string(), |p| p.to_string_lossy().into_owned());
             match std::fs::read_to_string(&path) {
                 Ok(contents) => self.merge_toml(&name, &contents),
                 Err(e) => crate::note!("Ignoring vocabulary {name}: {e}"),
@@ -590,6 +605,34 @@ mod tests {
             .find(|a| a.name == "Finder")
             .expect("Finder should still be there");
         assert_eq!(finder.bundle_id, "pack.finder");
+    }
+
+    #[test]
+    fn a_pack_in_a_subdirectory_is_loaded_too() {
+        // packs.rs unzips a downloaded release with packs grouped under
+        // subdirectories such as `community/` — a scan that only looked
+        // at the top level would silently never load them.
+        let dir = std::env::temp_dir().join(format!(
+            "minion-vocabulary-test-nested-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let nested = dir.join("community");
+        std::fs::create_dir_all(&nested).expect("nested temp directory");
+        std::fs::write(
+            nested.join("adobe.toml"),
+            "[[apps]]\nname = \"Photoshop\"\nbundle_id = \"com.adobe.Photoshop\"\naliases = [\"photoshop\"]\n",
+        )
+        .expect("write nested pack");
+
+        let mut vocabulary = Vocabulary::default();
+        vocabulary.merge_dir(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            vocabulary.apps.iter().any(|a| a.name == "Photoshop"),
+            "a pack in a subdirectory should still be merged"
+        );
     }
 
     #[test]
