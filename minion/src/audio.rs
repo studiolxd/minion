@@ -499,6 +499,10 @@ struct Segmenter {
     score: Option<f32>,
     /// The best Silero score seen in the utterance so far, for the log.
     best_score: f32,
+    /// Blocks in a row scored as voice during probation. A single block
+    /// over the threshold is what a click or a system chime produces; a
+    /// voice produces them back to back.
+    voice_streak: u8,
     /// Blocks left of the window in which Silero may still veto an
     /// utterance that energy opened. `None` once it has spoken up.
     probation: Option<usize>,
@@ -515,6 +519,10 @@ struct Segmenter {
 /// the recogniser.
 const PROBATION_MS: usize = 200;
 const PROBATION_BLOCKS: usize = PROBATION_MS / BLOCK_MS;
+
+/// Consecutive blocks Silero must score as voice before an utterance is
+/// approved. One block let system chimes and clicks through.
+const VOICE_STREAK_BLOCKS: u8 = 2;
 
 impl Segmenter {
     fn new(settings: Settings, voice: Option<Silero>) -> Self {
@@ -533,6 +541,7 @@ impl Segmenter {
             probation: None,
             approved: false,
             best_score: 0.0,
+            voice_streak: 0,
         }
     }
 
@@ -618,7 +627,9 @@ impl Segmenter {
         // speech is the dishwasher, not an order. Dropped here rather
         // than after the recogniser has been woken to transcribe it.
         if let Some(left) = self.probation {
-            if let Some(score) = self.score.filter(|s| *s >= self.settings.vad_threshold) {
+            let voiced = self.score.filter(|s| *s >= self.settings.vad_threshold);
+            self.voice_streak = if voiced.is_some() { self.voice_streak + 1 } else { 0 };
+            if let Some(score) = voiced.filter(|_| self.voice_streak >= VOICE_STREAK_BLOCKS) {
                 self.approved = true;
                 // Written down so the threshold can be tuned on what the
                 // room actually produces: a cough or a system sound that
@@ -679,6 +690,7 @@ impl Segmenter {
         self.preroll.clear();
         self.probation = None;
         self.approved = false;
+        self.voice_streak = 0;
         self.best_score = 0.0;
         self.score = None;
         // The next utterance is not a continuation of this one.
