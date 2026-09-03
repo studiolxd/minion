@@ -25,6 +25,10 @@ const DEFAULT_DISAMBIGUATION_MARGIN: f32 = 0.08;
 /// Shortcut that pauses and resumes when nothing is set.
 pub const DEFAULT_RESUME_SHORTCUT: &str = "ctrl-alt-m";
 
+/// Seconds the HUD panel stays up when the file says nothing — matches
+/// what `hud.rs` used as a constant before this became configurable.
+const DEFAULT_HUD_SECONDS: f64 = 4.0;
+
 /// Cosine similarity a voice must reach to be treated as yours.
 ///
 /// Measured rather than guessed. Against a profile trained on this
@@ -263,6 +267,11 @@ pub struct Config {
     /// "battery" always behaves as if it were, "performance" never
     /// unloads anything. See [`Config::energy_mode`].
     pub energy: Option<String>,
+
+    /// Seconds the "what did it hear" HUD panel stays up after the last
+    /// thing worth showing, with nothing else keeping it open — see
+    /// `hud.rs`. `None` is the default of 4.
+    pub hud_seconds: Option<f64>,
 }
 
 /// The `[ai]` table: which model answers what the vocabulary cannot, and
@@ -542,6 +551,7 @@ impl Default for Config {
             check_updates: true,
             ai: AiConfig::default(),
             energy: None,
+            hud_seconds: None,
         }
     }
 }
@@ -1201,6 +1211,12 @@ impl Config {
         }
     }
 
+    /// How long the HUD panel stays up after the last thing worth
+    /// showing. `None` in the file means the default of 4 seconds.
+    pub fn hud_seconds(&self) -> f64 {
+        self.hud_seconds.unwrap_or(DEFAULT_HUD_SECONDS)
+    }
+
     /// Commands defined in the file, as `'static` entries.
     ///
     /// Exactly one of `keys`, `script` and `shell` must be given; naming
@@ -1450,6 +1466,14 @@ mod tests {
         assert!(!default.show_hud);
         let pinned: Config = toml::from_str("show_hud = true").expect("should parse");
         assert!(pinned.show_hud);
+    }
+
+    #[test]
+    fn the_hud_stays_up_four_seconds_by_default_and_can_be_changed() {
+        let default: Config = toml::from_str("").expect("empty config should parse");
+        assert_eq!(default.hud_seconds(), 4.0);
+        let changed: Config = toml::from_str("hud_seconds = 8.5").expect("should parse");
+        assert_eq!(changed.hud_seconds(), 8.5);
     }
 
     #[test]

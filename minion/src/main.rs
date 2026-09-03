@@ -893,6 +893,11 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                     voice_unloaded_for_idle = true;
                     note!("Idle for {} — speaker model released.", format_idle(last_used.elapsed()));
                 }
+                // Same idea, on its own clock (`[ai] idle_minutes`): the
+                // context — a warm Claude Code process, an HTTP backend's
+                // history — dies with an idle Minion the same way the
+                // speech model does.
+                ai::unload_if_idle();
                 continue;
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -1150,6 +1155,44 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                     }
                     continue;
                 }
+                Some(Reply::AiYes { phrase, suggestion }) => {
+                    // Through `interpret` like anything else, so that what
+                    // the AI suggested can be repeated with "otra vez" and
+                    // taken back with "deshaz" — but never learned, unlike
+                    // `Reply::Yes`: a model's guess is not a nearby alias.
+                    let outcome =
+                        session.interpret(&phrase, suggestion.decision.clone(), context.as_deref());
+                    let (decision, repeats) = match outcome {
+                        Outcome::Perform { decision, repeats } => (decision, repeats),
+                        _ => (suggestion.decision.clone(), 1),
+                    };
+                    let ran = report(
+                        &phrase,
+                        &decision,
+                        1.0,
+                        repeats,
+                        &Reporting {
+                            seconds,
+                            elapsed_ms,
+                            log_ignored_speech: log_ignored_speech.load(Ordering::Relaxed),
+                            play_sounds: play_sounds.load(Ordering::Relaxed),
+                            acted: &acted,
+                            status: &status,
+                        },
+                    );
+                    if ran == Ran::Yes {
+                        note!("ai-run   «{phrase}»  ->  {}", suggestion.description);
+                    }
+                    match ran {
+                        Ran::Blocked => session.forget_undo(),
+                        Ran::Yes if !hold_mode => {
+                            session.open_window(now, conversation_window);
+                            window_open.store(session.window_open(now), Ordering::Relaxed);
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
                 Some(Reply::No { phrase, answered }) => {
                     note!("declined «{phrase}»");
                     // A "no" was the answer and is spent. Anything else was
@@ -1338,6 +1381,79 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                         window_open.store(session.window_open(now), Ordering::Relaxed);
                     }
                 }
+                Outcome::ForgetAiConversation => {
+                    ai::forget();
+                    note!("ai       conversación olvidada — pedido por voz");
+                    acted.store(true, Ordering::Relaxed);
+                    let reply = "Conversación olvidada.";
+                    set_status(&status, &last_utterance_tooltip(&part, reply));
+                    match &voice_reply {
+                        Some(settings) => {
+                            speaking.store(true, Ordering::Relaxed);
+                            speech::say(
+                                reply,
+                                settings.voice.as_deref(),
+                                settings.rate,
+                                settings.device.as_deref(),
+                                &deaf,
+                                speech_tail,
+                            );
+                            speaking.store(false, Ordering::Relaxed);
+                            while listener.utterances.try_recv().is_ok() {}
+                        }
+                        None => actions::show_message(reply),
+                    }
+                }
+                Outcome::AskAi(text) => {
+                    // Thinking can take a while (a cold CLI agent process,
+                    // or a slow HTTP round trip), so both faces the model
+                    // reload already uses are reused here: the menu bar's
+                    // and the HUD's "thinking" state, and the HUD is kept
+                    // on screen for as long as it lasts.
+                    thinking.store(true, Ordering::Relaxed);
+                    hud::set_busy(true);
+                    let result = ai::ask(&text, ai::Purpose::Questions);
+                    hud::set_busy(false);
+                    thinking.store(false, Ordering::Relaxed);
+                    let reply = match result {
+                        Ok(answer) => answer,
+                        // Neither of these ever reaches a backend, so
+                        // `ai::ask` never logs them itself — said here
+                        // instead, or the log would have no trace of them.
+                        Err(ai::AiError::Disabled) => {
+                            note!("ai       «{text}»  ->  desactivada");
+                            "La IA está desactivada; actívala en Ajustes.".to_string()
+                        }
+                        Err(ai::AiError::Budget) => {
+                            note!("ai       «{text}»  ->  límite diario alcanzado");
+                            ai::AiError::Budget.to_string()
+                        }
+                        Err(why) => why.to_string(),
+                    };
+                    set_status(&status, &last_utterance_tooltip(&part, &reply));
+                    acted.store(true, Ordering::Relaxed);
+                    answered.store(true, Ordering::Relaxed);
+                    match &voice_reply {
+                        Some(settings) => {
+                            speaking.store(true, Ordering::Relaxed);
+                            speech::say(
+                                &reply,
+                                settings.voice.as_deref(),
+                                settings.rate,
+                                settings.device.as_deref(),
+                                &deaf,
+                                speech_tail,
+                            );
+                            speaking.store(false, Ordering::Relaxed);
+                            while listener.utterances.try_recv().is_ok() {}
+                        }
+                        None => notify::post("Minion", &reply),
+                    }
+                    if !hold_mode {
+                        session.open_window(now, conversation_window);
+                        window_open.store(session.window_open(now), Ordering::Relaxed);
+                    }
+                }
                 Outcome::Undo(taken) => match taken {
                     Some(Undoable::Typed(length)) => {
                         let mut blocked = None;
@@ -1409,6 +1525,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                     // that arrives as a silent banner has nobody waiting
                     // for the answer, so it is left as a notice.
                     if decision == Decision::Unrecognised {
+                        let mut asked = false;
                         if let Some(question) = session.ask_about(&part, Instant::now()) {
                             note!("asking   «{part}»  ->  {}?", question.description);
                             if ask_aloud(&question.text) {
@@ -1417,6 +1534,47 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                                 // person has to answer in.
                                 session.open_question(&part, question, Instant::now());
                                 hud::set_question_pending(true);
+                                asked = true;
+                            }
+                        }
+                        // Only once the near-miss question above did not
+                        // open: a guess from the vocabulary itself beats
+                        // one from the model, and asking both would leave
+                        // the next "sí" answering whichever was asked
+                        // last. `ai::ask_for_command` is self-gating —
+                        // off, or `[ai] use` without "unknown", both come
+                        // back `None` at no cost beyond the check.
+                        if !asked {
+                            if let Some(suggestion) =
+                                ai::ask_for_command(&part, &commands::ai_catalogue())
+                            {
+                                if suggestion.confidence >= 0.6 {
+                                    if let Some(decision) =
+                                        commands::decision_for_ai_suggestion(&suggestion.command)
+                                    {
+                                        let ai_suggestion = session::AiSuggestion {
+                                            decision,
+                                            description: suggestion.command.clone(),
+                                        };
+                                        if let Some(question) = session
+                                            .ask_ai_suggestion(ai_suggestion, Instant::now())
+                                        {
+                                            note!(
+                                                "asking   «{part}»  ->  {}?  (ai, {:.0}%)",
+                                                question.description,
+                                                suggestion.confidence * 100.0
+                                            );
+                                            if ask_aloud(&question.text) {
+                                                session.open_question(
+                                                    &part,
+                                                    question,
+                                                    Instant::now(),
+                                                );
+                                                hud::set_question_pending(true);
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -1800,7 +1958,7 @@ fn run_menu_bar(
 
     // The "what did it hear" HUD — see hud.rs. Starts pinned exactly as
     // the settings window already read `show_hud` at construction.
-    let hud = Rc::new(hud::Hud::new(mtm, panel.show_hud_on()));
+    let hud = Rc::new(hud::Hud::new(mtm, panel.show_hud_on(), config::load().hud_seconds()));
     // Watches this application's keys, so the shortcut button can be set by
     // pressing a combination rather than typing its name.
     let panel_for_capture = Rc::clone(&panel);

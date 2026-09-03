@@ -83,6 +83,12 @@
 # only around an utterance or while dictating. Off by default; also
 # toggled by voice — "muestra lo que oyes" / "esconde lo que oyes".
 # show_hud = false
+
+# Seconds the HUD panel stays up after the last thing worth showing —
+# a heard utterance, a finished AI answer — with nothing else keeping it
+# open (dictation, a pending question, show_hud, waiting on the AI
+# layer). Default 4.
+# hud_seconds = 4
 # Look once a day for a newer version of Minion and offer to install it.
 # On by default, and silent unless there is one. «Buscar
 # actualizaciones…» in the menu asks straight away either way.
