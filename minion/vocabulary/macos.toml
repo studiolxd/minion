@@ -60,9 +60,9 @@
 #     system:dark-mode, system:wifi-on, system:wifi-off,
 #     system:empty-trash, system:sleep-display, system:screenshot-window,
 #     clipboard:clear, browser:copy-url, browser:duplicate-tab-safari,
-#     browser:duplicate-tab-chrome. There is deliberately no way to run a
-#     script from here: a vocabulary file is data someone may have
-#     downloaded, not code.
+#     browser:duplicate-tab-chrome, hud:show, hud:hide. There is
+#     deliberately no way to run a script from here: a vocabulary file is
+#     data someone may have downloaded, not code.
 #
 #   [[sites]]
 #   name = "gmail"                   # said on its own, after an opening verb
@@ -412,6 +412,16 @@ name = "dormir"
 phrases = ["deja de escuchar", "duérmete", "duerme", "silénciate",
            "apágate", "descansa", "cállate"]
 action = "minion:sleep"
+
+[[commands]]
+name = "mostrar hud"
+phrases = ["muestra lo que oyes"]
+action = "hud:show"
+
+[[commands]]
+name = "esconder hud"
+phrases = ["esconde lo que oyes"]
+action = "hud:hide"
 
 # ── Inside the Finder ───────────────────────────────────────────────────
 #

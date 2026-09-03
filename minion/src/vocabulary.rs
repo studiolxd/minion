@@ -81,6 +81,8 @@ const NAMED_ACTIONS: &[(&str, Action)] = &[
     ("browser:copy-url", Action::Script(system::COPY_URL)),
     ("browser:duplicate-tab-safari", Action::Script(system::DUPLICATE_TAB_SAFARI)),
     ("browser:duplicate-tab-chrome", Action::Script(system::DUPLICATE_TAB_CHROME)),
+    ("hud:show", Action::Hud(true)),
+    ("hud:hide", Action::Hud(false)),
 ];
 
 /// The category given to whatever comes out of `config.toml`.

@@ -209,6 +209,10 @@ pub enum Action {
     Open(&'static str),
     /// Stop acting on commands until resumed from the menu bar.
     Sleep,
+    /// Show (`true`) or hide (`false`) the "what did it hear" HUD — see
+    /// `hud.rs`. Only sets a flag the run loop timer reads; run_action
+    /// itself does no AppKit, since it may run on the listening thread.
+    Hud(bool),
 }
 
 pub struct Command {
@@ -1418,6 +1422,10 @@ fn run_action(action: Action) -> Result<(), String> {
         Action::Type(text) => actions::type_text(text),
         Action::Open(url) => actions::open_url(url, None),
         Action::Sleep => Ok(()),
+        Action::Hud(show) => {
+            crate::hud::request(show);
+            Ok(())
+        }
     }
 }
 
