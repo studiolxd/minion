@@ -453,7 +453,7 @@ fn run_with_timeout(
         .args(arguments)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| AiError::NotConfigured(format!("no se pudo iniciar «{program}»: {e}")))?;
     if let Some(mut stdin) = child.stdin.take() {
@@ -468,9 +468,28 @@ fn run_with_timeout(
         let _ = std::io::Read::read_to_string(&mut reader, &mut text);
         let _ = sender.send(text);
     });
+    // stderr is read too: an agent that prints nothing on stdout usually
+    // said why on stderr («This account requires setting
+    // GOOGLE_CLOUD_PROJECT…»), and «no respondió nada» hides that.
+    let (err_sender, errors) = channel();
+    if let Some(stderr) = child.stderr.take() {
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            let mut reader = BufReader::new(stderr);
+            let _ = std::io::Read::read_to_string(&mut reader, &mut text);
+            let _ = err_sender.send(text);
+        });
+    }
     match output.recv_timeout(timeout) {
         Ok(text) => {
             let _ = child.wait();
+            if text.trim().is_empty() {
+                if let Ok(stderr) = errors.recv_timeout(Duration::from_secs(2)) {
+                    if let Some(reason) = first_complaint(&stderr) {
+                        return Err(AiError::Backend(reason));
+                    }
+                }
+            }
             Ok(text)
         }
         Err(_) => {
@@ -539,6 +558,18 @@ fn codex_reason(message: &str) -> String {
                 .map(str::to_string)
         })
         .unwrap_or_else(|| message.to_string())
+}
+
+/// The first line of an agent's stderr that reads like a reason, minus
+/// the stack trace and the log noise around it.
+fn first_complaint(stderr: &str) -> Option<String> {
+    stderr
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("at ") && !line.starts_with('['))
+        .map(|line| line.trim_start_matches("An unexpected critical error occurred:").trim())
+        .find(|line| !line.is_empty())
+        .map(|line| line.chars().take(200).collect())
 }
 
 /// Reads Gemini CLI's `-o json` output.
@@ -872,5 +903,15 @@ mod tests {
     #[test]
     fn plain_text_from_gemini_is_taken_as_the_answer() {
         assert_eq!(parse_gemini_output("  OK  ").unwrap(), "OK");
+    }
+
+    #[test]
+    fn the_reason_on_stderr_survives_and_the_stack_trace_does_not() {
+        let stderr = "[WARN] something\nAn unexpected critical error occurred:Error: This account requires setting the GOOGLE_CLOUD_PROJECT env var.\n    at setupUser (file:///x.js:85:15)\n";
+        assert_eq!(
+            first_complaint(stderr).as_deref(),
+            Some("Error: This account requires setting the GOOGLE_CLOUD_PROJECT env var.")
+        );
+        assert!(first_complaint("   \n").is_none());
     }
 }
