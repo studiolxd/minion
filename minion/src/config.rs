@@ -15,7 +15,7 @@ use serde::Deserialize;
 const DEFAULT_UNLOAD_MINUTES: u64 = 5;
 
 /// Shortcut that pauses and resumes when nothing is set.
-pub const DEFAULT_RESUME_SHORTCUT: &str = "alt-space";
+pub const DEFAULT_RESUME_SHORTCUT: &str = "ctrl-alt-m";
 
 /// Cosine similarity a voice must reach to be treated as yours.
 ///
@@ -563,6 +563,18 @@ mod tests {
         // Anything sensible is still honoured.
         config.audio.max_utterance_ms = Some(6_000);
         assert_eq!(config.audio_settings().max_utterance_ms, 6_000);
+    }
+
+    #[test]
+    fn the_default_resume_shortcut_parses_and_is_not_alt_space() {
+        // alt-space collides with the remaps Alfred, Raycast and
+        // Spotlight commonly use for their own summon shortcut.
+        assert_ne!(DEFAULT_RESUME_SHORTCUT, "alt-space");
+        assert!(
+            crate::actions::parse_shortcut(DEFAULT_RESUME_SHORTCUT).is_some(),
+            "the default must be a shortcut actions::parse_shortcut accepts"
+        );
+        assert_eq!(Config::default().resume_shortcut().as_deref(), Some(DEFAULT_RESUME_SHORTCUT));
     }
 
     #[test]

@@ -65,9 +65,10 @@
 # speech_rate = 190
 
 # Keyboard shortcut that pauses and resumes from anywhere, written as it
-# appears on the menu: "alt-space", "ctrl+shift+m". Empty disables it.
-# Default "alt-space".
-# resume_shortcut = "alt-space"
+# appears on the menu: "ctrl-alt-m", "ctrl+shift+m". Empty disables it.
+# Default "ctrl-alt-m". (Not "alt-space": that collides with the remaps
+# Alfred, Raycast and Spotlight commonly use.)
+# resume_shortcut = "ctrl-alt-m"
 
 [audio]
 # RMS energy above which someone is considered to be speaking.

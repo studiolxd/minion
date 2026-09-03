@@ -64,7 +64,8 @@ documentation:
   behaves oddly — off by default, since it writes everything said nearby
 - the pause/resume keyboard shortcut, captured by pressing it rather than
   typing its name; a modifier is required, Escape cancels the capture, and
-  **Ninguno** turns the shortcut off entirely
+  **Ninguno** turns the shortcut off entirely — default is `ctrl-alt-m`
+  (not ⌥Space, which Alfred, Raycast and Spotlight commonly remap)
 - **tu voz** — enrol or forget the voice profile Minion checks commands
   against; *Olvidar mi voz* deletes it after confirming, and Minion goes
   back to obeying whoever speaks
