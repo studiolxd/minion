@@ -135,7 +135,7 @@ pub fn run(model_path: &str) -> Result<()> {
                 .utterances
                 .recv_timeout(Duration::from_secs(60))
                 .map_err(|_| anyhow!("no se oyó nada; inténtalo otra vez"))?;
-            if let Some(embedding) = model.embed(&utterance) {
+            if let Some(embedding) = model.embed(utterance.speech()) {
                 collected.push(embedding);
                 println!("        ✓ recogida\n");
                 break;

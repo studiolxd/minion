@@ -60,13 +60,48 @@ impl Default for Settings {
     }
 }
 
+/// One finished utterance, and where the speech inside it sits.
+///
+/// The samples carry the 320 ms preroll in front and the whole
+/// `silence_end_ms` hangover behind, because the recogniser needs both: cut
+/// the preroll and "Chrome" loses its consonant again. The speaker model
+/// wants the opposite — a second of room tone per phrase drags its mean
+/// towards the room rather than the voice — so the offsets say where the
+/// energy actually crossed the threshold, and [`Utterance::speech`] hands
+/// out that stretch alone.
+#[derive(Clone, Debug)]
+pub struct Utterance {
+    /// 16 kHz mono, preroll and hangover included.
+    pub samples: Vec<f32>,
+    /// Where the first block above the threshold begins.
+    pub speech_start: usize,
+    /// Where the last block above the threshold ends.
+    pub speech_end: usize,
+}
+
+impl Utterance {
+    /// The speech alone, without the preroll or the trailing silence.
+    ///
+    /// NOTE: the speaker threshold (0.32) was measured on scores computed
+    /// over the whole utterance, silence and all. Feeding only the speech
+    /// should raise same-speaker scores — it removes the room tone that was
+    /// pulling every embedding towards the same place — so the threshold
+    /// wants re-measuring on real recordings before it is trusted as tight
+    /// or as loose as it looks now.
+    pub fn speech(&self) -> &[f32] {
+        let end = self.speech_end.min(self.samples.len());
+        let start = self.speech_start.min(end);
+        &self.samples[start..end]
+    }
+}
+
 /// A running microphone. Dropping it stops capture.
 pub struct Listener {
     /// Replaced when the system's default input changes, so the field is
     /// held rather than ignored.
     _stream: Arc<Mutex<Option<cpal::platform::Stream>>>,
     /// Completed utterances, as 16 kHz mono samples.
-    pub utterances: Receiver<Vec<f32>>,
+    pub utterances: Receiver<Utterance>,
     pub source_hz: u32,
     pub channels: usize,
 }
@@ -336,6 +371,9 @@ struct Segmenter {
     speech_blocks: usize,
     silence_blocks: usize,
     speaking: bool,
+    /// Where the speech starts and ends inside `current`.
+    speech_start: usize,
+    speech_end: usize,
     noise: NoiseFloor,
     /// The most recent quiet blocks, kept in case speech starts.
     preroll: std::collections::VecDeque<Vec<f32>>,
@@ -349,13 +387,15 @@ impl Segmenter {
             speech_blocks: 0,
             silence_blocks: 0,
             speaking: false,
+            speech_start: 0,
+            speech_end: 0,
             noise: NoiseFloor::new(),
             preroll: std::collections::VecDeque::with_capacity(PREROLL_BLOCKS + 1),
         }
     }
 
     /// Feeds one block. Returns a finished utterance when there is one.
-    fn push(&mut self, block: &[f32]) -> Option<Vec<f32>> {
+    fn push(&mut self, block: &[f32]) -> Option<Utterance> {
         let level = rms(block);
         let threshold = self.noise.threshold(self.settings.speech_threshold);
         let has_speech = level > threshold;
@@ -372,6 +412,9 @@ impl Segmenter {
                 for held in self.preroll.drain(..) {
                     self.current.extend_from_slice(&held);
                 }
+                // Everything replaced above is room tone: the speech proper
+                // starts here.
+                self.speech_start = self.current.len();
             }
             self.speaking = true;
             self.speech_blocks += 1;
@@ -388,6 +431,11 @@ impl Segmenter {
 
         if self.speaking {
             self.current.extend_from_slice(block);
+            if has_speech {
+                // The last block with energy in it: everything after this
+                // is the hangover that closes the utterance.
+                self.speech_end = self.current.len();
+            }
         }
 
         let max_samples = self.settings.max_utterance_ms * TARGET_HZ as usize / 1000;
@@ -400,10 +448,17 @@ impl Segmenter {
         }
 
         let long_enough = self.speech_blocks >= self.settings.min_speech_ms / BLOCK_MS;
-        let utterance = std::mem::take(&mut self.current);
+        let samples = std::mem::take(&mut self.current);
+        let utterance = Utterance {
+            speech_start: self.speech_start,
+            speech_end: self.speech_end.max(self.speech_start),
+            samples,
+        };
         self.speaking = false;
         self.speech_blocks = 0;
         self.silence_blocks = 0;
+        self.speech_start = 0;
+        self.speech_end = 0;
         self.preroll.clear();
 
         long_enough.then_some(utterance)
@@ -599,7 +654,7 @@ mod tests {
         vec![vec![level; BLOCK_SAMPLES]; count]
     }
 
-    fn feed(segmenter: &mut Segmenter, blocks: Vec<Vec<f32>>) -> Vec<Vec<f32>> {
+    fn feed(segmenter: &mut Segmenter, blocks: Vec<Vec<f32>>) -> Vec<Utterance> {
         blocks
             .iter()
             .filter_map(|b| segmenter.push(b))
@@ -628,11 +683,60 @@ mod tests {
         assert_eq!(done.len(), 1);
         let expected = (50 + PREROLL_BLOCKS) * BLOCK_SAMPLES;
         assert!(
-            done[0].len() >= expected,
+            done[0].samples.len() >= expected,
             "the utterance should carry {PREROLL_MS} ms from before it started: \
              got {} samples, expected at least {expected}",
-            done[0].len()
+            done[0].samples.len()
         );
+    }
+
+    #[test]
+    fn the_speech_slice_leaves_the_silence_behind() {
+        // The recogniser wants the preroll and the hangover; the speaker
+        // model does not — a second of room tone per phrase drags its mean
+        // away from the voice.
+        let mut segmenter = Segmenter::new(Settings::default());
+        feed(&mut segmenter, blocks_of(0.0, 40)); // quiet room
+        feed(&mut segmenter, blocks_of(0.2, 50)); // 1 s of speech
+        let done = feed(&mut segmenter, blocks_of(0.0, 80));
+        assert_eq!(done.len(), 1);
+        let utterance = &done[0];
+
+        assert_eq!(
+            utterance.speech_start,
+            PREROLL_BLOCKS * BLOCK_SAMPLES,
+            "the speech should start where the preroll ends"
+        );
+        assert_eq!(
+            utterance.speech().len(),
+            50 * BLOCK_SAMPLES,
+            "the speech slice should be the speech and nothing else"
+        );
+        assert!(
+            utterance.samples.len() > utterance.speech().len(),
+            "while the samples themselves keep both margins"
+        );
+        assert!(
+            utterance.speech().iter().all(|s| *s > 0.1),
+            "no silence should have survived the trim"
+        );
+    }
+
+    #[test]
+    fn a_speech_slice_is_always_inside_its_samples() {
+        // Whatever the offsets say, slicing must not panic.
+        let utterance = Utterance {
+            samples: vec![0.0; 10],
+            speech_start: 8,
+            speech_end: 400,
+        };
+        assert_eq!(utterance.speech().len(), 2);
+        let backwards = Utterance {
+            samples: vec![0.0; 10],
+            speech_start: 9,
+            speech_end: 3,
+        };
+        assert!(backwards.speech().is_empty());
     }
 
     #[test]
@@ -670,7 +774,7 @@ mod tests {
         let done = feed(&mut segmenter, blocks_of(0.2, 200));
         assert!(!done.is_empty(), "continuous noise must still be cut");
         assert!(
-            done[0].len() <= 600 * TARGET_HZ as usize / 1000 + BLOCK_SAMPLES,
+            done[0].samples.len() <= 600 * TARGET_HZ as usize / 1000 + BLOCK_SAMPLES,
             "the cut should respect max_utterance_ms"
         );
     }

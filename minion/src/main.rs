@@ -298,12 +298,12 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
         if !active.load(Ordering::Relaxed) {
             continue;
         }
-        let seconds = utterance.len() as f32 / audio::TARGET_HZ as f32;
+        let seconds = utterance.samples.len() as f32 / audio::TARGET_HZ as f32;
         let started = Instant::now();
 
         if save_recordings {
             let name = chrono::Local::now().format("%H-%M-%S").to_string();
-            match audio::save_recording(&utterance, &name) {
+            match audio::save_recording(&utterance.samples, &name) {
                 Ok(path) => note!("saved    {}", path.display()),
                 Err(e) => note!("could not save the recording: {e}"),
             }
@@ -333,7 +333,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                     }
                 }
             }
-            let embedding = voice.as_mut().and_then(|v| v.model.embed(&utterance));
+            let embedding = voice.as_mut().and_then(|v| v.model.embed(utterance.speech()));
             if let Ok(mut session) = training.lock() {
                 if let Some(active_session) = session.as_mut() {
                     if active_session.accept(embedding) {
@@ -358,7 +358,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
             // there is nothing to compare against, so anyone is obeyed.
             let known_voice = !voice.profile.is_empty();
             if known_voice {
-                match voice.model.embed(&utterance) {
+                match voice.model.embed(utterance.speech()) {
                     Some(heard) => {
                         let likeness = speaker::similarity(&heard, &voice.profile);
                         if likeness < voice.threshold {
@@ -396,7 +396,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
         let Some(loaded) = model.as_mut() else {
             continue;
         };
-        let transcript = match loaded.transcribe_samples(utterance, audio::TARGET_HZ, 1, None) {
+        let transcript = match loaded.transcribe_samples(utterance.samples, audio::TARGET_HZ, 1, None) {
             Ok(result) => result.text.trim().to_string(),
             Err(e) => {
                 note!("error    transcription failed: {e}");
