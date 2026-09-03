@@ -356,18 +356,19 @@ const KEYCHAIN_SERVICE: &str = "minion-ai";
 pub struct Keychain {
     pub read: fn(&str) -> Option<String>,
     pub write: fn(&str, &str) -> Result<(), String>,
+    pub delete: fn(&str) -> Result<(), String>,
 }
 
 /// The one in force: the real keychain outside tests, an in-memory map
 /// inside them.
 #[cfg(test)]
 fn keychain() -> Keychain {
-    Keychain { read: fake_keychain::read, write: fake_keychain::write }
+    Keychain { read: fake_keychain::read, write: fake_keychain::write, delete: fake_keychain::delete }
 }
 
 #[cfg(not(test))]
 fn keychain() -> Keychain {
-    Keychain { read: security_read, write: security_write }
+    Keychain { read: security_read, write: security_write, delete: security_delete }
 }
 
 /// Reads one key out of the login keychain.
@@ -413,6 +414,22 @@ fn security_write(provider: &str, key: &str) -> Result<(), String> {
     }
 }
 
+/// Deletes one key from the login keychain. `security` refuses when there
+/// was nothing to delete, which is not a problem worth reporting back —
+/// «Olvidar clave» on an already-empty entry should not look like a
+/// failure.
+fn security_delete(provider: &str) -> Result<(), String> {
+    let status = std::process::Command::new("/usr/bin/security")
+        .args(["delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", provider])
+        .status()
+        .map_err(|e| e.to_string())?;
+    if status.success() || security_read(provider).is_none() {
+        Ok(())
+    } else {
+        Err("el llavero rechazó el borrado".into())
+    }
+}
+
 /// The keychain a test run gets: a map in this process, and nothing else.
 #[cfg(test)]
 mod fake_keychain {
@@ -428,6 +445,12 @@ mod fake_keychain {
     pub fn write(provider: &str, key: &str) -> Result<(), String> {
         let mut held = STORED.lock().map_err(|_| "llavero bloqueado".to_string())?;
         held.get_or_insert_with(HashMap::new).insert(provider.to_string(), key.to_string());
+        Ok(())
+    }
+
+    pub fn delete(provider: &str) -> Result<(), String> {
+        let mut held = STORED.lock().map_err(|_| "llavero bloqueado".to_string())?;
+        held.get_or_insert_with(HashMap::new).remove(provider);
         Ok(())
     }
 }
@@ -456,6 +479,101 @@ fn set_key(provider: &str, key: &str) -> Result<(), String> {
         return Err("no se ha leído ninguna clave".into());
     }
     (keychain().write)(provider, key)
+}
+
+/// Stores a key for `provider`, typed straight into the preferences
+/// window rather than piped in on a terminal. Same helper
+/// [`set_key_from_stdin`] uses, and the same keychain entry «minion ai
+/// set-key» would write.
+pub fn store_key(provider: &str, key: &str) -> Result<(), String> {
+    set_key(provider, key)
+}
+
+/// Whether a key is on file for `provider`. Never returns the key itself —
+/// the preferences window uses this to decide what its status line says,
+/// not to show what was stored.
+pub fn has_key(provider: &str) -> bool {
+    keychain_key(provider).is_some()
+}
+
+/// Removes whatever key is on file for `provider`. Not an error when
+/// there was none.
+pub fn forget_key(provider: &str) -> Result<(), String> {
+    (keychain().delete)(provider)
+}
+
+/// One backend `[ai] backend` accepts, as the preferences window's
+/// provider popup wants it: a human label, whether it needs a key before
+/// it can be asked anything, and what `[ai] model` defaults to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderInfo {
+    /// The `[ai] backend` value.
+    pub id: &'static str,
+    /// What the popup calls it.
+    pub label: &'static str,
+    /// The CLI agents answer without one; every HTTP provider but the two
+    /// local servers needs one before it is worth asking anything.
+    pub needs_key: bool,
+    /// Shown as the model field's placeholder when `[ai] model` is empty:
+    /// what the backend actually uses in that case.
+    pub default_model: &'static str,
+}
+
+/// The human label an HTTP preset is not asked for itself.
+fn http_label(id: &'static str) -> &'static str {
+    match id {
+        "openai" => "OpenAI",
+        "deepseek" => "DeepSeek",
+        "mistral" => "Mistral",
+        "groq" => "Groq",
+        "openrouter" => "OpenRouter",
+        "xai" => "xAI",
+        "gemini" => "Gemini",
+        "ollama" => "Ollama (local)",
+        "lmstudio" => "LM Studio (local)",
+        _ => id,
+    }
+}
+
+/// Every backend `[ai] backend` accepts, in the order the preferences
+/// window's provider popup shows them: the CLI agents first (already paid
+/// for, no key to manage), then Anthropic's own API, then the
+/// OpenAI-compatible presets.
+///
+/// Built once from [`cli::AGENTS`], [`anthropic::DEFAULT_MODEL`] and
+/// [`openai_compat::PRESETS`] rather than duplicated here by hand, so a
+/// preset added to either module shows up in the popup without a second
+/// edit.
+pub fn providers() -> &'static [ProviderInfo] {
+    static PROVIDERS: std::sync::OnceLock<Vec<ProviderInfo>> = std::sync::OnceLock::new();
+    PROVIDERS
+        .get_or_init(|| {
+            let mut list: Vec<ProviderInfo> = cli::AGENTS
+                .iter()
+                .map(|agent| ProviderInfo {
+                    id: agent.backend,
+                    label: agent.label,
+                    needs_key: false,
+                    default_model: "",
+                })
+                .collect();
+            list.push(ProviderInfo {
+                id: "anthropic",
+                label: "Anthropic",
+                needs_key: true,
+                default_model: anthropic::DEFAULT_MODEL,
+            });
+            for preset in openai_compat::PRESETS {
+                list.push(ProviderInfo {
+                    id: preset.name,
+                    label: http_label(preset.name),
+                    needs_key: preset.needs_key,
+                    default_model: preset.model,
+                });
+            }
+            list
+        })
+        .as_slice()
 }
 
 /// Asks the configured backend a question.
@@ -1151,5 +1269,51 @@ mod tests {
     fn errors_are_written_in_spanish() {
         assert!(AiError::Budget.to_string().contains("límite"));
         assert!(AiError::Timeout.to_string().contains("demasiado"));
+    }
+
+    #[test]
+    fn providers_covers_every_backend_id_the_config_accepts() {
+        // Mirrors `AiConfig::backend`'s own doc comment in config.rs.
+        const EXPECTED: &[&str] = &[
+            "claude-code",
+            "codex",
+            "gemini-cli",
+            "openai",
+            "anthropic",
+            "deepseek",
+            "mistral",
+            "groq",
+            "openrouter",
+            "xai",
+            "gemini",
+            "ollama",
+            "lmstudio",
+        ];
+        let ids: Vec<&str> = providers().iter().map(|info| info.id).collect();
+        for id in EXPECTED {
+            assert!(ids.contains(id), "providers() is missing «{id}»");
+        }
+        assert_eq!(ids.len(), EXPECTED.len(), "providers() lists an id not in AiConfig's doc comment");
+    }
+
+    #[test]
+    fn only_the_local_servers_and_cli_agents_need_no_key() {
+        let keyless: Vec<&str> =
+            providers().iter().filter(|info| !info.needs_key).map(|info| info.id).collect();
+        assert_eq!(keyless, vec!["claude-code", "codex", "gemini-cli", "ollama", "lmstudio"]);
+    }
+
+    #[test]
+    fn a_stored_key_is_reported_by_has_key_and_removed_by_forget_key() {
+        assert!(!has_key("proveedor-de-prueba-store-key"));
+        store_key("proveedor-de-prueba-store-key", "sk-guardada").unwrap();
+        assert!(has_key("proveedor-de-prueba-store-key"));
+        forget_key("proveedor-de-prueba-store-key").unwrap();
+        assert!(!has_key("proveedor-de-prueba-store-key"));
+    }
+
+    #[test]
+    fn forgetting_a_key_that_was_never_there_is_not_an_error() {
+        assert!(forget_key("proveedor-sin-clave-de-prueba").is_ok());
     }
 }

@@ -20,8 +20,8 @@ use objc2::rc::Retained;
 use objc2::MainThreadMarker;
 use objc2_app_kit::{
     NSAccessibility, NSAutoresizingMaskOptions, NSApplication, NSBackingStoreType, NSButton, NSColor, NSFont, NSLineBreakMode,
-    NSPopUpButton, NSScrollView, NSSlider, NSTextField, NSTextView, NSView, NSWindow,
-    NSWindowStyleMask,
+    NSPopUpButton, NSScrollView, NSSecureTextField, NSSlider, NSTextField, NSTextView, NSView,
+    NSWindow, NSWindowStyleMask,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
@@ -621,6 +621,30 @@ pub struct Preferences {
     /// does in `main.rs`, so this window is never blocked waiting on it.
     ai_probe_result: Arc<Mutex<Option<String>>>,
     ai_probe_running: Cell<bool>,
+    /// Re-runs `crate::ai::detect()` on a worker thread — the probes it
+    /// runs are real requests to real CLI agents, seconds each, so this
+    /// window's own thread never blocks on one.
+    ai_check: Press,
+    ai_check_status: Retained<NSTextField>,
+    ai_detect_result: Arc<Mutex<Option<Vec<crate::ai::Detected>>>>,
+    ai_detect_running: Cell<bool>,
+    /// Shown only for a backend in [`crate::ai::ProviderInfo::needs_key`].
+    ai_key_label: Retained<NSTextField>,
+    ai_key_field: Retained<NSSecureTextField>,
+    ai_save_key: Press,
+    ai_forget_key: Press,
+    ai_key_status: Retained<NSTextField>,
+    ai_model_field: Retained<NSTextField>,
+    last_ai_model: std::cell::RefCell<String>,
+    /// Only meaningful for Codex, whose installed CLI may name a model the
+    /// user's ChatGPT plan does not actually allow.
+    ai_codex_hint: Retained<NSTextField>,
+    /// Shown only for an OpenAI-compatible backend — the two local servers
+    /// and any cloud preset pointed at a proxy in front of it.
+    ai_base_url_label: Retained<NSTextField>,
+    ai_base_url_field: Retained<NSTextField>,
+    ai_base_url_hint: Retained<NSTextField>,
+    last_ai_base_url: std::cell::RefCell<String>,
 }
 
 /// A shortcut written the way macOS shows it: ⌥Space, ⇧⌘B.
@@ -713,6 +737,107 @@ fn sensitivity_step(threshold: f32) -> f64 {
 fn sensitivity_at(step: f64) -> (&'static str, f32) {
     let index = (step.round().max(0.0) as usize).min(SENSITIVITY.len() - 1);
     SENSITIVITY[index]
+}
+
+/// Whether `id` is one of the CLI agents `crate::ai::cli::AGENTS` lists —
+/// the ones a real probe can say something about — rather than an HTTP
+/// provider, local or not.
+fn is_cli_provider(id: &str) -> bool {
+    crate::ai::cli::AGENTS.iter().any(|agent| agent.backend == id)
+}
+
+/// Whether `id` reaches an OpenAI-compatible endpoint, which is the only
+/// kind `[ai] base_url` is offered for — Anthropic's own API and the CLI
+/// agents have no base URL worth overriding from this window.
+fn is_openai_compatible_provider(id: &str) -> bool {
+    crate::ai::openai_compat::preset(id).is_some()
+}
+
+/// A duration, written the way a Spanish sentence writes one: a comma for
+/// the decimal point.
+fn spanish_seconds(seconds: f32) -> String {
+    format!("{seconds:.1}").replace('.', ",")
+}
+
+/// The state word(s) shown after a provider's name in the backend popup.
+///
+/// Pure, so every state — including the ones this Mac cannot itself be in
+/// right now, such as a Codex model the account refuses — can be checked
+/// without a real probe. `detected` is `None` before the worker thread
+/// that runs `crate::ai::detect()` has answered even once.
+fn provider_state_text(
+    is_cli: bool,
+    needs_key: bool,
+    has_key: bool,
+    detected: Option<&crate::ai::Detected>,
+) -> String {
+    if is_cli {
+        return match detected {
+            None => "comprobando…".to_string(),
+            Some(found) if found.path.is_none() => "no disponible".to_string(),
+            Some(found) if found.authenticated => {
+                let seconds = found.latency.map_or(0.0, |latency| latency.as_secs_f32());
+                format!("listo ({} s)", spanish_seconds(seconds))
+            }
+            Some(found) => {
+                let why = found.problem.as_deref().unwrap_or("no responde");
+                format!("instalado, {why}")
+            }
+        };
+    }
+    if !needs_key {
+        "sin clave".to_string()
+    } else if has_key {
+        "clave guardada".to_string()
+    } else {
+        "falta la clave".to_string()
+    }
+}
+
+/// The backend popup's entries, in `providers`' order. `detected` is the
+/// last-known result of `crate::ai::detect()`, or `None` before the first
+/// one has come back.
+fn ai_backend_labels(
+    providers: &[crate::ai::ProviderInfo],
+    detected: Option<&[crate::ai::Detected]>,
+) -> Vec<String> {
+    providers
+        .iter()
+        .map(|info| {
+            let is_cli = is_cli_provider(info.id);
+            let found = detected.and_then(|list| list.iter().find(|found| found.backend == info.id));
+            let has_key = !is_cli && info.needs_key && crate::ai::has_key(info.id);
+            let state = provider_state_text(is_cli, info.needs_key, has_key, found);
+            format!("{} — {state}", info.label)
+        })
+        .collect()
+}
+
+/// Lays out a line of explanation exactly like [`Layout::hint`], but hands
+/// back the label instead of losing it — for a hint that is only shown for
+/// some backends and has to be hidden and shown again later.
+fn hidable_hint(layout: &mut Layout, mtm: MainThreadMarker, text: &str) -> Retained<NSTextField> {
+    layout.gap(spacing::BEFORE_HINT);
+    let width = layout.content_width();
+    let blank = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, 0.0));
+    let view = small_label(mtm, text, blank);
+    let frame = layout.place(text_height(&view, width, text), 0.0);
+    view.setFrame(frame);
+    layout.add(&view);
+    layout.gap(spacing::AFTER_HINT);
+    view
+}
+
+/// What the model field's placeholder says: the backend's own default, or
+/// nothing for a CLI agent, which has no fixed one to name.
+fn model_placeholder(providers: &[crate::ai::ProviderInfo], backend: &str) -> String {
+    providers
+        .iter()
+        .find(|info| info.id == backend)
+        .map(|info| info.default_model)
+        .filter(|model| !model.is_empty())
+        .map(|model| format!("por defecto: {model}"))
+        .unwrap_or_default()
 }
 
 impl Preferences {
@@ -974,36 +1099,128 @@ impl Preferences {
             INDENT,
         );
 
-        let detected = crate::ai::detect();
-        let ai_backend_labels: Vec<String> = detected
-            .iter()
-            .map(|found| {
-                let state = if found.path.is_none() {
-                    "no instalado"
-                } else if found.authenticated {
-                    "listo"
-                } else {
-                    "no utilizable"
-                };
-                format!("{} — {state}", found.label)
-            })
+        // The full list is built before any probe has run — see
+        // `ai_backend_labels` below, called with `None` — so opening this
+        // window never waits on one. The probes themselves start on a
+        // worker thread a few lines down, and «Comprobar» repeats them.
+        let providers = crate::ai::providers();
+        let ai_backend_options: Vec<(String, &str)> = ai_backend_labels(providers, None)
+            .into_iter()
+            .zip(providers.iter())
+            .map(|(label, info)| (label, info.id))
             .collect();
-        let ai_backend_options: Vec<(&str, &str)> = ai_backend_labels
-            .iter()
-            .zip(detected.iter())
-            .map(|(label, found)| (label.as_str(), found.backend))
-            .collect();
+        let ai_backend_options_ref: Vec<(&str, &str)> =
+            ai_backend_options.iter().map(|(label, id)| (label.as_str(), *id)).collect();
         let current_backend = if ai_settings.backend.is_empty() {
-            detected.first().map_or("claude-code", |found| found.backend)
+            providers.first().map_or("claude-code", |info| info.id)
         } else {
             ai_settings.backend.as_str()
         };
         layout.field_label("Backend");
-        let ai_backend = layout.popup(&ai_backend_options, current_backend);
+        let ai_backend = layout.popup(&ai_backend_options_ref, current_backend);
+        layout.gap(spacing::SIBLING);
+
+        let ai_check_row = layout.place(spacing::BUTTON, 0.0);
+        // Safety: no target and no action, so nothing is called back into.
+        let ai_check = unsafe {
+            NSButton::buttonWithTitle_target_action(&NSString::from_str("Comprobar"), None, None, mtm)
+        };
+        ai_check.setFrame(narrow(ai_check_row, 100.0));
+        layout.add_control(&ai_check, "Comprobar los backends de IA");
+        let ai_check_status = plain_label(
+            mtm,
+            "",
+            beside(ai_check_row, 100.0, layout.content_width() - 100.0 - spacing::SIBLING),
+        );
+        layout.add(&ai_check_status);
+        layout.gap(spacing::SIBLING);
         layout.hint(
-            "Las claves de API no se editan aquí: guárdalas con \
-             «minion ai set-key <backend>» en la terminal.",
+            "Los agentes de terminal (Claude Code, Codex, Gemini CLI) se \
+             prueban de verdad, y eso tarda unos segundos; los demás solo \
+             se miran para ver si tienen una clave guardada.",
             0.0,
+        );
+
+        let key_row = layout.place(spacing::LABEL, 0.0);
+        let ai_key_label = plain_label(mtm, "Clave de API", key_row);
+        layout.add(&ai_key_label);
+        layout.last_label = Some("Clave de API".to_string());
+        layout.gap(spacing::AFTER_LABEL);
+
+        let ai_key_field = NSSecureTextField::new(mtm);
+        ai_key_field.setPlaceholderString(Some(&NSString::from_str("Clave nueva")));
+        ai_key_field.setFrame(layout.place(spacing::FIELD, 0.0));
+        layout.add_control(&ai_key_field, "Clave de API");
+        layout.gap(spacing::SIBLING);
+
+        let key_buttons_row = layout.place(spacing::BUTTON, 0.0);
+        // Safety: no target and no action, so nothing is called back into.
+        let ai_save_key = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str("Guardar clave"),
+                None,
+                None,
+                mtm,
+            )
+        };
+        ai_save_key.setFrame(narrow(key_buttons_row, 120.0));
+        layout.add_control(&ai_save_key, "Guardar la clave en el llavero");
+        // Safety: no target and no action, so nothing is called back into.
+        let ai_forget_key = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str("Olvidar clave"),
+                None,
+                None,
+                mtm,
+            )
+        };
+        ai_forget_key.setFrame(beside(key_buttons_row, 120.0, 120.0));
+        layout.add_control(&ai_forget_key, "Olvidar la clave guardada");
+        layout.gap(spacing::SIBLING);
+
+        let ai_key_status = plain_label(mtm, "", layout.place(spacing::LABEL, 0.0));
+        layout.add(&ai_key_status);
+        layout.gap(spacing::SIBLING);
+        layout.hint(
+            "La clave se guarda en el llavero de macOS, nunca en config.toml \
+             ni en el registro; nunca se vuelve a mostrar aquí. También se \
+             puede guardar con «minion ai set-key <backend>» en la terminal.",
+            0.0,
+        );
+
+        layout.field_label("Modelo");
+        let ai_model_field = NSTextField::new(mtm);
+        ai_model_field.setStringValue(&NSString::from_str(&ai_settings.model));
+        ai_model_field.setPlaceholderString(Some(&NSString::from_str(&model_placeholder(
+            providers,
+            current_backend,
+        ))));
+        ai_model_field.setFrame(layout.place(spacing::FIELD, 0.0));
+        layout.add_control(&ai_model_field, "Modelo");
+        layout.gap(spacing::SIBLING);
+        let ai_codex_hint = hidable_hint(
+            &mut layout,
+            mtm,
+            "Codex, con una cuenta de ChatGPT, puede rechazar un modelo \
+             que su propio archivo de configuración nombra si el plan no lo \
+             permite.",
+        );
+
+        let base_url_row = layout.place(spacing::LABEL, 0.0);
+        let ai_base_url_label = plain_label(mtm, "URL base", base_url_row);
+        layout.add(&ai_base_url_label);
+        layout.last_label = Some("URL base".to_string());
+        layout.gap(spacing::AFTER_LABEL);
+        let ai_base_url_field = NSTextField::new(mtm);
+        ai_base_url_field.setStringValue(&NSString::from_str(&ai_settings.base_url));
+        ai_base_url_field.setFrame(layout.place(spacing::FIELD, 0.0));
+        layout.add_control(&ai_base_url_field, "URL base");
+        layout.gap(spacing::SIBLING);
+        let ai_base_url_hint = hidable_hint(
+            &mut layout,
+            mtm,
+            "Solo para un servidor local o un proxy delante de un proveedor \
+             compatible con OpenAI.",
         );
 
         layout.field_label("Se usa para");
@@ -1212,8 +1429,39 @@ impl Preferences {
             ai_status,
             ai_probe_result: Arc::new(Mutex::new(None)),
             ai_probe_running: Cell::new(false),
+            ai_check: Press::new(ai_check),
+            ai_check_status,
+            ai_detect_result: {
+                // The section is on screen the moment this window exists —
+                // it is built once at startup and only shown or hidden
+                // after that — so the probes start right here, on their
+                // own thread, rather than blocking the constructor.
+                let result = Arc::new(Mutex::new(None));
+                let slot = Arc::clone(&result);
+                std::thread::spawn(move || {
+                    let detected = crate::ai::detect();
+                    if let Ok(mut held) = slot.lock() {
+                        *held = Some(detected);
+                    }
+                });
+                result
+            },
+            ai_detect_running: Cell::new(true),
+            ai_key_label,
+            ai_key_field,
+            ai_save_key: Press::new(ai_save_key),
+            ai_forget_key: Press::new(ai_forget_key),
+            ai_key_status,
+            ai_model_field,
+            last_ai_model: std::cell::RefCell::new(ai_settings.model.clone()),
+            ai_codex_hint,
+            ai_base_url_label,
+            ai_base_url_field,
+            ai_base_url_hint,
+            last_ai_base_url: std::cell::RefCell::new(ai_settings.base_url.clone()),
         };
         preferences.update_readouts();
+        preferences.sync_ai_provider_controls();
         preferences
     }
 
@@ -1282,6 +1530,65 @@ impl Preferences {
                 format!("{seconds:.0} s")
             },
         );
+    }
+
+    /// Rebuilds the backend popup's entries in place, keeping whichever one
+    /// is selected.
+    ///
+    /// `NSPopUpButton` has no "just change this item's title" call, so this
+    /// clears it and adds the labels back — the values behind them, and
+    /// their order, never change, only what `crate::ai::detect()` (or a
+    /// freshly stored key) has to say about each one.
+    fn refresh_ai_backend_labels(&self, detected: Option<&[crate::ai::Detected]>) {
+        let providers = crate::ai::providers();
+        let labels = ai_backend_labels(providers, detected);
+        let current = self.ai_backend.value();
+        self.ai_backend.control.removeAllItems();
+        for label in &labels {
+            self.ai_backend.control.addItemWithTitle(&NSString::from_str(label));
+        }
+        let index = self.ai_backend.values.iter().position(|value| *value == current).unwrap_or(0);
+        self.ai_backend.control.selectItemAtIndex(index as isize);
+        self.ai_backend.last.set(index as isize);
+    }
+
+    /// Shows and hides the key, model and base-URL controls for whichever
+    /// backend the popup names right now, and refreshes their text.
+    ///
+    /// Called once at construction and again every time the popup changes,
+    /// since these fields describe the *selected* backend, not necessarily
+    /// the one `[ai] backend` currently has active.
+    fn sync_ai_provider_controls(&self) {
+        let backend = self.ai_backend.value();
+        let providers = crate::ai::providers();
+        let info = providers.iter().find(|info| info.id == backend);
+        let needs_key = info.is_some_and(|info| info.needs_key);
+
+        self.ai_key_label.setHidden(!needs_key);
+        self.ai_key_field.setHidden(!needs_key);
+        self.ai_save_key.control.setHidden(!needs_key);
+        self.ai_forget_key.control.setHidden(!needs_key);
+        self.ai_key_status.setHidden(!needs_key);
+        if needs_key {
+            self.ai_key_field.setStringValue(&NSString::from_str(""));
+            let text = if crate::ai::has_key(&backend) {
+                "Hay una clave guardada en el llavero.".to_string()
+            } else {
+                "Falta la clave.".to_string()
+            };
+            self.ai_key_status.setStringValue(&NSString::from_str(&text));
+        }
+
+        self.ai_model_field.setPlaceholderString(Some(&NSString::from_str(&model_placeholder(
+            providers, &backend,
+        ))));
+
+        self.ai_codex_hint.setHidden(backend != "codex");
+
+        let base_url = is_openai_compatible_provider(&backend);
+        self.ai_base_url_label.setHidden(!base_url);
+        self.ai_base_url_field.setHidden(!base_url);
+        self.ai_base_url_hint.setHidden(!base_url);
     }
 
     /// Reads the controls and writes through anything that moved.
@@ -1425,7 +1732,85 @@ impl Preferences {
             if self.ai_enabled.on() {
                 save_ai("backend", &config::toml_string(&backend));
             }
+            self.sync_ai_provider_controls();
             changed = true;
+        }
+        if self.ai_check.clicked() && !self.ai_detect_running.get() {
+            self.ai_detect_running.set(true);
+            self.ai_check_status.setStringValue(&NSString::from_str("Comprobando…"));
+            let slot = Arc::clone(&self.ai_detect_result);
+            std::thread::spawn(move || {
+                let detected = crate::ai::detect();
+                if let Ok(mut held) = slot.lock() {
+                    *held = Some(detected);
+                }
+            });
+            changed = true;
+        }
+        if let Ok(mut slot) = self.ai_detect_result.lock() {
+            if let Some(detected) = slot.take() {
+                self.refresh_ai_backend_labels(Some(&detected));
+                self.ai_check_status.setStringValue(&NSString::from_str(""));
+                self.ai_detect_running.set(false);
+                changed = true;
+            }
+        }
+        if self.ai_save_key.clicked() {
+            let backend = self.ai_backend.value();
+            let key = self.ai_key_field.stringValue().to_string();
+            let key = key.trim();
+            if key.is_empty() {
+                self.ai_key_status.setStringValue(&NSString::from_str("Escribe una clave antes de guardarla."));
+            } else {
+                match crate::ai::store_key(&backend, key) {
+                    Ok(()) => {
+                        self.ai_key_field.setStringValue(&NSString::from_str(""));
+                        if config::load().ai.api_key != "keychain" {
+                            save_ai("api_key", &config::toml_string("keychain"));
+                        }
+                        self.ai_key_status.setStringValue(&NSString::from_str(&format!(
+                            "Clave guardada en el llavero ({}).",
+                            chrono::Local::now().format("%d/%m/%Y")
+                        )));
+                        self.refresh_ai_backend_labels(None);
+                    }
+                    Err(why) => {
+                        self.ai_key_status
+                            .setStringValue(&NSString::from_str(&format!("No se pudo guardar: {why}")));
+                    }
+                }
+            }
+            changed = true;
+        }
+        if self.ai_forget_key.clicked() {
+            let backend = self.ai_backend.value();
+            match crate::ai::forget_key(&backend) {
+                Ok(()) => {
+                    self.ai_key_status.setStringValue(&NSString::from_str("Se ha olvidado la clave."));
+                    self.refresh_ai_backend_labels(None);
+                }
+                Err(why) => {
+                    self.ai_key_status
+                        .setStringValue(&NSString::from_str(&format!("No se pudo olvidar: {why}")));
+                }
+            }
+            changed = true;
+        }
+        if !self.is_editing(&self.ai_model_field) {
+            let typed = self.ai_model_field.stringValue().to_string();
+            if typed.trim() != self.last_ai_model.borrow().trim() {
+                save_ai("model", &config::toml_string(typed.trim()));
+                *self.last_ai_model.borrow_mut() = typed;
+                changed = true;
+            }
+        }
+        if !self.is_editing(&self.ai_base_url_field) {
+            let typed = self.ai_base_url_field.stringValue().to_string();
+            if typed.trim() != self.last_ai_base_url.borrow().trim() {
+                save_ai("base_url", &config::toml_string(typed.trim()));
+                *self.last_ai_base_url.borrow_mut() = typed;
+                changed = true;
+            }
         }
         if let Some(uses) = self.ai_use.changed() {
             // Already a valid TOML array literal — see the popup's own
@@ -2031,5 +2416,98 @@ mod tests {
         }
         // And something in between lands on the nearest.
         assert_eq!(sensitivity_step(0.71), 2.0);
+    }
+
+    fn detected(path: Option<&str>, authenticated: bool, problem: Option<&str>) -> crate::ai::Detected {
+        crate::ai::Detected {
+            backend: "claude-code",
+            label: "Claude Code",
+            path: path.map(str::to_string),
+            authenticated,
+            problem: problem.map(str::to_string),
+            latency: Some(std::time::Duration::from_millis(2_900)),
+        }
+    }
+
+    #[test]
+    fn a_duration_reads_with_a_spanish_comma() {
+        assert_eq!(spanish_seconds(2.9), "2,9");
+        assert_eq!(spanish_seconds(0.0), "0,0");
+    }
+
+    #[test]
+    fn a_cli_agent_not_yet_probed_says_so() {
+        assert_eq!(provider_state_text(true, false, false, None), "comprobando…");
+    }
+
+    #[test]
+    fn a_cli_agent_not_on_this_mac_is_not_available() {
+        let found = detected(None, false, None);
+        assert_eq!(provider_state_text(true, false, false, Some(&found)), "no disponible");
+    }
+
+    #[test]
+    fn a_cli_agent_that_answered_is_ready_with_its_time() {
+        let found = detected(Some("/opt/homebrew/bin/claude"), true, None);
+        assert_eq!(provider_state_text(true, false, false, Some(&found)), "listo (2,9 s)");
+    }
+
+    #[test]
+    fn a_cli_agent_installed_but_refusing_names_the_reason() {
+        let found = detected(
+            Some("/opt/homebrew/bin/codex"),
+            false,
+            Some("is not supported when using Codex with a ChatGPT account"),
+        );
+        assert_eq!(
+            provider_state_text(true, false, false, Some(&found)),
+            "instalado, is not supported when using Codex with a ChatGPT account"
+        );
+    }
+
+    #[test]
+    fn an_http_provider_needing_no_key_just_says_so() {
+        assert_eq!(provider_state_text(false, false, false, None), "sin clave");
+        // A stray key would still be ignored: no key is ever needed.
+        assert_eq!(provider_state_text(false, false, true, None), "sin clave");
+    }
+
+    #[test]
+    fn an_http_provider_reports_whether_a_key_is_on_file() {
+        assert_eq!(provider_state_text(false, true, false, None), "falta la clave");
+        assert_eq!(provider_state_text(false, true, true, None), "clave guardada");
+    }
+
+    #[test]
+    fn every_provider_appears_once_in_the_popup_labels() {
+        let providers = crate::ai::providers();
+        let labels = ai_backend_labels(providers, None);
+        assert_eq!(labels.len(), providers.len());
+        for (label, info) in labels.iter().zip(providers.iter()) {
+            assert!(label.starts_with(info.label), "«{label}» should start with «{}»", info.label);
+        }
+    }
+
+    #[test]
+    fn a_cli_backend_is_recognised_and_an_http_one_is_not() {
+        assert!(is_cli_provider("claude-code"));
+        assert!(is_cli_provider("codex"));
+        assert!(!is_cli_provider("openai"));
+        assert!(!is_cli_provider("ollama"));
+    }
+
+    #[test]
+    fn only_openai_compatible_presets_get_a_base_url_field() {
+        assert!(is_openai_compatible_provider("ollama"));
+        assert!(is_openai_compatible_provider("openai"));
+        assert!(!is_openai_compatible_provider("anthropic"));
+        assert!(!is_openai_compatible_provider("claude-code"));
+    }
+
+    #[test]
+    fn the_model_placeholder_names_the_backend_default_and_a_cli_agent_has_none() {
+        let providers = crate::ai::providers();
+        assert_eq!(model_placeholder(providers, "openai"), "por defecto: gpt-4o-mini");
+        assert_eq!(model_placeholder(providers, "claude-code"), "");
     }
 }
