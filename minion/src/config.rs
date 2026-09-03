@@ -173,14 +173,7 @@ pub struct Config {
     /// Chrome, like every other tab — so it cannot be detected this way
     /// and is not on the list.
     pub pause_during: Option<Vec<String>>,
-}
 
-/// How Minion decides when to listen.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ListenMode {
-    Always,
-    /// Only while the shortcut is held down.
-    Hold,
     /// Named sequences of phrases, run one after another. Only read from
     /// here — a downloaded vocabulary pack cannot define one, since a
     /// macro presses keys and launches applications on its own say-so,
@@ -195,6 +188,14 @@ pub enum ListenMode {
     /// reported in the log, at startup, the same as an alias with no
     /// command to point at.
     pub search_engine: Option<String>,
+}
+
+/// How Minion decides when to listen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenMode {
+    Always,
+    /// Only while the shortcut is held down.
+    Hold,
 }
 
 /// A command of your own: what to say, and which keys to press.

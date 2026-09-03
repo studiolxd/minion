@@ -178,7 +178,10 @@ fn candidates(config: &config::Config) -> Vec<Candidate> {
             )
         })
         .filter_map(|(phrase, times)| {
-            let normalised = crate::text::normalise(&phrase);
+            // Compared without the wake word, which is how the alias was
+            // stored: with it, a phrase already taught was offered again
+            // on every run and appended to the config once more each time.
+            let normalised = without_wake_word(&phrase);
             if known.contains(&normalised) {
                 return None; // already taught
             }
@@ -244,6 +247,16 @@ mod tests {
                 ("Minion ponme un café.".to_string(), 1),
             ]
         );
+    }
+
+    #[test]
+    fn a_phrase_already_taught_is_compared_without_the_wake_word() {
+        // The alias is stored without «minion»; the log line has it. The
+        // two must still be recognised as the same phrase, or the lesson
+        // is offered again on every run.
+        let known = vec![without_wake_word("Minion. Deshacer.")];
+        assert!(known.contains(&without_wake_word("Minion deshacer")));
+        assert!(!known.contains(&without_wake_word("Minion rehacer")));
     }
 
     #[test]
