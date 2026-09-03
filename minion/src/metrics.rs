@@ -623,7 +623,10 @@ pub fn report_text(days: Option<u32>) -> String {
     let threshold = crate::config::load().voice_threshold();
     let cutoff = days.and_then(|n| if n == 0 { None } else { Some(cutoff_date(n)) });
     let today = chrono::Local::now().date_naive().format("%Y-%m-%d").to_string();
-    render(&analyse(&contents, cutoff.as_deref(), threshold, &today))
+    let health = build_health(&contents, &current_microphone_name(), ai_backend_name().as_deref());
+    let mut out = estado_block(&health);
+    out.push_str(&render(&analyse(&contents, cutoff.as_deref(), threshold, &today)));
+    out
 }
 
 /// [`Drift`] over the real log, as of today.
@@ -672,6 +675,157 @@ pub fn record_reenrolment_suggested() {
         }
         let _ = std::fs::write(path, "");
     }
+}
+
+/// What Minion currently knows about its own health: the tooltip's short
+/// line and the «Estado» block in `minion stats` both come from this.
+///
+/// `microphone` and `ai_backend` are handed in rather than looked up here:
+/// they are the *configured* facts, cheap to read from anywhere, while
+/// `vad_mode` and `own_audio_tap` are the *live* ones — whether Silero
+/// actually loaded, whether the loopback tap actually opened — and the
+/// only record of that is the line each one already logs on success or
+/// failure (`audio::open_voice`'s three `journal::write` calls, and the
+/// two `note!` calls around `loopback::Loopback::start()` in `main.rs`).
+/// Reading those back is simpler than threading a second, cross-thread
+/// status flag through code this change does not otherwise own.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Health {
+    pub microphone: String,
+    pub vad_mode: String,
+    pub own_audio_tap: String,
+    pub ai_backend: Option<String>,
+    /// The last three `error`/`BLOCKED`/`fatal` lines, oldest first.
+    pub last_problems: Vec<String>,
+}
+
+/// The most recent line saying which voice detector is actually in use,
+/// read backwards so a Silero failure logged after a working start does
+/// not report the state it started in.
+fn last_vad_mode(contents: &str) -> Option<&'static str> {
+    contents.lines().rev().find_map(|line| {
+        let rest = line.get(21..)?;
+        if rest.starts_with("Voice detector: Silero.") {
+            Some("Silero")
+        } else if rest.starts_with("Voice detector: energy only")
+            || rest.starts_with("Voice detector: cannot load Silero")
+        {
+            Some("energía")
+        } else {
+            None
+        }
+    })
+}
+
+/// The most recent line saying whether the Mac's own audio is being
+/// ignored — the "grifo" (tap) the tooltip's example refers to.
+fn last_own_audio_tap(contents: &str) -> Option<&'static str> {
+    contents.lines().rev().find_map(|line| {
+        let rest = line.get(21..)?;
+        if rest.starts_with("Ignoring the Mac's own audio") {
+            Some("grifo ok")
+        } else if rest.starts_with("own-audio tap unavailable") {
+            Some("grifo no disponible")
+        } else {
+            None
+        }
+    })
+}
+
+/// The last `n` lines that recorded an error, a blocked command, or a
+/// fatal exit, oldest first — a much shorter list than reading the whole
+/// log, and the three shapes most worth a glance at without opening it.
+fn last_problem_lines(contents: &str, n: usize) -> Vec<String> {
+    let mut found: Vec<String> = contents
+        .lines()
+        .filter(|line| {
+            line.get(21..).is_some_and(|rest| {
+                rest.starts_with("error    ")
+                    || rest.starts_with("fatal    ")
+                    || rest.starts_with("BLOCKED  ")
+            })
+        })
+        .map(str::to_string)
+        .collect();
+    let start = found.len().saturating_sub(n);
+    found.split_off(start)
+}
+
+/// Builds [`Health`] from a log's text and the two facts that only
+/// main.rs and this module's own `health()` wrapper can supply cheaply.
+/// Pure — exercised on fixture text, same as everything else here.
+fn build_health(contents: &str, microphone: &str, ai_backend: Option<&str>) -> Health {
+    Health {
+        microphone: microphone.to_string(),
+        vad_mode: last_vad_mode(contents).unwrap_or("—").to_string(),
+        own_audio_tap: last_own_audio_tap(contents).unwrap_or("—").to_string(),
+        ai_backend: ai_backend.map(str::to_string),
+        last_problems: last_problem_lines(contents, 3),
+    }
+}
+
+/// The «Estado» block: microphone, voice detector, own-audio tap, AI
+/// backend, and the last few problems — the body for both `minion stats`
+/// and the «Estadísticas…» window, same as [`render`].
+pub fn estado_block(health: &Health) -> String {
+    let mut out = String::new();
+    out.push_str("Estado\n\n");
+    out.push_str(&format!("Micrófono: {}\n", health.microphone));
+    out.push_str(&format!("Detector de voz: {}\n", health.vad_mode));
+    out.push_str(&format!("Audio propio: {}\n", health.own_audio_tap));
+    out.push_str(&format!(
+        "IA: {}\n",
+        health.ai_backend.as_deref().unwrap_or("desactivada")
+    ));
+    if health.last_problems.is_empty() {
+        out.push_str("Sin errores recientes.\n");
+    } else {
+        out.push_str("Últimos problemas:\n");
+        for line in &health.last_problems {
+            out.push_str(&format!("  {line}\n"));
+        }
+    }
+    out.push('\n');
+    out
+}
+
+/// The short line the tooltip appends after «Minion — escuchando» —
+/// «micro: MacBook Pro · Silero · grifo ok · IA: Claude Code».
+pub fn tooltip_health(health: &Health) -> String {
+    format!(
+        "micro: {} · {} · {} · IA: {}",
+        health.microphone,
+        health.vad_mode,
+        health.own_audio_tap,
+        health.ai_backend.as_deref().unwrap_or("no")
+    )
+}
+
+/// The microphone Minion would open right now: the configured name, or
+/// the system default's. A miniature of `audio::choose_input`'s own
+/// resolution — not shared with it, since that function also opens the
+/// stream, and this is only ever asked for a name to show.
+fn current_microphone_name() -> String {
+    use cpal::traits::{DeviceTrait, HostTrait};
+    if let Some(name) = crate::config::load().microphone().filter(|n| !n.trim().is_empty()) {
+        return name;
+    }
+    cpal::default_host()
+        .default_input_device()
+        .and_then(|device| device.description().ok())
+        .map(|description| description.name().to_string())
+        .unwrap_or_else(|| "predeterminado".to_string())
+}
+
+/// The configured `[ai] backend`, or `None` when the AI layer is off.
+fn ai_backend_name() -> Option<String> {
+    let backend = crate::config::load().ai.backend.trim().to_string();
+    (!backend.is_empty()).then_some(backend)
+}
+
+/// [`Health`] as of right now, over the real log.
+pub fn health() -> Health {
+    build_health(&read_log(), &current_microphone_name(), ai_backend_name().as_deref())
 }
 
 #[cfg(test)]
@@ -922,5 +1076,95 @@ mod tests {
             .to_string();
         let line = drift_line(&voice_drift(&log, &today));
         assert!(line.contains("minion enroll"), "{line}");
+    }
+
+    const HEALTH_LOG: &str = "\
+2026-09-01 12:00:00  Voice detector: energy only, by configuration.\n\
+2026-09-01 12:00:01  own-audio tap unavailable: no output device\n\
+2026-09-01 12:00:02  error    could not reload the model: boom\n\
+2026-09-01 12:00:03  ran      «Minion Chrome.»  ->  abrir Chrome  [100% · 1.6s audio · 142 ms]\n\
+2026-09-01 12:00:04  Voice detector: Silero.\n\
+2026-09-01 12:00:05  Ignoring the Mac's own audio: output tap open at 48000 Hz, threshold 0.02.\n\
+2026-09-01 12:00:06  BLOCKED  «Minion cierra la ventana.»  ->  cerrar ventana: not permitted\n\
+2026-09-01 12:00:07  error    transcription failed: bad frame\n\
+2026-09-01 12:00:08  fatal    the model could not be loaded\n\
+2026-09-01 12:00:09  error    could not learn «hola»: reason\n\
+";
+
+    #[test]
+    fn vad_mode_and_tap_read_the_most_recent_line() {
+        // Silero and the tap both fail once, then recover — the report
+        // must say what is true now, not what happened first.
+        assert_eq!(last_vad_mode(HEALTH_LOG), Some("Silero"));
+        assert_eq!(last_own_audio_tap(HEALTH_LOG), Some("grifo ok"));
+    }
+
+    #[test]
+    fn a_log_with_neither_line_reports_neither() {
+        assert_eq!(last_vad_mode(""), None);
+        assert_eq!(last_own_audio_tap(""), None);
+    }
+
+    #[test]
+    fn only_the_last_three_problems_are_kept_oldest_first() {
+        let problems = last_problem_lines(HEALTH_LOG, 3);
+        assert_eq!(problems.len(), 3);
+        assert!(problems[0].contains("transcription failed"));
+        assert!(problems[1].contains("the model could not be loaded"));
+        assert!(problems[2].contains("could not learn"));
+        // The first error and the blocked line both fell off the end.
+        assert!(!problems.iter().any(|line| line.contains("boom")));
+    }
+
+    #[test]
+    fn build_health_combines_the_log_with_what_it_is_handed() {
+        let health = build_health(HEALTH_LOG, "MacBook Pro", Some("Claude Code"));
+        assert_eq!(health.microphone, "MacBook Pro");
+        assert_eq!(health.vad_mode, "Silero");
+        assert_eq!(health.own_audio_tap, "grifo ok");
+        assert_eq!(health.ai_backend.as_deref(), Some("Claude Code"));
+        assert_eq!(health.last_problems.len(), 3);
+    }
+
+    #[test]
+    fn health_with_no_ai_backend_reads_as_off() {
+        let health = build_health("", "MacBook Pro", None);
+        assert_eq!(health.vad_mode, "—");
+        assert_eq!(health.own_audio_tap, "—");
+        assert_eq!(health.ai_backend, None);
+        assert!(health.last_problems.is_empty());
+    }
+
+    #[test]
+    fn the_tooltip_line_matches_the_brief_s_example_shape() {
+        let health = build_health(HEALTH_LOG, "MacBook Pro", Some("Claude Code"));
+        assert_eq!(
+            tooltip_health(&health),
+            "micro: MacBook Pro · Silero · grifo ok · IA: Claude Code"
+        );
+    }
+
+    #[test]
+    fn the_tooltip_line_says_no_ai_when_it_is_off() {
+        let health = build_health(HEALTH_LOG, "MacBook Pro", None);
+        assert!(tooltip_health(&health).ends_with("IA: no"));
+    }
+
+    #[test]
+    fn estado_block_names_every_field_and_a_recent_problem() {
+        let health = build_health(HEALTH_LOG, "MacBook Pro", Some("Claude Code"));
+        let block = estado_block(&health);
+        assert!(block.contains("Estado"));
+        assert!(block.contains("MacBook Pro"));
+        assert!(block.contains("Silero"));
+        assert!(block.contains("grifo ok"));
+        assert!(block.contains("Claude Code"));
+        assert!(block.contains("could not learn"));
+    }
+
+    #[test]
+    fn estado_block_says_so_when_there_is_nothing_recent() {
+        let health = build_health("", "MacBook Pro", None);
+        assert!(estado_block(&health).contains("Sin errores recientes"));
     }
 }

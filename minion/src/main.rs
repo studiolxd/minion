@@ -95,6 +95,14 @@ fn shorten(text: &str, max: usize) -> String {
 /// This is the whole visible trace of what Minion just did: the sounds can
 /// be turned off, the icon only blinks, and the log is a file. Pure, so
 /// the shortening can be tested.
+/// The listening tooltip with the health summary appended — see
+/// `metrics::tooltip_health`. Called only on a listening/paused
+/// transition and at startup, never on the audio thread's 250 ms tick, so
+/// the log read behind it costs nothing that matters.
+fn tooltip_listening_with_health() -> String {
+    format!("{TOOLTIP_LISTENING} · {}", metrics::tooltip_health(&metrics::health()))
+}
+
 fn last_utterance_tooltip(transcript: &str, outcome: &str) -> String {
     format!("Minion — última: “{}” → {outcome}", shorten(transcript, TOOLTIP_TRANSCRIPT))
 }
@@ -2761,16 +2769,15 @@ fn run_menu_bar(
             if let Ok(mut text) = status_for_timer.lock() {
                 *text = if hold_mode {
                     if active_for_timer.load(Ordering::Relaxed) {
-                        TOOLTIP_HOLD_ACTIVE
+                        TOOLTIP_HOLD_ACTIVE.to_string()
                     } else {
-                        TOOLTIP_HOLD_IDLE
+                        TOOLTIP_HOLD_IDLE.to_string()
                     }
                 } else if active_for_timer.load(Ordering::Relaxed) {
-                    TOOLTIP_LISTENING
+                    tooltip_listening_with_health()
                 } else {
-                    TOOLTIP_PAUSED
-                }
-                .to_string();
+                    TOOLTIP_PAUSED.to_string()
+                };
             }
         }
         // A check for a new Minion, asked for from the menu or by the
@@ -2959,13 +2966,12 @@ fn run_menu_bar(
         if !downloading_for_timer.load(Ordering::Relaxed) && was_awake != awake {
             if let Ok(mut text) = status_for_timer.lock() {
                 *text = if hold_mode {
-                    if awake { TOOLTIP_HOLD_ACTIVE } else { TOOLTIP_HOLD_IDLE }
+                    if awake { TOOLTIP_HOLD_ACTIVE.to_string() } else { TOOLTIP_HOLD_IDLE.to_string() }
                 } else if awake {
-                    TOOLTIP_LISTENING
+                    tooltip_listening_with_health()
                 } else {
-                    TOOLTIP_PAUSED
-                }
-                .to_string();
+                    TOOLTIP_PAUSED.to_string()
+                };
             }
         }
         let face = match wanted {
@@ -3722,7 +3728,7 @@ fn main() -> Result<()> {
             }
             note!("Model downloaded.");
             worker_downloading.store(false, Ordering::Relaxed);
-            set_status(&worker_status, TOOLTIP_LISTENING);
+            set_status(&worker_status, &tooltip_listening_with_health());
         }
         if let Err(e) = listen_and_obey(Listening {
             model_path,
