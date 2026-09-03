@@ -207,7 +207,18 @@ impl Layout {
     }
 
     fn checkbox(&mut self, title: &str, on: bool) -> Switch {
-        let frame = self.place(spacing::CHECKBOX, 0.0);
+        self.checkbox_at(title, on, 0.0)
+    }
+
+    /// A checkbox indented under the one above it, such as a sub-option
+    /// that only makes sense while its parent is on — see
+    /// [`Switch::set_enabled`].
+    fn indented_checkbox(&mut self, title: &str, on: bool) -> Switch {
+        self.checkbox_at(title, on, INDENT)
+    }
+
+    fn checkbox_at(&mut self, title: &str, on: bool, indent: f64) -> Switch {
+        let frame = self.place(spacing::CHECKBOX, indent);
         let button = unsafe {
             NSButton::checkboxWithTitle_target_action(
                 &NSString::from_str(title),
@@ -344,6 +355,22 @@ pub(crate) fn beside(frame: NSRect, width: f64, own_width: f64) -> NSRect {
     NSRect::new(
         NSPoint::new(frame.origin.x + width + spacing::SIBLING, frame.origin.y),
         NSSize::new(own_width, frame.size.height),
+    )
+}
+
+/// A result label beside a button, its baseline matching the button's own.
+///
+/// [`beside`] alone stretches the label to the button row's full height —
+/// right for a checkbox or a field, but a label field top-aligns its text
+/// within its frame, so at button height it sits noticeably higher than
+/// the button's own vertically-centred title. Shrinking it to a single
+/// label line and nudging it down by half the difference lines the two up.
+pub(crate) fn beside_button(row: NSRect, button_width: f64, own_width: f64) -> NSRect {
+    let frame = beside(row, button_width, own_width);
+    let offset = (spacing::BUTTON - spacing::LABEL) / 2.0;
+    NSRect::new(
+        NSPoint::new(frame.origin.x, frame.origin.y + offset),
+        NSSize::new(frame.size.width, spacing::LABEL),
     )
 }
 
@@ -523,6 +550,13 @@ impl Switch {
         self.control.setState(isize::from(on));
         self.last.set(on);
     }
+
+    /// Greys the checkbox out — for a sub-option that only makes sense
+    /// while its parent is on, such as «Mantenerlo siempre visible» under
+    /// «Mostrar lo que oye».
+    fn set_enabled(&self, on: bool) {
+        self.control.setEnabled(on);
+    }
 }
 
 /// A push button, and the state it had when it was last read.
@@ -619,6 +653,7 @@ pub struct Preferences {
     auto_capitalise: Switch,
     notifications: Switch,
     show_hud: Switch,
+    hud_pinned: Switch,
     search_engine: Popup,
     shortcut: Retained<NSButton>,
     /// The shortcut as stored, e.g. "alt-space".
@@ -850,6 +885,32 @@ fn provider_state_text(
     } else {
         "falta la clave".to_string()
     }
+}
+
+/// A Spanish noun with the plural `s`, or without — "1 listo" vs
+/// "2 listos".
+fn plural_es(count: usize, singular: &str, plural: &str) -> String {
+    format!("{count} {}", if count == 1 { singular } else { plural })
+}
+
+/// The status line beside «Comprobar» once a check finishes, e.g.
+/// "Comprobado a las 18:20: 1 listo, 2 no utilizables". `now` is already
+/// formatted ("18:20"), so this stays pure and testable without a clock.
+fn check_summary(detected: &[crate::ai::Detected], now: &str) -> String {
+    let ready = detected.iter().filter(|found| found.authenticated).count();
+    let unusable = detected.len() - ready;
+    format!(
+        "Comprobado a las {now}: {}, {}",
+        plural_es(ready, "listo", "listos"),
+        plural_es(unusable, "no utilizable", "no utilizables"),
+    )
+}
+
+/// The status line under the model popup once a fetch succeeds, e.g.
+/// "12 modelos (18:21)". `now` is already formatted, for the same reason
+/// as [`check_summary`].
+fn model_status_summary(count: usize, now: &str) -> String {
+    format!("{} ({now})", plural_es(count, "modelo", "modelos"))
 }
 
 /// The backend popup's entries, in `providers`' order. `detected` is the
@@ -1115,14 +1176,16 @@ impl Preferences {
             "Notificaciones del sistema para respuestas y temporizadores",
             settings.notifications,
         );
-        let show_hud = layout.checkbox("Mostrar siempre lo que oye", settings.show_hud);
+        let show_hud = layout.checkbox("Mostrar lo que oye", settings.show_hud);
         layout.hint(
             "Un panel junto a la esquina superior derecha con la cara y la \
-             última frase. Sin esto, solo aparece unos segundos tras oír \
-             algo — también se dice: «muestra lo que oyes» / «esconde lo \
-             que oyes».",
+             última frase, unos segundos tras oír algo — también se dice: \
+             «muestra lo que oyes» / «esconde lo que oyes».",
             INDENT,
         );
+        let hud_pinned = layout.indented_checkbox("Mantenerlo siempre visible", settings.hud_pinned);
+        hud_pinned.set_enabled(settings.show_hud);
+        layout.hint("En vez de solo unos segundos tras oír algo.", INDENT * 2.0);
 
         layout.heading("Búsqueda");
         layout.field_label("Motor para «busca X» sin nombrar uno");
@@ -1176,7 +1239,7 @@ impl Preferences {
         let ai_check_status = plain_label(
             mtm,
             "",
-            beside(ai_check_row, 100.0, layout.content_width() - 100.0 - spacing::SIBLING),
+            beside_button(ai_check_row, 100.0, layout.content_width() - 100.0 - spacing::SIBLING),
         );
         layout.add(&ai_check_status);
         layout.gap(spacing::SIBLING);
@@ -1199,7 +1262,7 @@ impl Preferences {
         layout.add_control(&ai_key_field, "Clave de API");
         layout.gap(spacing::SIBLING);
 
-        let key_buttons_row = layout.place(spacing::BUTTON, 0.0);
+        let save_row = layout.place(spacing::BUTTON, 0.0);
         // Safety: no target and no action, so nothing is called back into.
         let ai_save_key = unsafe {
             NSButton::buttonWithTitle_target_action(
@@ -1209,8 +1272,20 @@ impl Preferences {
                 mtm,
             )
         };
-        ai_save_key.setFrame(narrow(key_buttons_row, 120.0));
+        ai_save_key.setFrame(narrow(save_row, 120.0));
         layout.add_control(&ai_save_key, "Guardar la clave en el llavero");
+        layout.gap(spacing::SIBLING);
+
+        // The masked preview and «Olvidar clave» sit on the same row —
+        // beside() when the window is wide enough for both, or the button
+        // drops to its own line below rather than overlapping the preview.
+        const FORGET_WIDTH: f64 = 120.0;
+        let beside_fits = layout.content_width() >= FORGET_WIDTH * 2.0 + spacing::SIBLING;
+        let preview_row = layout.place(spacing::LABEL, 0.0);
+        let preview_width =
+            if beside_fits { layout.content_width() - FORGET_WIDTH - spacing::SIBLING } else { layout.content_width() };
+        let ai_key_status = plain_label(mtm, "", narrow(preview_row, preview_width));
+        layout.add(&ai_key_status);
         // Safety: no target and no action, so nothing is called back into.
         let ai_forget_key = unsafe {
             NSButton::buttonWithTitle_target_action(
@@ -1220,12 +1295,14 @@ impl Preferences {
                 mtm,
             )
         };
-        ai_forget_key.setFrame(beside(key_buttons_row, 120.0, 120.0));
-        layout.add_control(&ai_forget_key, "Olvidar la clave guardada");
-        layout.gap(spacing::SIBLING);
-
-        let ai_key_status = plain_label(mtm, "", layout.place(spacing::LABEL, 0.0));
-        layout.add(&ai_key_status);
+        if beside_fits {
+            ai_forget_key.setFrame(beside(preview_row, preview_width, FORGET_WIDTH));
+            layout.add_control(&ai_forget_key, "Olvidar la clave guardada");
+        } else {
+            layout.gap(spacing::SIBLING);
+            ai_forget_key.setFrame(narrow(layout.place(spacing::BUTTON, 0.0), FORGET_WIDTH));
+            layout.add_control(&ai_forget_key, "Olvidar la clave guardada");
+        }
         layout.gap(spacing::SIBLING);
         layout.hint(
             "La clave se guarda en el llavero de macOS, nunca en config.toml \
@@ -1273,7 +1350,7 @@ impl Preferences {
         let ai_model_status = plain_label(
             mtm,
             "",
-            beside(model_buttons_row, 140.0, layout.content_width() - 140.0 - spacing::SIBLING),
+            beside_button(model_buttons_row, 140.0, layout.content_width() - 140.0 - spacing::SIBLING),
         );
         layout.add(&ai_model_status);
         layout.gap(spacing::SIBLING);
@@ -1349,7 +1426,7 @@ impl Preferences {
         let ai_status = plain_label(
             mtm,
             &format!("Peticiones hoy: {} de {}", crate::ai::requests_today(), ai_settings.daily_limit),
-            beside(ai_probe_row, 90.0, layout.content_width() - 90.0 - spacing::SIBLING),
+            beside_button(ai_probe_row, 90.0, layout.content_width() - 90.0 - spacing::SIBLING),
         );
         layout.add(&ai_status);
         layout.gap(spacing::SIBLING);
@@ -1493,6 +1570,7 @@ impl Preferences {
             auto_capitalise,
             notifications,
             show_hud,
+            hud_pinned,
             search_engine,
             shortcut,
             shortcut_value: std::cell::RefCell::new(current_shortcut),
@@ -1863,6 +1941,15 @@ impl Preferences {
         // Read fresh every tick by the HUD itself — no restart needed.
         if let Some(on) = self.show_hud.toggled() {
             save("show_hud", if on { "true" } else { "false" });
+            // «Mantenerlo siempre visible» only means anything while this
+            // is on — grey it out the moment it goes off, rather than
+            // leaving an editable checkbox that `hud::Visibility::visible`
+            // ignores anyway.
+            self.hud_pinned.set_enabled(on);
+            changed = true;
+        }
+        if let Some(on) = self.hud_pinned.toggled() {
+            save("hud_pinned", if on { "true" } else { "false" });
             changed = true;
         }
         // Read once at startup into a `OnceLock` (`commands::configure`).
@@ -1895,6 +1982,12 @@ impl Preferences {
             changed = true;
         }
         if self.ai_check.clicked() && !self.ai_detect_running.get() {
+            // The listening loop reloads `[ai]` fresh before every question
+            // (`ai::configure`, right before `ai::ask` in `main.rs`) — this
+            // window's own writes already do the same through `save_ai`,
+            // but a check started right after flipping a switch should not
+            // race whichever poll gets there first.
+            crate::ai::configure(&config::load());
             self.ai_detect_running.set(true);
             self.ai_check_status.setStringValue(&NSString::from_str("Comprobando…"));
             let slot = Arc::clone(&self.ai_detect_result);
@@ -1909,7 +2002,8 @@ impl Preferences {
         if let Ok(mut slot) = self.ai_detect_result.lock() {
             if let Some(detected) = slot.take() {
                 self.refresh_ai_backend_labels(Some(&detected));
-                self.ai_check_status.setStringValue(&NSString::from_str(""));
+                let now = chrono::Local::now().format("%H:%M").to_string();
+                self.ai_check_status.setStringValue(&NSString::from_str(&check_summary(&detected, &now)));
                 self.ai_detect_running.set(false);
                 changed = true;
             }
@@ -1974,6 +2068,9 @@ impl Preferences {
             }
         }
         if self.ai_model_refresh.clicked() && !self.ai_model_running.get() {
+            // See the comment on «Comprobar» above — same reload, same
+            // reason.
+            crate::ai::configure(&config::load());
             self.ai_model_running.set(true);
             self.ai_model_status.setStringValue(&NSString::from_str("Cargando modelos…"));
             let backend = self.ai_backend.value();
@@ -1991,7 +2088,9 @@ impl Preferences {
                 self.ai_model_running.set(false);
                 match result {
                     Ok(models) => {
-                        self.ai_model_status.setStringValue(&NSString::from_str(""));
+                        let now = chrono::Local::now().format("%H:%M").to_string();
+                        self.ai_model_status
+                            .setStringValue(&NSString::from_str(&model_status_summary(models.len(), &now)));
                         self.apply_model_list(&models);
                     }
                     Err(why) => {
@@ -2032,6 +2131,11 @@ impl Preferences {
             }
         }
         if self.ai_probe.clicked() && !self.ai_probe_running.get() {
+            // Without this, «Probar» answered from whatever `ai::configure`
+            // last loaded at startup — stale the moment the switch, the
+            // backend or a key changes in this very window. See the
+            // comment on «Comprobar» above.
+            crate::ai::configure(&config::load());
             self.ai_probe_running.set(true);
             self.ai_status.setStringValue(&NSString::from_str("Probando…"));
             let result = Arc::clone(&self.ai_probe_result);
@@ -2324,6 +2428,10 @@ impl Preferences {
     pub fn show_hud_on(&self) -> bool {
         self.show_hud.on()
     }
+
+    pub fn hud_pinned_on(&self) -> bool {
+        self.hud_pinned.on()
+    }
 }
 
 /// Gives the application the menu its windows need, once.
@@ -2588,6 +2696,44 @@ mod tests {
         assert!(spacing::SIBLING < spacing::AFTER_HINT);
         assert!(spacing::AFTER_HINT < spacing::GROUP);
         assert!(spacing::AFTER_LABEL < spacing::AFTER_HEADING);
+    }
+
+    /// A minimal [`crate::ai::Detected`], as if `path` were `Some(_)`
+    /// (installed) exactly when `authenticated` is true — the check
+    /// summary only cares about ready-vs-not, not why.
+    fn found_agent(authenticated: bool) -> crate::ai::Detected {
+        crate::ai::Detected {
+            backend: "claude-code",
+            label: "Claude Code",
+            path: Some("/opt/homebrew/bin/claude".to_string()),
+            authenticated,
+            problem: (!authenticated).then(|| "no responde".to_string()),
+            latency: None,
+        }
+    }
+
+    #[test]
+    fn check_summary_counts_ready_and_unusable() {
+        let found = [found_agent(true), found_agent(false), found_agent(false)];
+        assert_eq!(check_summary(&found, "18:20"), "Comprobado a las 18:20: 1 listo, 2 no utilizables");
+    }
+
+    #[test]
+    fn check_summary_pluralises_ready_too() {
+        let found = [found_agent(true), found_agent(true)];
+        assert_eq!(check_summary(&found, "09:05"), "Comprobado a las 09:05: 2 listos, 0 no utilizables");
+    }
+
+    #[test]
+    fn check_summary_handles_nothing_found() {
+        assert_eq!(check_summary(&[], "12:00"), "Comprobado a las 12:00: 0 listos, 0 no utilizables");
+    }
+
+    #[test]
+    fn model_status_summary_pluralises_the_count() {
+        assert_eq!(model_status_summary(1, "18:21"), "1 modelo (18:21)");
+        assert_eq!(model_status_summary(12, "18:21"), "12 modelos (18:21)");
+        assert_eq!(model_status_summary(0, "18:21"), "0 modelos (18:21)");
     }
 
     #[test]

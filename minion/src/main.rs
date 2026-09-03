@@ -2012,9 +2012,15 @@ fn run_menu_bar(
     let panel = Rc::new(preferences::Preferences::new(mtm));
     let vocabulary_editor = vocabulary_editor::VocabularyEditor::new(mtm);
 
-    // The "what did it hear" HUD — see hud.rs. Starts pinned exactly as
-    // the settings window already read `show_hud` at construction.
-    let hud = Rc::new(hud::Hud::new(mtm, panel.show_hud_on(), config::load().hud_seconds()));
+    // The "what did it hear" HUD — see hud.rs. Starts enabled/pinned
+    // exactly as the settings window already read `show_hud`/`hud_pinned`
+    // at construction.
+    let hud = Rc::new(hud::Hud::new(
+        mtm,
+        panel.show_hud_on(),
+        panel.hud_pinned_on(),
+        config::load().hud_seconds(),
+    ));
     // Watches this application's keys, so the shortcut button can be set by
     // pressing a combination rather than typing its name.
     let panel_for_capture = Rc::clone(&panel);
@@ -2305,7 +2311,8 @@ fn run_menu_bar(
         // thing worth showing) needs checking every throttled tick, not
         // only when the menu bar's own face changes — see hud.rs.
         let hud_now = std::time::Instant::now();
-        hud_for_timer.set_pinned(panel_for_timer.show_hud_on());
+        hud_for_timer.set_enabled(panel_for_timer.show_hud_on());
+        hud_for_timer.set_pinned(panel_for_timer.hud_pinned_on());
         hud_for_timer.set_dictating(dictating_for_timer.load(Ordering::Relaxed));
         let hud_awake =
             active_for_timer.load(Ordering::Relaxed) && !downloading_for_timer.load(Ordering::Relaxed);

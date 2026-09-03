@@ -235,12 +235,11 @@ pub struct Config {
     #[serde(default = "yes")]
     pub notifications: bool,
 
-    /// Keep the "what did it hear" HUD panel on screen all the time,
-    /// instead of only around an utterance — see `hud.rs`.
-    ///
-    /// Off by default: the panel already appears on its own whenever
-    /// there is something to show, and pinning it is for someone who
-    /// wants a permanent caption of what Minion is hearing.
+    /// Show the "what did it hear" HUD panel around an utterance — see
+    /// `hud.rs`. Off by default: with this off the panel never appears on
+    /// its own (though «muestra lo que oyes» still shows it, once, for
+    /// [`Config::hud_seconds`] — an explicit ask overrides the setting for
+    /// that one time rather than being silently ignored).
     #[serde(default)]
     pub show_hud: bool,
     /// Look once a day for a newer Minion, and offer to install it —
@@ -272,6 +271,13 @@ pub struct Config {
     /// thing worth showing, with nothing else keeping it open — see
     /// `hud.rs`. `None` is the default of 4.
     pub hud_seconds: Option<f64>,
+
+    /// Keep the HUD panel on screen permanently, instead of only around an
+    /// utterance — see `hud.rs`. Off by default, and meaningless (ignored
+    /// in practice — Ajustes disables its own checkbox) while `show_hud`
+    /// is off: pinning a panel that never appears has nothing to pin.
+    #[serde(default)]
+    pub hud_pinned: bool,
 }
 
 /// The `[ai]` table: which model answers what the vocabulary cannot, and
@@ -552,6 +558,7 @@ impl Default for Config {
             ai: AiConfig::default(),
             energy: None,
             hud_seconds: None,
+            hud_pinned: false,
         }
     }
 }
@@ -1552,11 +1559,20 @@ mod tests {
     }
 
     #[test]
-    fn the_hud_is_off_by_default_and_can_be_pinned() {
+    fn the_hud_is_off_by_default_and_can_be_enabled() {
         let default: Config = toml::from_str("").expect("empty config should parse");
         assert!(!default.show_hud);
-        let pinned: Config = toml::from_str("show_hud = true").expect("should parse");
-        assert!(pinned.show_hud);
+        let enabled: Config = toml::from_str("show_hud = true").expect("should parse");
+        assert!(enabled.show_hud);
+    }
+
+    #[test]
+    fn the_hud_is_not_pinned_by_default_and_can_be_pinned_separately() {
+        let default: Config = toml::from_str("").expect("empty config should parse");
+        assert!(!default.hud_pinned);
+        let pinned: Config =
+            toml::from_str("show_hud = true\nhud_pinned = true").expect("should parse");
+        assert!(pinned.hud_pinned);
     }
 
     #[test]

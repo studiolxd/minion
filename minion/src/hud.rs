@@ -95,13 +95,24 @@ impl Face {
 /// Whether the panel should be on screen right now.
 ///
 /// Pure and given `now` explicitly rather than reading the clock itself,
-/// so the rules can be tested directly. Four things can hold it open:
-/// being pinned from Ajustes, dictation in progress, a learning question
-/// waiting for an answer, or simply having heard something recently
-/// (`activity_until`). "Esconde lo que oyes" cuts through all but the
-/// pin — it is the one thing here that means "no, really, not now".
+/// so the rules can be tested directly. `enabled` (`show_hud` in
+/// `config.toml`) is the gate: off, and nothing here shows the panel on
+/// its own — except "muestra lo que oyes" (`show_forced`), which is an
+/// explicit ask and shows it once regardless, for `hud_seconds`, the same
+/// way it would if enabled. With it on, four things can hold the panel
+/// open: being pinned from Ajustes, dictation in progress, a learning
+/// question waiting for an answer, or simply having heard something
+/// recently (`activity_until`). "Esconde lo que oyes" cuts through all
+/// but the pin — it is the one thing here that means "no, really, not
+/// now".
 #[derive(Debug, Default)]
 struct Visibility {
+    /// `show_hud`: the panel is allowed to appear on its own at all.
+    enabled: bool,
+    /// `hud_pinned`: never hide, as long as `enabled` is also true — a
+    /// pin on a disabled HUD has nothing to pin, so it is ignored rather
+    /// than trusted at face value (Ajustes disables its own checkbox for
+    /// this same reason, but this is the defensive backstop).
     pinned: bool,
     dictating: bool,
     question_pending: bool,
@@ -111,15 +122,20 @@ struct Visibility {
     /// `activity_until`, which would expire long before an answer arrives.
     busy: bool,
     activity_until: Option<Instant>,
+    /// Set by "muestra lo que oyes" — kept apart from `activity_until` so
+    /// it can still show the panel for `hud_seconds` even while `enabled`
+    /// is false, which real speech activity must not do.
+    forced_until: Option<Instant>,
     forced_hidden: bool,
-    /// How long [`Self::note_heard`] keeps the panel up — `[hud_seconds]`
-    /// in `config.toml`, resolved once when the HUD is built.
+    /// How long [`Self::note_heard`] and [`Self::show_forced`] keep the
+    /// panel up — `[hud_seconds]` in `config.toml`, resolved once when the
+    /// HUD is built.
     hud_seconds: f64,
 }
 
 impl Visibility {
     fn with_hud_seconds(hud_seconds: f64) -> Self {
-        Self { hud_seconds, ..Self::default() }
+        Self { hud_seconds, enabled: true, ..Self::default() }
     }
 
     /// A wake word was heard and understood (or not) — keep the panel up
@@ -150,32 +166,45 @@ impl Visibility {
         }
     }
 
+    fn set_enabled(&mut self, on: bool) {
+        self.enabled = on;
+    }
+
     fn set_pinned(&mut self, on: bool) {
         self.pinned = on;
     }
 
-    /// "Muestra lo que oyes": behaves like something was just heard.
+    /// "Muestra lo que oyes": shows the panel for [`Self::hud_seconds`]
+    /// even with `enabled` false — an explicit ask, unlike `activity_until`,
+    /// which only ever comes from `enabled` speech handling.
     fn show_forced(&mut self, now: Instant) {
-        self.note_heard(now);
+        self.forced_until = Some(now + Duration::from_secs_f64(self.hud_seconds));
+        self.forced_hidden = false;
     }
 
     /// "Esconde lo que oyes": hidden until the next thing worth showing.
     fn hide_forced(&mut self) {
         self.forced_hidden = true;
         self.activity_until = None;
+        self.forced_until = None;
     }
 
     fn visible(&self, now: Instant) -> bool {
-        if self.pinned {
+        if self.pinned && self.enabled {
             return true;
         }
         if self.forced_hidden {
             return false;
         }
+        let forced_active = self.forced_until.is_some_and(|until| now < until);
+        if !self.enabled {
+            return forced_active;
+        }
         self.dictating
             || self.question_pending
             || self.busy
             || self.activity_until.is_some_and(|until| now < until)
+            || forced_active
     }
 }
 
@@ -328,7 +357,7 @@ pub struct Hud {
 impl Hud {
     /// Builds the panel, hidden until something calls [`Hud::tick`] with a
     /// reason to show it.
-    pub fn new(mtm: MainThreadMarker, pinned: bool, hud_seconds: f64) -> Self {
+    pub fn new(mtm: MainThreadMarker, enabled: bool, pinned: bool, hud_seconds: f64) -> Self {
         let style = NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel;
         let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(WIDTH, HEIGHT));
         let window = NSPanel::initWithContentRect_styleMask_backing_defer(
@@ -405,6 +434,7 @@ impl Hud {
         position(&window, mtm);
 
         let mut state = Visibility::with_hud_seconds(hud_seconds);
+        state.set_enabled(enabled);
         state.set_pinned(pinned);
         Self {
             window,
@@ -419,6 +449,10 @@ impl Hud {
             last_dictation: RefCell::new(String::new()),
             dictating: Cell::new(false),
         }
+    }
+
+    pub fn set_enabled(&self, on: bool) {
+        self.state.borrow_mut().set_enabled(on);
     }
 
     pub fn set_pinned(&self, on: bool) {
@@ -760,6 +794,68 @@ mod tests {
         let mut state = Visibility::with_hud_seconds(HUD_SECONDS);
         state.set_pinned(true);
         state.hide_forced();
+        assert!(state.visible(t(0)));
+    }
+
+    #[test]
+    fn disabled_hud_never_shows_for_ordinary_activity() {
+        let mut state = Visibility::with_hud_seconds(HUD_SECONDS);
+        state.set_enabled(false);
+        state.note_heard(t(0));
+        assert!(!state.visible(t(0)));
+    }
+
+    #[test]
+    fn disabled_hud_ignores_dictation_a_question_and_being_busy() {
+        let mut state = Visibility::with_hud_seconds(HUD_SECONDS);
+        state.set_enabled(false);
+        state.set_dictating(true);
+        assert!(!state.visible(t(0)));
+        state.set_dictating(false);
+        state.set_question_pending(true);
+        assert!(!state.visible(t(0)));
+        state.set_question_pending(false);
+        state.set_busy(true);
+        assert!(!state.visible(t(0)));
+    }
+
+    #[test]
+    fn a_pin_on_a_disabled_hud_does_not_show_it() {
+        // Ajustes disables the pin checkbox whenever "Mostrar lo que oye"
+        // is off, so this combination should not arise from the UI — but
+        // the state machine still must not show a panel nobody asked to
+        // see just because a stale pin is set.
+        let mut state = Visibility::with_hud_seconds(HUD_SECONDS);
+        state.set_enabled(false);
+        state.set_pinned(true);
+        assert!(!state.visible(t(0)));
+    }
+
+    #[test]
+    fn muestra_lo_que_oyes_still_shows_a_disabled_hud_once() {
+        let mut state = Visibility::with_hud_seconds(HUD_SECONDS);
+        state.set_enabled(false);
+        state.show_forced(t(0));
+        assert!(state.visible(t(0)));
+        assert!(!state.visible(t(HUD_SECONDS as u64 + 1)));
+    }
+
+    #[test]
+    fn esconde_lo_que_oyes_still_hides_a_disabled_hud_shown_by_voice() {
+        let mut state = Visibility::with_hud_seconds(HUD_SECONDS);
+        state.set_enabled(false);
+        state.show_forced(t(0));
+        state.hide_forced();
+        assert!(!state.visible(t(0)));
+    }
+
+    #[test]
+    fn enabling_the_hud_again_restores_ordinary_activity() {
+        let mut state = Visibility::with_hud_seconds(HUD_SECONDS);
+        state.set_enabled(false);
+        state.note_heard(t(0));
+        assert!(!state.visible(t(0)));
+        state.set_enabled(true);
         assert!(state.visible(t(0)));
     }
 
