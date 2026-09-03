@@ -898,11 +898,12 @@ pub fn decide_in(transcript: &str, context: Option<&str>) -> (Decision, f32) {
 
     // The dictation mode's own switches, and undo. Checked here because
     // they are answered by the caller, which is what holds the state.
-    for (phrases, decision) in [
-        (["empieza a dictar", "modo dictado"], Decision::StartDictation),
-        (["deja de dictar", "fin del dictado"], Decision::StopDictation),
-        (["deshaz lo que has hecho", "anula eso"], Decision::UndoLast),
-    ] {
+    let switches: [(&[&str], Decision); 3] = [
+        (&["empieza a dictar", "modo dictado", "dictado"], Decision::StartDictation),
+        (&["deja de dictar", "fin del dictado"], Decision::StopDictation),
+        (&["deshaz lo que has hecho", "anula eso"], Decision::UndoLast),
+    ];
+    for (phrases, decision) in switches {
         for phrase in phrases {
             if similarity(rest, phrase) >= threshold() {
                 return (decision, 1.0);
@@ -1974,6 +1975,8 @@ mod tests {
     fn dictation_is_a_mode_of_its_own() {
         assert_eq!(decide("minion empieza a dictar").0, Decision::StartDictation);
         assert_eq!(decide("minion modo dictado").0, Decision::StartDictation);
+        // The shortest way in: just the mode's name.
+        assert_eq!(decide("minion dictado").0, Decision::StartDictation);
         assert_eq!(decide("minion deja de dictar").0, Decision::StopDictation);
         assert_eq!(decide("minion fin del dictado").0, Decision::StopDictation);
     }
