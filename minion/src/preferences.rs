@@ -339,6 +339,10 @@ fn is_function_key(code: u16) -> bool {
 const RETURN: u16 = 36;
 const KEYPAD_ENTER: u16 = 76;
 
+/// Height of a line of the training prompt, which is set larger than a
+/// hint because it is read aloud from across the room.
+const PROMPT_LINE: f64 = 19.0;
+
 /// Indent for a hint that belongs to a checkbox, lining up with its label.
 const INDENT: f64 = 20.0;
 
@@ -460,6 +464,11 @@ pub struct Preferences {
     train_clicks: Cell<isize>,
     train_status: Retained<NSTextField>,
     train_requested: Cell<bool>,
+    /// Stops a training session halfway through.
+    cancel_train: Press,
+    cancel_requested: Cell<bool>,
+    /// Deletes the voice profile, after asking.
+    forget: Press,
     /// The button's state last time it was read, to notice a click without
     /// an Objective-C target — see the note at the top of this file.
     button_clicks: Cell<isize>,
@@ -580,6 +589,80 @@ impl Preferences {
             INDENT,
         );
 
+        // Directly under the behaviour it changes, and above the fold: in
+        // a window that scrolls, a section at the bottom is one nobody
+        // finds, and this is the one that decides who Minion obeys.
+        layout.heading("Tu voz");
+        let trained = crate::speaker::has_profile();
+        // Safety: no target and no action, so nothing is called back into.
+        let train = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str(if trained {
+                    "Volver a entrenar"
+                } else {
+                    "Entrenar mi voz"
+                }),
+                None,
+                None,
+                mtm,
+            )
+        };
+        let voice_row = layout.place(spacing::BUTTON, 0.0);
+        train.setFrame(narrow(voice_row, 170.0));
+        layout.add_control(&train, "Entrenar mi voz");
+        // Safety: no target and no action, so nothing is called back into.
+        let cancel_train = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str("Cancelar"),
+                None,
+                None,
+                mtm,
+            )
+        };
+        cancel_train.setFrame(beside(voice_row, 170.0, 110.0));
+        cancel_train.setAccessibilityLabel(Some(&NSString::from_str(
+            "Cancelar el entrenamiento",
+        )));
+        // Only means anything while training is under way.
+        cancel_train.setHidden(true);
+        layout.add(&cancel_train);
+
+        // Big enough to read from where you sit to talk to the machine:
+        // this line is a sentence to be said aloud, not a footnote.
+        let train_status_frame = {
+            layout.gap(spacing::BEFORE_HINT);
+            layout.place(PROMPT_LINE * 2.0, 0.0)
+        };
+        let train_status = plain_label(
+            mtm,
+            if trained {
+                "Minion solo obedece a tu voz."
+            } else {
+                "Ahora obedece a cualquiera que diga la palabra clave."
+            },
+            train_status_frame,
+        );
+        train_status.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+        layout.add(&train_status);
+        layout.gap(spacing::SIBLING);
+
+        // Safety: no target and no action, so nothing is called back into.
+        let forget = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str("Olvidar mi voz"),
+                None,
+                None,
+                mtm,
+            )
+        };
+        forget.setFrame(narrow(layout.place(spacing::BUTTON, 0.0), 170.0));
+        layout.add_control(&forget, "Olvidar mi voz");
+        layout.hint(
+            "Borra el perfil de voz. Minion volverá a obedecer a cualquiera \
+             que diga la palabra clave.",
+            0.0,
+        );
+
         layout.heading("Palabra clave");
         let current_wake = settings
             .wake_words
@@ -668,38 +751,6 @@ impl Preferences {
             0.0,
         );
 
-        layout.heading("Tu voz");
-        let trained = crate::speaker::has_profile();
-        // Safety: no target and no action, so nothing is called back into.
-        let train = unsafe {
-            NSButton::buttonWithTitle_target_action(
-                &NSString::from_str(if trained {
-                    "Volver a entrenar"
-                } else {
-                    "Entrenar mi voz"
-                }),
-                None,
-                None,
-                mtm,
-            )
-        };
-        train.setFrame(narrow(layout.place(spacing::BUTTON, 0.0), 170.0));
-        layout.add_control(&train, "Entrenar mi voz");
-        let train_status_frame = {
-            layout.gap(spacing::BEFORE_HINT);
-            layout.place(spacing::HINT_LINE * 2.0, 0.0)
-        };
-        let train_status = small_label(
-            mtm,
-            if trained {
-                "Minion solo obedece a tu voz."
-            } else {
-                "Ahora obedece a cualquiera que diga la palabra clave."
-            },
-            train_status_frame,
-        );
-        layout.add(&train_status);
-
         let (canvas, content_height) = layout.finish();
 
         let window = {
@@ -773,6 +824,9 @@ impl Preferences {
             train_clicks: Cell::new(0),
             train_status,
             train_requested: Cell::new(false),
+            cancel_train: Press::new(cancel_train),
+            cancel_requested: Cell::new(false),
+            forget: Press::new(forget),
         };
         preferences.update_readouts();
         preferences
@@ -924,6 +978,16 @@ impl Preferences {
             self.end_capture();
         }
 
+        if self.cancel_train.clicked() {
+            self.cancel_requested.set(true);
+            self.cancel_train.control.setHidden(true);
+            self.show_training("Entrenamiento cancelado.", true);
+        }
+        if self.forget.clicked() {
+            self.forget_voice();
+            changed = true;
+        }
+
         if self.clear_shortcut.clicked() {
             self.end_capture();
             save("resume_shortcut", &config::toml_string(""));
@@ -961,9 +1025,60 @@ impl Preferences {
     /// Shows how training is going.
     pub fn show_training(&self, message: &str, finished: bool) {
         self.train_status.setStringValue(&NSString::from_str(message));
+        // The way out is only offered while there is something to get out
+        // of: five phrases is long enough to change your mind.
+        self.cancel_train.control.setHidden(finished);
         if finished {
             self.train
                 .setTitle(&NSString::from_str("Volver a entrenar"));
+        }
+    }
+
+    /// Whether the person just asked to stop training.
+    ///
+    /// Cleared by asking, like the training request: only the loop that
+    /// owns the microphone can end the session.
+    ///
+    /// Waiting to be read by the run loop timer in `main.rs`, next to
+    /// `take_training_request`; until it is, the button only clears the
+    /// window's own prompt.
+    #[allow(dead_code)]
+    pub fn take_cancel_request(&self) -> bool {
+        self.cancel_requested.replace(false)
+    }
+
+    /// Deletes the voice profile, once.
+    ///
+    /// Asked about first: it is the one setting here that cannot be undone
+    /// without saying five phrases again.
+    fn forget_voice(&self) {
+        let Some(path) = crate::speaker::profile_path() else {
+            return;
+        };
+        if !path.exists() {
+            self.show_training("No hay ninguna voz que olvidar.", true);
+            return;
+        }
+        if !crate::actions::ask(
+            "¿Olvidar tu voz? Minion volverá a obedecer a cualquiera que diga \
+             la palabra clave.",
+            "Olvidar",
+        ) {
+            return;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                crate::journal::write("voice profile deleted from the settings window");
+                self.train.setTitle(&NSString::from_str("Entrenar mi voz"));
+                self.show_training(
+                    "Voz olvidada. Reinicia Minion para que deje de reconocerte.",
+                    true,
+                );
+            }
+            Err(e) => {
+                crate::journal::write(&format!("could not delete the voice profile: {e}"));
+                self.show_training("No se pudo borrar el perfil de voz.", true);
+            }
         }
     }
 
