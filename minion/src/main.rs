@@ -20,6 +20,7 @@ mod hotkey;
 mod icon;
 mod journal;
 mod learn;
+mod microphone;
 mod models;
 mod notify;
 mod preferences;
@@ -169,6 +170,7 @@ const IDLE_CHECK: Duration = Duration::from_millis(250);
 /// the idle tick already polls a few times a second for other reasons —
 /// one more cheap check costs nothing extra.
 mod auto_pause {
+    use crate::microphone;
     use core_foundation::base::{CFType, TCFType};
     use core_foundation::boolean::CFBoolean;
     use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
@@ -211,25 +213,43 @@ mod auto_pause {
         core_graphics::display::CGDisplay::main().is_asleep()
     }
 
-    /// Whether the application in front is one to pause listening for.
-    pub fn frontmost_matches(frontmost: Option<&str>, pause_during: &[String]) -> bool {
-        frontmost.is_some_and(|id| pause_during.iter().any(|paused| paused == id))
+    /// How a microphone already in use is written down, if it is in use.
+    ///
+    /// Kept apart from [`reason`] so the wording can be tested without a
+    /// microphone: everything else in here reads the live system.
+    pub fn microphone_reason(capturing: &[microphone::Capture]) -> Option<String> {
+        let first = capturing.first()?;
+        let others = capturing.len() - 1;
+        Some(match others {
+            0 => format!("microphone in use by {first}"),
+            1 => format!("microphone in use by {first} and 1 other"),
+            _ => format!("microphone in use by {first} and {others} others"),
+        })
     }
 
     /// Why listening should be paused right now, if it should.
     ///
     /// Checked in order of how much it would cost to keep listening
     /// wrongly: a locked or sleeping Mac hears nothing useful at all,
-    /// while an unwelcome app being in front is the milder case.
-    pub fn reason(frontmost: Option<&str>, pause_during: &[String]) -> Option<String> {
+    /// while somebody else recording is the milder case.
+    ///
+    /// `watch_microphone` is the `pause_when_microphone_busy` setting,
+    /// already lowered to false where macOS cannot answer the question.
+    pub fn reason(watch_microphone: bool) -> Option<String> {
         if screen_locked() {
             return Some("the screen is locked".to_string());
         }
         if display_asleep() {
             return Some("the display is asleep".to_string());
         }
-        if frontmost_matches(frontmost, pause_during) {
-            return Some(format!("{} is in front", frontmost.unwrap_or_default()));
+        if watch_microphone && microphone::in_use_by_others() == Some(true) {
+            // Same second-long cache as the check above, so naming who it
+            // is costs nothing more than asking whether anyone is.
+            let capturing = microphone::others_capturing().unwrap_or_default();
+            return Some(
+                microphone_reason(&capturing)
+                    .unwrap_or_else(|| "the microphone is in use elsewhere".to_string()),
+            );
         }
         None
     }
@@ -239,16 +259,31 @@ mod auto_pause {
         use super::*;
 
         #[test]
-        fn only_a_listed_bundle_id_matches() {
-            let listed = vec!["us.zoom.xos".to_string(), "com.apple.FaceTime".to_string()];
-            assert!(frontmost_matches(Some("us.zoom.xos"), &listed));
-            assert!(!frontmost_matches(Some("com.apple.Safari"), &listed));
-            assert!(!frontmost_matches(None, &listed));
+        fn nobody_recording_is_not_a_reason_to_pause() {
+            assert_eq!(microphone_reason(&[]), None);
         }
 
         #[test]
-        fn an_empty_list_matches_nothing() {
-            assert!(!frontmost_matches(Some("us.zoom.xos"), &[]));
+        fn the_reason_names_who_is_recording() {
+            let teams = microphone::Capture {
+                pid: 501,
+                bundle_id: Some("com.microsoft.teams2".to_string()),
+            };
+            let nameless = microphone::Capture { pid: 777, bundle_id: None };
+            assert_eq!(
+                microphone_reason(std::slice::from_ref(&teams)),
+                Some("microphone in use by com.microsoft.teams2 (pid 501)".to_string())
+            );
+            assert_eq!(
+                microphone_reason(&[teams.clone(), nameless.clone()]),
+                Some("microphone in use by com.microsoft.teams2 (pid 501) and 1 other".to_string())
+            );
+            assert_eq!(
+                microphone_reason(&[teams, nameless.clone(), nameless]),
+                Some(
+                    "microphone in use by com.microsoft.teams2 (pid 501) and 2 others".to_string()
+                )
+            );
         }
 
         #[test]
@@ -471,8 +506,8 @@ struct Listening {
     /// `listen_mode = "hold"`: no wake word is needed while `active` is
     /// true, since that only happens while the shortcut is held.
     hold_mode: bool,
-    /// Bundle IDs of applications that pause listening while in front.
-    pause_during: Vec<String>,
+    /// Pause listening while another process is capturing the microphone.
+    pause_when_microphone_busy: bool,
     voice: Option<Voice>,
     training: Training,
     active: Arc<AtomicBool>,
@@ -514,7 +549,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
         conversation_window,
         window_open,
         hold_mode,
-        pause_during,
+        pause_when_microphone_busy,
         mut voice,
         training,
         active,
@@ -549,6 +584,13 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
     // knows the pause is its own to lift — a manual pause never sets this,
     // and so never gets silently overridden once the reason clears.
     let mut auto_paused = false;
+    // The CoreAudio process objects that say who is recording arrived in
+    // macOS 14. On 13 the question cannot be asked at all, so the setting
+    // is lowered here — said once, rather than on every tick.
+    let watch_microphone = pause_when_microphone_busy && microphone::available();
+    if pause_when_microphone_busy && !watch_microphone {
+        note!("auto-pause: this macOS cannot say which apps use the microphone (needs macOS 14).");
+    }
     note!("Model loaded. {}", resident_memory());
 
     // How long to stay deaf after speaking: the segmenter needs
@@ -593,10 +635,7 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                         // so the pause is no longer this feature's to lift.
                         auto_paused = false;
                     }
-                    let reason = auto_pause::reason(
-                        actions::frontmost_app().as_deref(),
-                        &pause_during,
-                    );
+                    let reason = auto_pause::reason(watch_microphone);
                     if let Some(reason) = reason {
                         if listening {
                             active.store(false, Ordering::Relaxed);
@@ -2060,6 +2099,7 @@ fn main() -> Result<()> {
                  minion run \"orden\"          la ejecuta, como si la hubieras dicho\n  \
                  minion say \"texto\"          lo dice en voz alta\n  \
                  minion status               si Minion está escuchando o en pausa\n  \
+                 minion mic                  qué apps usan ahora el micrófono\n  \
                  minion --help               esto\n\n\
                  «run» y «say» dejan un aviso para la copia que ya está en\n\
                  marcha y no hacen nada si no hay ninguna — útil para atajos\n\
@@ -2112,6 +2152,12 @@ fn main() -> Result<()> {
         }
         if argument == "status" {
             api::print_status();
+            return Ok(());
+        }
+        // For checking the automatic pause by hand: pick up a call, run
+        // this, and see the same thing Minion sees.
+        if argument == "mic" {
+            microphone::report();
             return Ok(());
         }
     }
@@ -2197,7 +2243,7 @@ fn main() -> Result<()> {
     let window_open = Arc::new(AtomicBool::new(false));
     let worker_window_open = Arc::clone(&window_open);
     let conversation_window = config.conversation_window();
-    let pause_during = config.pause_during();
+    let pause_when_microphone_busy = config.pause_when_microphone_busy;
 
     let worker_active = Arc::clone(&active);
     let worker_log_ignored = Arc::clone(&log_ignored);
@@ -2260,7 +2306,7 @@ fn main() -> Result<()> {
             conversation_window,
             window_open: worker_window_open,
             hold_mode: listen_mode == config::ListenMode::Hold,
-            pause_during,
+            pause_when_microphone_busy,
             voice_reply,
             microphone,
             show_catalogue: worker_catalogue,

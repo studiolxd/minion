@@ -18,7 +18,7 @@ use std::rc::Rc;
 use objc2::rc::Retained;
 use objc2::MainThreadMarker;
 use objc2_app_kit::{
-    NSAccessibility, NSAutoresizingMaskOptions, NSApplication, NSBackingStoreType, NSBorderType, NSButton, NSColor, NSFont, NSLineBreakMode,
+    NSAccessibility, NSAutoresizingMaskOptions, NSApplication, NSBackingStoreType, NSButton, NSColor, NSFont, NSLineBreakMode,
     NSPopUpButton, NSScrollView, NSSlider, NSTextField, NSTextView, NSView, NSWindow,
     NSWindowStyleMask,
 };
@@ -287,50 +287,6 @@ impl Layout {
         Popup { control, values, last: Cell::new(selected) }
     }
 
-    /// A small, editable, multi-line text box — for a setting that is a
-    /// list, one entry per line, rather than a single value.
-    fn multiline_field(&mut self, initial: &str, lines: f64) -> MultilineField {
-        let height = spacing::HINT_LINE * lines + 8.0;
-        let frame = self.place(height, 0.0);
-
-        let scroll = NSScrollView::new(self.mtm);
-        scroll.setFrame(frame);
-        scroll.setHasVerticalScroller(true);
-        scroll.setBorderType(NSBorderType::BezelBorder);
-
-        let view = NSTextView::new(self.mtm);
-        view.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), frame.size));
-        view.setString(&NSString::from_str(initial));
-        view.setEditable(true);
-        view.setSelectable(true);
-        view.setRichText(false);
-        view.setFont(Some(&NSFont::systemFontOfSize(12.0)));
-        view.setVerticallyResizable(true);
-        view.setHorizontallyResizable(false);
-        view.setMinSize(NSSize::new(0.0, 0.0));
-        view.setMaxSize(NSSize::new(f64::MAX, f64::MAX));
-        view.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
-        // Safety: reading the text view's own container, which exists for
-        // a view built the ordinary way.
-        if let Some(container) = unsafe { view.textContainer() } {
-            container.setWidthTracksTextView(true);
-            container.setContainerSize(NSSize::new(frame.size.width, f64::MAX));
-        }
-        scroll.setDocumentView(Some(&view));
-        self.add(&scroll);
-
-        // The label and hint belong to the text view itself, which is what
-        // actually takes the focus and the keystrokes — the scroll view
-        // around it is only a frame.
-        let name = self.borrowed_label();
-        let as_view: &NSView = &view;
-        as_view.setAccessibilityLabel(Some(&NSString::from_str(&name)));
-        self.last_control = Some(Retained::from(as_view));
-        self.gap(spacing::SIBLING);
-
-        MultilineField { view, last: std::cell::RefCell::new(initial.to_string()) }
-    }
-
     /// A dropdown of device names, with "follow the system" first.
     fn chooser(&mut self, names: Vec<String>, current: Option<String>) -> Chooser {
         let frame = self.place(spacing::BUTTON, 0.0);
@@ -496,34 +452,6 @@ impl Popup {
     }
 }
 
-/// A small multi-line editable text box, one entry per line.
-struct MultilineField {
-    view: Retained<NSTextView>,
-    /// The text as last saved, so a still-unsettled edit is not written
-    /// through on every poll — see [`Preferences::poll`] for why that
-    /// matters, same reasoning as the wake word field.
-    last: std::cell::RefCell<String>,
-}
-
-impl MultilineField {
-    fn text(&self) -> String {
-        self.view.string().to_string()
-    }
-
-    /// Whether this is the view currently taking keystrokes.
-    ///
-    /// Unlike [`NSTextField`], which hands editing off to a shared field
-    /// editor read back through `currentEditor()`, an [`NSTextView`] is
-    /// itself the thing that becomes first responder — so identity is
-    /// checked directly against the window's first responder instead.
-    fn is_editing(&self, window: &NSWindow) -> bool {
-        window.firstResponder().is_some_and(|responder| {
-            Retained::as_ptr(&responder).cast::<std::ffi::c_void>()
-                == Retained::as_ptr(&self.view).cast::<std::ffi::c_void>()
-        })
-    }
-}
-
 /// A checkbox and the value it last had.
 struct Switch {
     control: Retained<NSButton>,
@@ -593,7 +521,7 @@ pub struct Preferences {
     memory: Dial,
     listen_mode: Popup,
     conversation: Dial,
-    pause_during: MultilineField,
+    pause_when_microphone_busy: Switch,
     spoken_punctuation: Switch,
     auto_capitalise: Switch,
     notifications: Switch,
@@ -907,13 +835,14 @@ impl Preferences {
         );
 
         layout.heading("Pausa automática");
-        layout.field_label("Aplicaciones delante de las que Minion se pausa");
-        let pause_during = layout.multiline_field(&settings.pause_during().join("\n"), 4.0);
+        let pause_when_microphone_busy = layout.checkbox(
+            "Pausar mientras otra app use el micrófono",
+            settings.pause_when_microphone_busy,
+        );
         layout.hint(
-            "Un identificador de aplicación (bundle ID) por línea. La \
-             pantalla bloqueada y el Mac dormido siempre pausan a Minion, \
-             se escriba aquí lo que se escriba.",
-            0.0,
+            "Videollamadas: Minion se pausa al descolgar y vuelve al colgar. \
+             Bloquear la pantalla o dormir el Mac siempre pausa.",
+            INDENT,
         );
 
         layout.heading("Avisos");
@@ -1044,7 +973,7 @@ impl Preferences {
             memory,
             listen_mode,
             conversation,
-            pause_during,
+            pause_when_microphone_busy,
             spoken_punctuation,
             auto_capitalise,
             notifications,
@@ -1251,26 +1180,10 @@ impl Preferences {
             needs_restart = true;
             changed = true;
         }
-        // Also read once at startup (`pause_during` in `main.rs`). Settled
-        // the same way as the wake word field: only once the text has
-        // stopped changing, so a bundle ID is not saved one keystroke at a
-        // time while it is still being typed.
-        let editing_pause_during = self.pause_during.is_editing(&self.window);
-        let settled_pause_during = !editing_pause_during || !self.window.isKeyWindow();
-        let current_pause_during = self.pause_during.text();
-        if settled_pause_during && current_pause_during.trim() != self.pause_during.last.borrow().trim() {
-            let lines: Vec<String> = current_pause_during
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .map(str::to_string)
-                .collect();
-            let value = format!(
-                "[{}]",
-                lines.iter().map(|id| config::toml_string(id)).collect::<Vec<_>>().join(", ")
-            );
-            save("pause_during", &value);
-            *self.pause_during.last.borrow_mut() = current_pause_during;
+        // Read once at startup (`pause_when_microphone_busy` in `main.rs`),
+        // so this one needs the restart notice.
+        if let Some(on) = self.pause_when_microphone_busy.toggled() {
+            save("pause_when_microphone_busy", if on { "true" } else { "false" });
             needs_restart = true;
             changed = true;
         }
