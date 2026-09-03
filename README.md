@@ -1,15 +1,15 @@
 # Voice control in Spanish, on macOS
 
-**[oyente/](oyente/)** — the working project. Speak Spanish to your Mac,
+**[minion/](minion/)** — the working project. Speak Spanish to your Mac,
 hands free, entirely offline. Lives in the menu bar.
 
 ```bash
-cd oyente
+cd minion
 ./download-model.sh
 ./install.sh
 ```
 
-Then say «ordenador, abre Chrome».
+Then say «minion, abre Chrome».
 
 ## How it got here
 
@@ -29,5 +29,5 @@ Its `external_script` paste method is documented as "Linux only" and hidden
 from the macOS interface, yet works fine when written straight into the
 settings file.
 
-**Oyente** — Parakeet TDT v3 for Spanish recognition, always listening, in
-Rust. What the other two each had half of.
+**Minion**, first named Oyente — Parakeet TDT v3 for Spanish recognition,
+always listening, in Rust. What the other two each had half of.
