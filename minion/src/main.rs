@@ -540,11 +540,13 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                 Outcome::NotDictating => note!("not dictating"),
                 // Heard while dictating, with nothing in it to type.
                 Outcome::Nothing => {}
-                Outcome::Type(typed) => {
-                    actions::type_text(&format!("{typed} "));
-                    note!("typed    «{typed}»");
-                    acted.store(true, Ordering::Relaxed);
-                }
+                Outcome::Type(typed) => match actions::type_text(&format!("{typed} ")) {
+                    Ok(()) => {
+                        note!("typed    «{typed}»");
+                        acted.store(true, Ordering::Relaxed);
+                    }
+                    Err(reason) => note!("BLOCKED  «{typed}»  ->  escribir texto: {reason}"),
+                },
                 Outcome::Answer(question) => {
                     // "¿Qué puedes hacer?" is answered by showing the list.
                     if question == answers::Question::Help {
@@ -575,18 +577,35 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                 }
                 Outcome::Undo(taken) => match taken {
                     Some(Undoable::Typed(length)) => {
+                        let mut blocked = None;
                         for _ in 0..length {
-                            actions::press(actions::key::DELETE, actions::Mods::NONE);
+                            if let Err(reason) =
+                                actions::press(actions::key::DELETE, actions::Mods::NONE)
+                            {
+                                blocked = Some(reason);
+                                break;
+                            }
                         }
-                        note!("undid    typing ({length} characters)");
-                        acted.store(true, Ordering::Relaxed);
+                        match blocked {
+                            None => {
+                                note!("undid    typing ({length} characters)");
+                                acted.store(true, Ordering::Relaxed);
+                            }
+                            Some(reason) => {
+                                note!("BLOCKED  undo typing ({length} characters): {reason}");
+                            }
+                        }
                     }
                     Some(Undoable::Launched { previous }) => match previous {
-                        Some(bundle) => {
-                            actions::open_app(&bundle);
-                            note!("undid    going back to {bundle}");
-                            acted.store(true, Ordering::Relaxed);
-                        }
+                        Some(bundle) => match actions::open_app(&bundle) {
+                            Ok(()) => {
+                                note!("undid    going back to {bundle}");
+                                acted.store(true, Ordering::Relaxed);
+                            }
+                            Err(reason) => {
+                                note!("BLOCKED  undo going back to {bundle}: {reason}");
+                            }
+                        },
                         None => note!("nothing to go back to"),
                     },
                     None => note!("nothing of mine to undo"),
@@ -660,7 +679,7 @@ fn report(
             note!("unknown  «{transcript}»  ->  not understood");
             set_status(at.status, &last_utterance_tooltip(transcript, "no entendido"));
             if at.play_sounds {
-                actions::play_sound(sounds::UNSURE);
+                let _ = actions::play_sound(sounds::UNSURE);
             }
         }
         _ => {
@@ -669,7 +688,22 @@ fn report(
                 outcome = commands::perform(decision);
             }
             if let Some(done) = outcome {
-                if done.succeeded {
+                if let Err(reason) = &done.outcome {
+                    // Understood perfectly and refused by the system.
+                    // Almost always the Accessibility permission.
+                    note!(
+                        "BLOCKED  «{transcript}»  ->  {}: {reason}  — macOS refused it. \
+                         Grant Accessibility in System Settings.",
+                        done.description
+                    );
+                    set_status(
+                        at.status,
+                        &last_utterance_tooltip(transcript, "bloqueado por macOS"),
+                    );
+                    if at.play_sounds {
+                        let _ = actions::play_sound(sounds::BLOCKED);
+                    }
+                } else {
                     let again = if repeats > 1 {
                         format!(" ×{repeats}")
                     } else {
@@ -685,22 +719,7 @@ fn report(
                     at.acted.store(true, Ordering::Relaxed);
                     set_status(at.status, &last_utterance_tooltip(transcript, &done.description));
                     if at.play_sounds {
-                        actions::play_sound(sounds::DONE);
-                    }
-                } else {
-                    // Understood perfectly and refused by the system.
-                    // Almost always the Accessibility permission.
-                    note!(
-                        "BLOCKED  «{transcript}»  ->  {}  — macOS refused it. \
-                         Grant Accessibility in System Settings.",
-                        done.description
-                    );
-                    set_status(
-                        at.status,
-                        &last_utterance_tooltip(transcript, "bloqueado por macOS"),
-                    );
-                    if at.play_sounds {
-                        actions::play_sound(sounds::BLOCKED);
+                        let _ = actions::play_sound(sounds::DONE);
                     }
                 }
             }
@@ -1068,7 +1087,9 @@ fn run_menu_bar(
                 open_from_menu.store(true, Ordering::Relaxed);
             } else if event.id == show_log_id {
                 if let Some(path) = journal::path() {
-                    actions::reveal(&path.to_string_lossy());
+                    if let Err(reason) = actions::reveal(&path.to_string_lossy()) {
+                        note!("could not reveal the log: {reason}");
+                    }
                 }
             } else if event.id == restart_id {
                 // Handed to the timer: it can flush the settings window
@@ -1265,7 +1286,9 @@ fn report_permissions() {
         note!("Accessibility pane already offered since this Mac started; not reopening it.");
         return;
     }
-    actions::open_accessibility_settings();
+    if let Err(reason) = actions::open_accessibility_settings() {
+        note!("could not open the Accessibility pane: {reason}");
+    }
     remember_accessibility_prompt(boot);
 }
 
