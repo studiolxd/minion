@@ -81,6 +81,10 @@ const MICROPHONE_SETTINGS: &str =
 mod sounds {
     pub const DONE: &str = "/System/Library/Sounds/Pop.aiff";
     pub const UNSURE: &str = "/System/Library/Sounds/Tink.aiff";
+    /// Understood perfectly and refused by macOS. A different sound from
+    /// UNSURE on purpose: "say it again" and "grant the permission" are
+    /// different problems, and they used to be indistinguishable.
+    pub const BLOCKED: &str = "/System/Library/Sounds/Basso.aiff";
 }
 
 /// The toggle's two faces. It names the action, not the state: a menu item
@@ -107,7 +111,7 @@ const IDLE_CHECK: Duration = Duration::from_millis(250);
 
 /// Locates the speech model, without fetching anything.
 ///
-/// Order: explicit argument, `OYENTE_MODEL`, the app bundle's Resources,
+/// Order: explicit argument, `MINION_MODEL`, the app bundle's Resources,
 /// then the working directory. The bundle case is what makes double-click
 /// launching work, since a bundled app starts with `/` as its directory.
 ///
@@ -118,7 +122,13 @@ fn find_model(argument: Option<String>) -> Option<String> {
     if let Some(path) = argument {
         return Some(path);
     }
+    if let Ok(path) = std::env::var("MINION_MODEL") {
+        return Some(path);
+    }
+    // The name from when this was called Oyente. Still read, so an
+    // existing shell profile keeps working, but it says so.
     if let Ok(path) = std::env::var("OYENTE_MODEL") {
+        note!("OYENTE_MODEL is deprecated — rename it to MINION_MODEL.");
         return Some(path);
     }
 
@@ -345,7 +355,11 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
         listener.channels,
         commands::phrase_count()
     );
-    note!("Listening. Say: «minion, abre Chrome»");
+    // The wake word can be changed in preferences, and telling someone to
+    // say «minion» when it no longer answers to that is worse than saying
+    // nothing.
+    let wake = commands::wake_words().first().copied().unwrap_or("minion");
+    note!("Listening. Say: «{wake}, abre Chrome»");
 
     loop {
         // A bounded wait, so idleness can be noticed while nothing is being
@@ -732,7 +746,7 @@ fn report(
                             &last_utterance_tooltip(transcript, "bloqueado por macOS"),
                         );
                         if play_sounds {
-                            actions::play_sound(sounds::UNSURE);
+                            actions::play_sound(sounds::BLOCKED);
                         }
                     }
                 }
@@ -1274,6 +1288,26 @@ fn main() -> Result<()> {
     // before any of that is set up.
     let first_argument = std::env::args().nth(1);
     if let Some(argument) = first_argument.as_deref() {
+        if matches!(argument, "--help" | "-h" | "help") {
+            // Spanish: everything the person running this reads is in
+            // Spanish, and this is read by nobody else. Without it,
+            // `minion --help` went looking for a model called «--help».
+            println!(
+                "Minion — control por voz en español.\n\n\
+                 Uso:\n  \
+                 minion                      escucha y obedece (el uso normal)\n  \
+                 minion <ruta-al-modelo>     igual, con el modelo de esa carpeta\n  \
+                 minion learn [--apply]      convierte en alias lo que no entendió\n  \
+                 minion enroll               aprende tu voz desde la terminal\n  \
+                 minion export-icon <dir>    guarda el icono como .iconset\n  \
+                 minion --help               esto\n\n\
+                 Variables de entorno:\n  \
+                 MINION_MODEL                carpeta del modelo de reconocimiento\n\n\
+                 Registro: ~/Library/Logs/minion.log\n\
+                 Ajustes:  ~/Library/Application Support/Minion/config.toml"
+            );
+            return Ok(());
+        }
         if argument == "export-icon" {
             let directory = std::env::args().nth(2).unwrap_or_else(|| "Minion.iconset".into());
             icon::export_iconset(&directory)?;
