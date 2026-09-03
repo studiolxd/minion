@@ -1,0 +1,39 @@
+# Word processors and spreadsheets.
+# The schema is documented at the top of macos.toml.
+#
+# Only the real spellings are listed. Nothing here has been said to Minion
+# yet, so there is no log to copy misheard forms from, and guessing at them
+# is how the wrong application ends up opening. Add what you see in
+# «unknown «…»» lines, or let `minion learn` do it.
+
+category = "Ofimática"
+
+[[apps]]
+name = "Word"
+bundle_id = "com.microsoft.Word"
+aliases = ["word", "microsoft word"]
+
+[[apps]]
+name = "Excel"
+bundle_id = "com.microsoft.Excel"
+aliases = ["excel", "microsoft excel"]
+
+[[apps]]
+name = "PowerPoint"
+bundle_id = "com.microsoft.Powerpoint"
+aliases = ["powerpoint", "power point"]
+
+[[apps]]
+name = "Pages"
+bundle_id = "com.apple.iWork.Pages"
+aliases = ["pages"]
+
+[[apps]]
+name = "Numbers"
+bundle_id = "com.apple.iWork.Numbers"
+aliases = ["numbers"]
+
+[[apps]]
+name = "Keynote"
+bundle_id = "com.apple.iWork.Keynote"
+aliases = ["keynote"]

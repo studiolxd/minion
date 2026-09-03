@@ -430,6 +430,7 @@ impl Config {
                         .collect::<Vec<&'static str>>()
                         .into_boxed_slice(),
                 ),
+                category: crate::vocabulary::USER_CATEGORY,
             })
             .collect()
     }
@@ -512,6 +513,7 @@ impl Config {
                     phrases: Box::leak(phrases.into_boxed_slice()),
                     name: Box::leak(entry.name.clone().into_boxed_str()),
                     action: crate::commands::Action::Key(code, mods),
+                    category: crate::vocabulary::USER_CATEGORY,
                 })
             })
             .collect()

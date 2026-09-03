@@ -1,0 +1,56 @@
+# Terminals and editors, and the commands that only work in a terminal.
+# The schema is documented at the top of macos.toml.
+
+category = "Desarrollo"
+
+[[apps]]
+name = "Terminal"
+bundle_id = "com.apple.Terminal"
+aliases = ["terminal", "la terminal", "consola"]
+
+[[apps]]
+name = "VS Code"
+bundle_id = "com.microsoft.VSCode"
+aliases = ["visual studio", "vs code", "vsc"]
+
+# ── Inside a terminal ───────────────────────────────────────────────────
+#
+# The first three share their wording with a global command. The
+# contextual one wins where it applies: "sube" scrolls in a browser and
+# recalls the previous command here.
+
+[[commands]]
+name = "interrumpir"
+phrases = ["cancela esto", "cancela"]
+keys = "ctrl-c"
+bundles = ["com.apple.Terminal"]
+
+[[commands]]
+name = "orden anterior"
+phrases = ["sube", "sube del todo"]
+keys = "up"
+bundles = ["com.apple.Terminal"]
+
+[[commands]]
+name = "orden siguiente"
+phrases = ["baja", "baja del todo"]
+keys = "down"
+bundles = ["com.apple.Terminal"]
+
+[[commands]]
+name = "limpiar terminal"
+phrases = ["limpia la pantalla", "limpia"]
+keys = "ctrl-l"
+bundles = ["com.apple.Terminal"]
+
+[[commands]]
+name = "inicio de línea"
+phrases = ["principio de línea"]
+keys = "ctrl-a"
+bundles = ["com.apple.Terminal"]
+
+[[commands]]
+name = "fin de línea"
+phrases = ["final de línea"]
+keys = "ctrl-e"
+bundles = ["com.apple.Terminal"]

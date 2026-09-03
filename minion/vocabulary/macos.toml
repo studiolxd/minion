@@ -1,0 +1,342 @@
+# macOS itself: the applications Apple ships, and the commands that work
+# the same way everywhere — clipboard, windows, tabs, screenshots, sound.
+#
+# ─────────────────────────────────────────────────────────────────────────
+# THE SCHEMA (the same in every vocabulary file)
+# ─────────────────────────────────────────────────────────────────────────
+#
+# Files are read in this order, and a later entry with the same `name`
+# replaces the earlier one:
+#
+#   1. the files shipped inside Minion (this one among them)
+#   2. every *.toml in ~/Library/Application Support/Minion/vocabulary/
+#   3. [[apps]] and [[commands]] in config.toml
+#
+# Unknown keys are refused: a misspelled key invalidates the whole file,
+# which is then reported in the log and skipped. Restart Minion after
+# editing; vocabulary is read once, at startup.
+#
+#   category = "macOS"
+#
+#     What to call this group in «Qué puedo decirle». Optional; the file
+#     name is used when it is missing.
+#
+#   [[apps]]
+#   name = "Finder"                  # shown in the log and the catalogue
+#   bundle_id = "com.apple.finder"   # defaults read /Applications/X.app/Contents/Info CFBundleIdentifier
+#   aliases = ["finder", "archivos"] # ways of saying the name
+#
+#     Put down what the recogniser ACTUALLY writes, not just the correct
+#     spelling — saying "Chrome" in Spanish comes out as "cromo". Check the
+#     log, or run `minion learn`. Never guess: an invented alias is one
+#     more way for the wrong thing to fire.
+#
+#   [[commands]]
+#   name = "copiar"                  # stable identifier, shown in the log
+#   phrases = ["copia esto"]         # accents and case do not matter
+#   keys = "cmd-c"                   # what to press
+#
+#     Exactly one of these four says what the command does:
+#
+#       keys   = "cmd-shift-b"       a keystroke, written as on a menu
+#       action = "volume:up"         one of Minion's own actions (below)
+#       text   = "un saludo"         type this into whatever has focus
+#       url    = "https://…"         open this page
+#
+#     Add `bundles` to make it contextual — it then only exists while one
+#     of those applications is in front, and it beats a global command
+#     with the same phrase:
+#
+#   [[commands]]
+#   name = "a la papelera"
+#   phrases = ["borra esto"]
+#   keys = "cmd-delete"
+#   bundles = ["com.apple.finder"]
+#
+#     The actions `action` can name: volume:up, volume:down, volume:mute,
+#     volume:unmute, music:play, music:pause, music:next, music:previous,
+#     minion:sleep. There is deliberately no way to run a script from here:
+#     a vocabulary file is data someone may have downloaded, not code.
+#
+#   [[sites]]
+#   name = "gmail"                   # said on its own, after an opening verb
+#   url = "https://mail.google.com"
+#
+# A phrase claimed by two different commands is reported in the log at
+# startup, and the later one keeps it.
+
+category = "macOS"
+
+# ── Applications ────────────────────────────────────────────────────────
+
+[[apps]]
+name = "Finder"
+bundle_id = "com.apple.finder"
+aliases = ["finder", "el buscador", "archivos"]
+
+[[apps]]
+name = "Mail"
+bundle_id = "com.apple.mail"
+aliases = ["mail", "correo", "el correo"]
+
+[[apps]]
+name = "Notas"
+bundle_id = "com.apple.Notes"
+aliases = ["notas", "las notas"]
+
+[[apps]]
+name = "Calendario"
+bundle_id = "com.apple.iCal"
+aliases = ["calendario", "el calendario", "agenda"]
+
+[[apps]]
+name = "Ajustes"
+bundle_id = "com.apple.systempreferences"
+aliases = ["ajustes", "preferencias", "configuración"]
+
+[[apps]]
+name = "Vista Previa"
+bundle_id = "com.apple.Preview"
+aliases = ["vista previa", "previsualización"]
+
+[[apps]]
+name = "Monitor de Actividad"
+bundle_id = "com.apple.ActivityMonitor"
+aliases = ["monitor de actividad", "actividad"]
+
+# ── Editing ─────────────────────────────────────────────────────────────
+
+[[commands]]
+name = "copiar"
+phrases = ["copia esto"]
+keys = "cmd-c"
+
+[[commands]]
+name = "pegar"
+phrases = ["pega esto"]
+keys = "cmd-v"
+
+[[commands]]
+name = "cortar"
+phrases = ["corta esto"]
+keys = "cmd-x"
+
+[[commands]]
+name = "guardar"
+phrases = ["guarda esto"]
+keys = "cmd-s"
+
+[[commands]]
+name = "deshacer"
+phrases = ["deshaz el cambio"]
+keys = "cmd-z"
+
+[[commands]]
+name = "rehacer"
+phrases = ["rehaz el cambio"]
+keys = "cmd-shift-z"
+
+[[commands]]
+name = "seleccionar todo"
+phrases = ["selecciona todo"]
+keys = "cmd-a"
+
+[[commands]]
+name = "borrar"
+phrases = ["borra esto"]
+keys = "delete"
+
+[[commands]]
+name = "borrar palabra"
+phrases = ["borra la palabra"]
+keys = "alt-delete"
+
+# From the log: "borra la frase hasta el inicio".
+[[commands]]
+name = "borrar hasta el inicio"
+phrases = ["borra hasta el inicio", "borra la frase"]
+keys = "cmd-delete"
+
+[[commands]]
+name = "cancelar"
+phrases = ["cancela esto", "cancela"]
+keys = "escape"
+
+[[commands]]
+name = "buscar"
+phrases = ["busca en la página", "busca aquí"]
+keys = "cmd-f"
+
+# ── Tabs ────────────────────────────────────────────────────────────────
+
+[[commands]]
+name = "pestaña nueva"
+phrases = ["abre una pestaña nueva"]
+keys = "cmd-t"
+
+[[commands]]
+name = "cerrar pestaña"
+phrases = ["cierra la pestaña"]
+keys = "cmd-w"
+
+[[commands]]
+name = "reabrir pestaña"
+phrases = ["recupera la pestaña"]
+keys = "cmd-shift-t"
+
+[[commands]]
+name = "pestaña siguiente"
+phrases = ["pasa a la siguiente pestaña", "siguiente pestaña"]
+keys = "ctrl-tab"
+
+[[commands]]
+name = "pestaña anterior"
+phrases = ["vuelve a la pestaña anterior", "pestaña anterior"]
+keys = "ctrl-shift-tab"
+
+# ⌘9 is the last tab, not the ninth.
+[[commands]]
+name = "última pestaña"
+phrases = ["última pestaña", "pestaña final"]
+keys = "cmd-9"
+
+# ── Windows ─────────────────────────────────────────────────────────────
+
+[[commands]]
+name = "cerrar ventana"
+phrases = ["cierra la ventana"]
+keys = "cmd-w"
+
+[[commands]]
+name = "ventana nueva"
+phrases = ["abre una ventana nueva"]
+keys = "cmd-n"
+
+[[commands]]
+name = "minimizar"
+phrases = ["minimiza la ventana", "minimiza"]
+keys = "cmd-m"
+
+[[commands]]
+name = "pantalla completa"
+phrases = ["pon la pantalla completa", "pantalla completa"]
+keys = "ctrl-cmd-f"
+
+[[commands]]
+name = "ocultar app"
+phrases = ["esconde la aplicación"]
+keys = "cmd-h"
+
+# ── Navigation ──────────────────────────────────────────────────────────
+
+[[commands]]
+name = "atrás"
+phrases = ["vuelve atrás", "página anterior", "página atrás", "retrocede la página"]
+keys = "cmd-left"
+
+[[commands]]
+name = "adelante"
+phrases = ["ve hacia adelante", "ve adelante", "página siguiente", "avanza la página"]
+keys = "cmd-right"
+
+[[commands]]
+name = "recargar"
+phrases = ["recarga la página", "recarga"]
+keys = "cmd-r"
+
+[[commands]]
+name = "ir arriba"
+phrases = ["sube del todo"]
+keys = "cmd-up"
+
+[[commands]]
+name = "ir abajo"
+phrases = ["baja del todo"]
+keys = "cmd-down"
+
+[[commands]]
+name = "barra de direcciones"
+phrases = ["ve a la barra de direcciones", "barra de direcciones"]
+keys = "cmd-l"
+
+# ── System ──────────────────────────────────────────────────────────────
+
+[[commands]]
+name = "captura completa"
+phrases = ["captura la pantalla", "haz una captura"]
+keys = "cmd-shift-3"
+
+[[commands]]
+name = "captura de zona"
+phrases = ["recorta la pantalla"]
+keys = "cmd-shift-4"
+
+[[commands]]
+name = "Spotlight"
+phrases = ["abre spotlight"]
+keys = "cmd-space"
+
+[[commands]]
+name = "bloquear pantalla"
+phrases = ["bloquea la pantalla"]
+keys = "ctrl-cmd-q"
+
+# ── Sound ───────────────────────────────────────────────────────────────
+
+[[commands]]
+name = "subir volumen"
+phrases = ["sube el volumen"]
+action = "volume:up"
+
+[[commands]]
+name = "bajar volumen"
+phrases = ["baja el volumen"]
+action = "volume:down"
+
+[[commands]]
+name = "silenciar"
+phrases = ["quita el sonido"]
+action = "volume:mute"
+
+[[commands]]
+name = "quitar silencio"
+phrases = ["devuelve el sonido"]
+action = "volume:unmute"
+
+# ── Minion itself ───────────────────────────────────────────────────────
+
+[[commands]]
+name = "dormir"
+phrases = ["deja de escuchar", "duérmete", "duerme", "silénciate",
+           "apágate", "descansa", "cállate"]
+action = "minion:sleep"
+
+# ── Inside the Finder ───────────────────────────────────────────────────
+#
+# The first two share their wording with a global command. The contextual
+# one wins where it applies, which is what lets a phrase mean the right
+# thing in each place instead of needing a name of its own.
+
+[[commands]]
+name = "a la papelera"
+phrases = ["borra esto"]
+keys = "cmd-delete"
+bundles = ["com.apple.finder"]
+
+[[commands]]
+name = "carpeta superior"
+phrases = ["sube del todo", "sube"]
+keys = "cmd-up"
+bundles = ["com.apple.finder"]
+
+[[commands]]
+name = "carpeta nueva"
+phrases = ["crea una carpeta", "nueva carpeta"]
+keys = "cmd-shift-n"
+bundles = ["com.apple.finder"]
+
+[[commands]]
+name = "obtener información"
+phrases = ["muestra la información", "información"]
+keys = "cmd-i"
+bundles = ["com.apple.finder"]

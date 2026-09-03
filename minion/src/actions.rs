@@ -150,11 +150,6 @@ pub struct Mods {
 impl Mods {
     pub const NONE: Mods = Mods::new(false, false, false, false);
     pub const CMD: Mods = Mods::new(true, false, false, false);
-    pub const CMD_SHIFT: Mods = Mods::new(true, true, false, false);
-    pub const CTRL: Mods = Mods::new(false, false, false, true);
-    pub const CTRL_CMD: Mods = Mods::new(true, false, false, true);
-    pub const CTRL_SHIFT: Mods = Mods::new(false, true, false, true);
-    pub const OPTION: Mods = Mods::new(false, false, true, false);
 
     const fn new(command: bool, shift: bool, option: bool, control: bool) -> Self {
         Self { command, shift, option, control }
@@ -526,7 +521,10 @@ mod tests {
     #[test]
     fn reads_shortcuts_as_written() {
         assert_eq!(parse_shortcut("cmd-s"), Some((key::S, Mods::CMD)));
-        assert_eq!(parse_shortcut("cmd-shift-b"), Some((key::B, Mods::CMD_SHIFT)));
+        assert_eq!(parse_shortcut("cmd-shift-b"), {
+            let mods = Mods { command: true, shift: true, ..Mods::NONE };
+            Some((key::B, mods))
+        });
         assert_eq!(parse_shortcut("command+option+left"), {
             let mods = Mods { command: true, option: true, ..Mods::NONE };
             Some((key::LEFT, mods))

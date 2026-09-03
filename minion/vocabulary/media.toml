@@ -1,0 +1,39 @@
+# Music players, and the transport controls.
+# The schema is documented at the top of macos.toml.
+#
+# The four commands below name one of Minion's own actions rather than
+# carrying a script: the AppleScript that talks to Spotify stays in Rust,
+# where it can be read and reviewed once, instead of travelling inside a
+# file someone may have downloaded.
+
+category = "Música"
+
+[[apps]]
+name = "Spotify"
+bundle_id = "com.spotify.client"
+aliases = ["spotify", "espotifai", "música", "la música"]
+
+[[apps]]
+name = "Music"
+bundle_id = "com.apple.Music"
+aliases = ["apple music"]
+
+[[commands]]
+name = "reproducir"
+phrases = ["pon la música"]
+action = "music:play"
+
+[[commands]]
+name = "pausar"
+phrases = ["para la música"]
+action = "music:pause"
+
+[[commands]]
+name = "canción siguiente"
+phrases = ["pon la siguiente canción", "siguiente canción"]
+action = "music:next"
+
+[[commands]]
+name = "canción anterior"
+phrases = ["pon la canción anterior", "canción anterior"]
+action = "music:previous"

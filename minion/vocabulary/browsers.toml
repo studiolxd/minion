@@ -1,0 +1,53 @@
+# Web browsers, and the commands that only mean something inside one.
+# The schema is documented at the top of macos.toml.
+
+category = "Navegadores"
+
+[[apps]]
+name = "Chrome"
+bundle_id = "com.google.Chrome"
+# "grum", "crum", "crumb": what the recogniser makes of a Spanish mouth
+# saying an English name. Listed as heard, since no tolerance short of
+# reckless would reach them from the real word.
+aliases = ["chrome", "crome", "cromo", "grum", "crum", "crumb",
+           "el navegador", "navegador"]
+
+[[apps]]
+name = "Safari"
+bundle_id = "com.apple.Safari"
+# "shafari", "safaris", "safaria", "so fuddy": what the recogniser writes
+# when the word is said quickly. Cheaper and safer than loosening the
+# matcher.
+aliases = ["safari", "shafari", "safaris", "safaria", "so fuddy", "el safari"]
+
+# No misheard spellings here yet: nothing has been said to Minion in
+# Spanish for it to write down. Add what the log shows rather than
+# guessing — an invented alias is one more way for the wrong thing to fire.
+[[apps]]
+name = "Firefox"
+bundle_id = "org.mozilla.firefox"
+aliases = ["firefox"]
+
+# ── Inside a browser ────────────────────────────────────────────────────
+#
+# Chrome and Safari only. Firefox puts these three somewhere else, and a
+# shortcut written from memory presses the wrong keys in silence — add
+# them once someone has checked them against the real menus.
+
+[[commands]]
+name = "favoritos"
+phrases = ["abre los favoritos", "marcadores"]
+keys = "cmd-shift-b"
+bundles = ["com.google.Chrome", "com.apple.Safari"]
+
+[[commands]]
+name = "historial"
+phrases = ["abre el historial"]
+keys = "cmd-y"
+bundles = ["com.google.Chrome", "com.apple.Safari"]
+
+[[commands]]
+name = "ventana privada"
+phrases = ["ventana de incógnito", "modo incógnito"]
+keys = "cmd-shift-n"
+bundles = ["com.google.Chrome", "com.apple.Safari"]

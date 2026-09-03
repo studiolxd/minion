@@ -5,6 +5,13 @@
 //! word, followed by something recognisable. Anything else is ignored — with
 //! a microphone that is always on, ignoring is the default and acting is the
 //! exception.
+//!
+//! What can be said no longer lives here: applications, commands and sites
+//! are read from the TOML files in `minion/vocabulary/` by
+//! [`crate::vocabulary`], so a new application does not need a Rust
+//! toolchain. What stays here is everything that is a code path rather than
+//! a table — dictation, undo, repeat, questions, numbered commands, the
+//! wake word and the verb lists — and the deciding itself.
 
 use std::sync::OnceLock;
 
@@ -12,6 +19,7 @@ use crate::actions::{self, key, Mods};
 use crate::config::Config;
 use crate::spanish;
 use crate::text::{keywords, normalise, similarity};
+use crate::vocabulary::Vocabulary;
 
 /// Words that mark a sentence as a command. Only counted at the start.
 /// Includes what the recogniser actually produces for the name, not just
@@ -27,31 +35,40 @@ use crate::text::{keywords, normalise, similarity};
 pub const DEFAULT_WAKE_WORDS: &[&str] =
     &["minion", "minions", "minon", "minial", "mini", "minium"];
 
+/// Everything that can be said, merged from the vocabulary files, the
+/// packs and `config.toml`. Set once at startup.
+static VOCABULARY: OnceLock<Vocabulary> = OnceLock::new();
+
 /// Set once at startup from the configuration file. Absent means defaults.
-static USER_APPS: OnceLock<Vec<App>> = OnceLock::new();
 static USER_ALIASES: OnceLock<Vec<(&'static str, &'static str)>> = OnceLock::new();
-static USER_COMMANDS: OnceLock<Vec<Command>> = OnceLock::new();
 static USER_WAKE_WORDS: OnceLock<Vec<&'static str>> = OnceLock::new();
 static USER_THRESHOLD: OnceLock<f32> = OnceLock::new();
 
+/// The vocabulary in force.
+///
+/// Falls back to the files built into the binary when [`configure`] has not
+/// run, which is the case in tests and in anything that decides before the
+/// configuration has been read. Minion must work with nothing else on disk,
+/// so that fallback is the ordinary case rather than a degraded one.
+pub fn vocabulary() -> &'static Vocabulary {
+    VOCABULARY.get_or_init(|| {
+        let mut built_in = Vocabulary::built_in();
+        built_in.report_conflicts();
+        built_in
+    })
+}
+
 /// Applies the user configuration. Call once, before anything is decided.
 pub fn configure(config: &Config) {
-    let extra = config.extra_apps();
-    if !extra.is_empty() {
-        let _ = USER_APPS.set(extra);
-    }
-    let own = config.extra_commands();
-    if !own.is_empty() {
-        let _ = USER_COMMANDS.set(own);
-    }
+    let _ = VOCABULARY.set(Vocabulary::load(config));
+
     let aliases = config.extra_aliases();
     if !aliases.is_empty() {
         // An alias whose command does not exist can never fire. Said now,
         // once, rather than leaving the user to wonder in front of a
         // microphone that answers nothing.
-        let own: &[Command] = USER_COMMANDS.get().map_or(&[], Vec::as_slice);
         for (name, phrase) in &aliases {
-            if resolve_target(name, own) == Target::Unknown {
+            if resolve_target(vocabulary(), name) == Target::Unknown {
                 crate::journal::write(&format!(
                     "Ignoring alias «{phrase}»: no command is called «{name}»"
                 ));
@@ -70,12 +87,10 @@ pub fn configure(config: &Config) {
 /// Where the command an alias points at lives, if it exists at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Target {
-    /// One of the built-in commands.
+    /// A command that works anywhere.
     Global,
     /// One that only exists inside particular applications.
     Contextual,
-    /// One the user declared in `[[commands]]`.
-    User,
     /// Nothing of that name: the alias can never fire.
     Unknown,
 }
@@ -86,24 +101,19 @@ pub enum Target {
 /// copied into the configuration by hand, so a misspelling ("atras" for
 /// "atrás") produces an alias that silently never fires. Checked at
 /// startup instead, where it can be said out loud.
-pub fn resolve_target(name: &str, user_commands: &[Command]) -> Target {
-    if COMMANDS.iter().any(|c| c.name == name) {
+pub fn resolve_target(vocabulary: &Vocabulary, name: &str) -> Target {
+    if vocabulary.commands.iter().any(|c| c.name == name) {
         Target::Global
-    } else if user_commands.iter().any(|c| c.name == name) {
-        Target::User
-    } else if CONTEXTUAL_COMMANDS.iter().any(|c| c.name == name) {
+    } else if vocabulary.contextual.iter().any(|c| c.name == name) {
         Target::Contextual
     } else {
         Target::Unknown
     }
 }
 
-/// The command with this name, built in or the user's own.
+/// The command with this name.
 fn named_command(name: &str) -> Option<&'static Command> {
-    COMMANDS
-        .iter()
-        .chain(USER_COMMANDS.get().into_iter().flatten())
-        .find(|c| c.name == name)
+    vocabulary().commands.iter().find(|c| c.name == name)
 }
 
 /// Wake words in force: the user's if configured, otherwise the defaults.
@@ -116,9 +126,9 @@ fn threshold() -> f32 {
     *USER_THRESHOLD.get().unwrap_or(&DEFAULT_THRESHOLD)
 }
 
-/// Every application, built in and user-added.
+/// Every application, from every layer of the vocabulary.
 fn all_apps() -> impl Iterator<Item = &'static App> {
-    APPS.iter().chain(USER_APPS.get().into_iter().flatten())
+    vocabulary().apps.iter()
 }
 
 /// Minimum similarity for a phrase to count as a command.
@@ -157,28 +167,22 @@ const DICTATION_VERBS: &[&str] = &["escribir", "anotar", "apuntar", "dictar"];
 /// it out loud gives "google punto com", handled the same way.
 const TLDS: &[&str] = &["com", "es", "org", "net", "io", "dev", "app", "co", "ai"];
 
-/// Sites common enough to name without a domain.
-const SITES: &[(&str, &str)] = &[
-    ("google", "https://www.google.com"),
-    ("youtube", "https://www.youtube.com"),
-    ("gmail", "https://mail.google.com"),
-    ("github", "https://github.com"),
-    ("wikipedia", "https://es.wikipedia.org"),
-    ("drive", "https://drive.google.com"),
-    ("maps", "https://maps.google.com"),
-    ("mapas", "https://maps.google.com"),
-    ("calendar", "https://calendar.google.com"),
-    ("linkedin", "https://www.linkedin.com"),
-    ("amazon", "https://www.amazon.es"),
-    ("netflix", "https://www.netflix.com"),
-];
-
+/// What a command does once it is understood.
+///
+/// Everything a vocabulary file can ask for, and nothing more: the file
+/// names an action, the action itself is Rust. `Script` is reachable only
+/// through [`crate::vocabulary`]'s fixed list of named actions, never
+/// written out in a file.
 #[derive(Clone, Copy, Debug)]
 pub enum Action {
     Key(u16, Mods),
     Volume(i32),
     Mute(bool),
     Script(&'static str),
+    /// Type a fixed string into whatever has focus.
+    Type(&'static str),
+    /// Open a web address.
+    Open(&'static str),
     /// Stop acting on commands until resumed from the menu bar.
     Sleep,
 }
@@ -189,6 +193,8 @@ pub struct Command {
     /// Stable identifier, also shown in the log.
     pub name: &'static str,
     pub action: Action,
+    /// Which vocabulary file it came from, for the catalogue.
+    pub category: &'static str,
 }
 
 /// An application, with the ways people actually say its name.
@@ -198,218 +204,39 @@ pub struct App {
     /// Includes what the recogniser really produces, not just correct
     /// spellings: "cromo" is what comes out of saying Chrome in Spanish.
     pub aliases: &'static [&'static str],
+    pub category: &'static str,
 }
 
-pub const APPS: &[App] = &[
-    App { name: "Chrome", bundle_id: "com.google.Chrome",
-          // "grum", "crum", "crumb", "so fuddy": what the recogniser makes of
-          // a Spanish mouth saying two English names. Listed as heard, since
-          // no tolerance short of reckless would reach them from the real word.
-          aliases: &["chrome", "crome", "cromo", "grum", "crum", "crumb",
-                     "el navegador", "navegador"] },
-    // "shafari", "safaris", "safaria": what the recogniser writes when the
-    // word is said quickly. Cheaper and safer than loosening the matcher.
-    App { name: "Safari", bundle_id: "com.apple.Safari",
-          aliases: &["safari", "shafari", "safaris", "safaria", "so fuddy", "el safari"] },
-    App { name: "Terminal", bundle_id: "com.apple.Terminal",
-          aliases: &["terminal", "la terminal", "consola"] },
-    App { name: "Orca", bundle_id: "com.stablyai.orca",
-          aliases: &["orca", "orka", "el editor", "editor"] },
-    App { name: "Finder", bundle_id: "com.apple.finder",
-          aliases: &["finder", "el buscador", "archivos"] },
-    App { name: "Mail", bundle_id: "com.apple.mail",
-          aliases: &["mail", "correo", "el correo"] },
-    App { name: "Notas", bundle_id: "com.apple.Notes", aliases: &["notas", "las notas"] },
-    App { name: "Calendario", bundle_id: "com.apple.iCal",
-          aliases: &["calendario", "el calendario", "agenda"] },
-    App { name: "Spotify", bundle_id: "com.spotify.client",
-          aliases: &["spotify", "espotifai", "musica", "la musica"] },
-    App { name: "WhatsApp", bundle_id: "net.whatsapp.WhatsApp",
-          aliases: &["whatsapp", "guasap", "wasap"] },
-    App { name: "Telegram", bundle_id: "ru.keepcoder.Telegram",
-          aliases: &["telegram", "telegrama"] },
-    App { name: "Figma", bundle_id: "com.figma.Desktop", aliases: &["figma", "figna"] },
-    App { name: "Obsidian", bundle_id: "md.obsidian", aliases: &["obsidian", "obsidiana"] },
-    App { name: "Discord", bundle_id: "com.hnc.Discord", aliases: &["discord", "diskord"] },
-    App { name: "Teams", bundle_id: "com.microsoft.teams2", aliases: &["teams", "tims"] },
-    App { name: "VS Code", bundle_id: "com.microsoft.VSCode",
-          aliases: &["visual studio", "vs code", "vsc"] },
-    App { name: "Claude", bundle_id: "com.anthropic.claudefordesktop",
-          aliases: &["claude", "clod"] },
-    App { name: "ChatGPT", bundle_id: "com.openai.codex",
-          aliases: &["chat gpt", "chatgpt", "gepete"] },
-    App { name: "Ajustes", bundle_id: "com.apple.systempreferences",
-          aliases: &["ajustes", "preferencias", "configuracion"] },
-    App { name: "Vista Previa", bundle_id: "com.apple.Preview",
-          aliases: &["vista previa", "previsualizacion"] },
-    App { name: "Monitor de Actividad", bundle_id: "com.apple.ActivityMonitor",
-          aliases: &["monitor de actividad", "actividad"] },
-];
+/// A page common enough to name without its domain.
+pub struct Site {
+    /// Normalised, since it is matched against a word of the sentence.
+    pub name: &'static str,
+    pub url: &'static str,
+    pub category: &'static str,
+}
 
-/// Commands that only exist inside particular applications.
+/// A command that only exists inside particular applications.
 ///
-/// Kept apart from the global table rather than adding a context field to
+/// Kept apart from the global list rather than adding a context field to
 /// every entry: most commands are global, and this way the exceptions are
 /// visible in one place. A contextual command beats a global one with the
-/// same phrase, which is what lets an app reinterpret a general word.
+/// same phrase, which is what lets an app reinterpret a general word. In a
+/// vocabulary file it is a `[[commands]]` entry with a `bundles` key.
 pub struct ContextualCommand {
     /// Bundle identifiers this applies in.
     pub bundles: &'static [&'static str],
     pub phrases: &'static [&'static str],
     pub name: &'static str,
     pub action: Action,
+    pub category: &'static str,
 }
 
-const BROWSERS: &[&str] = &["com.google.Chrome", "com.apple.Safari"];
-const TERMINALS: &[&str] = &["com.apple.Terminal"];
-const FINDERS: &[&str] = &["com.apple.finder"];
-
-pub const CONTEXTUAL_COMMANDS: &[ContextualCommand] = &[
-    // --- The same phrase, read differently ---
-    //
-    // These share their wording with an entry in the global table. The
-    // contextual one wins where it applies, which is what lets a phrase
-    // mean the right thing in each place instead of needing a new name.
-    ContextualCommand { bundles: FINDERS, phrases: &["borra esto"],
-                        name: "a la papelera", action: Action::Key(key::DELETE, Mods::CMD) },
-    ContextualCommand { bundles: FINDERS, phrases: &["sube del todo", "sube"],
-                        name: "carpeta superior", action: Action::Key(key::UP, Mods::CMD) },
-    ContextualCommand { bundles: TERMINALS, phrases: &["cancela esto", "cancela"],
-                        name: "interrumpir", action: Action::Key(key::C, Mods::CTRL) },
-    ContextualCommand { bundles: TERMINALS, phrases: &["sube", "sube del todo"],
-                        name: "orden anterior", action: Action::Key(key::UP, Mods::NONE) },
-    ContextualCommand { bundles: TERMINALS, phrases: &["baja", "baja del todo"],
-                        name: "orden siguiente", action: Action::Key(key::DOWN, Mods::NONE) },
-
-    // --- Terminal ---
-    ContextualCommand { bundles: TERMINALS, phrases: &["limpia la pantalla", "limpia"],
-                        name: "limpiar terminal", action: Action::Key(key::L, Mods::CTRL) },
-
-    ContextualCommand { bundles: TERMINALS, phrases: &["principio de linea"],
-                        name: "inicio de línea", action: Action::Key(key::A, Mods::CTRL) },
-    ContextualCommand { bundles: TERMINALS, phrases: &["final de linea"],
-                        name: "fin de línea", action: Action::Key(key::E, Mods::CTRL) },
-
-    // --- Navegadores ---
-    ContextualCommand { bundles: BROWSERS, phrases: &["abre los favoritos", "marcadores"],
-                        name: "favoritos", action: Action::Key(key::B, Mods::CMD_SHIFT) },
-    ContextualCommand { bundles: BROWSERS, phrases: &["abre el historial"],
-                        name: "historial", action: Action::Key(key::Y, Mods::CMD) },
-    ContextualCommand { bundles: BROWSERS, phrases: &["ventana de incognito", "modo incognito"],
-                        name: "ventana privada", action: Action::Key(key::N, Mods::CMD_SHIFT) },
-
-    // --- Finder ---
-    ContextualCommand { bundles: FINDERS, phrases: &["crea una carpeta", "nueva carpeta"],
-                        name: "carpeta nueva", action: Action::Key(key::N, Mods::CMD_SHIFT) },
-    ContextualCommand { bundles: FINDERS, phrases: &["muestra la informacion", "informacion"],
-                        name: "obtener información", action: Action::Key(key::I, Mods::CMD) },
-];
-
-pub const COMMANDS: &[Command] = &[
-    // --- Editing ---
-    Command { phrases: &["copia esto"], name: "copiar",
-              action: Action::Key(key::C, Mods::CMD) },
-    Command { phrases: &["pega esto"], name: "pegar",
-              action: Action::Key(key::V, Mods::CMD) },
-    Command { phrases: &["corta esto"], name: "cortar",
-              action: Action::Key(key::X, Mods::CMD) },
-    Command { phrases: &["guarda esto"], name: "guardar",
-              action: Action::Key(key::S, Mods::CMD) },
-    Command { phrases: &["deshaz el cambio"], name: "deshacer",
-              action: Action::Key(key::Z, Mods::CMD) },
-    Command { phrases: &["rehaz el cambio"], name: "rehacer",
-              action: Action::Key(key::Z, Mods::CMD_SHIFT) },
-    Command { phrases: &["selecciona todo"], name: "seleccionar todo",
-              action: Action::Key(key::A, Mods::CMD) },
-    Command { phrases: &["borra esto"], name: "borrar",
-              action: Action::Key(key::DELETE, Mods::NONE) },
-    Command { phrases: &["borra la palabra"], name: "borrar palabra",
-              action: Action::Key(key::DELETE, Mods::OPTION) },
-    // From the log: "borra la frase hasta el inicio".
-    Command { phrases: &["borra hasta el inicio", "borra la frase"], name: "borrar hasta el inicio",
-              action: Action::Key(key::DELETE, Mods::CMD) },
-    Command { phrases: &["cancela esto", "cancela"], name: "cancelar",
-              action: Action::Key(key::ESCAPE, Mods::NONE) },
-    Command { phrases: &["busca en la pagina", "busca aqui"], name: "buscar",
-              action: Action::Key(key::F, Mods::CMD) },
-
-    // --- Tabs ---
-    Command { phrases: &["abre una pestana nueva"], name: "pestaña nueva",
-              action: Action::Key(key::T, Mods::CMD) },
-    Command { phrases: &["cierra la pestana"], name: "cerrar pestaña",
-              action: Action::Key(key::W, Mods::CMD) },
-    Command { phrases: &["recupera la pestana"], name: "reabrir pestaña",
-              action: Action::Key(key::T, Mods::CMD_SHIFT) },
-    Command { phrases: &["pasa a la siguiente pestana", "siguiente pestana"], name: "pestaña siguiente",
-              action: Action::Key(key::TAB, Mods::CTRL) },
-    Command { phrases: &["vuelve a la pestana anterior", "pestana anterior"], name: "pestaña anterior",
-              action: Action::Key(key::TAB, Mods::CTRL_SHIFT) },
-    Command { phrases: &["ultima pestana", "pestana final"], name: "última pestaña",
-              action: Action::Key(key::DIGIT_9, Mods::CMD) },
-
-    // --- Windows ---
-    Command { phrases: &["cierra la ventana"], name: "cerrar ventana",
-              action: Action::Key(key::W, Mods::CMD) },
-    Command { phrases: &["abre una ventana nueva"], name: "ventana nueva",
-              action: Action::Key(key::N, Mods::CMD) },
-    Command { phrases: &["minimiza la ventana", "minimiza"], name: "minimizar",
-              action: Action::Key(key::M, Mods::CMD) },
-    Command { phrases: &["pon la pantalla completa", "pantalla completa"], name: "pantalla completa",
-              action: Action::Key(key::F, Mods::CTRL_CMD) },
-    Command { phrases: &["esconde la aplicacion"], name: "ocultar app",
-              action: Action::Key(key::H, Mods::CMD) },
-
-    // --- Navigation ---
-    Command { phrases: &["vuelve atras", "pagina anterior", "pagina atras",
-                         "retrocede la pagina"], name: "atrás",
-              action: Action::Key(key::LEFT, Mods::CMD) },
-    Command { phrases: &["ve hacia adelante", "ve adelante", "pagina siguiente",
-                         "avanza la pagina"], name: "adelante",
-              action: Action::Key(key::RIGHT, Mods::CMD) },
-    Command { phrases: &["recarga la pagina", "recarga"], name: "recargar",
-              action: Action::Key(key::R, Mods::CMD) },
-    Command { phrases: &["sube del todo"], name: "ir arriba",
-              action: Action::Key(key::UP, Mods::CMD) },
-    Command { phrases: &["baja del todo"], name: "ir abajo",
-              action: Action::Key(key::DOWN, Mods::CMD) },
-    Command { phrases: &["ve a la barra de direcciones", "barra de direcciones"], name: "barra de direcciones",
-              action: Action::Key(key::L, Mods::CMD) },
-
-    // --- System ---
-    Command { phrases: &["captura la pantalla", "haz una captura"], name: "captura completa",
-              action: Action::Key(key::DIGIT_3, Mods::CMD_SHIFT) },
-    Command { phrases: &["recorta la pantalla"], name: "captura de zona",
-              action: Action::Key(key::DIGIT_4, Mods::CMD_SHIFT) },
-    Command { phrases: &["abre spotlight"], name: "Spotlight",
-              action: Action::Key(key::SPACE, Mods::CMD) },
-    Command { phrases: &["bloquea la pantalla"], name: "bloquear pantalla",
-              action: Action::Key(key::Q, Mods::CTRL_CMD) },
-
-    // --- Sound ---
-    Command { phrases: &["sube el volumen"], name: "subir volumen",
-              action: Action::Volume(10) },
-    Command { phrases: &["baja el volumen"], name: "bajar volumen",
-              action: Action::Volume(-10) },
-    Command { phrases: &["quita el sonido"], name: "silenciar",
-              action: Action::Mute(true) },
-    Command { phrases: &["devuelve el sonido"], name: "quitar silencio",
-              action: Action::Mute(false) },
-
-    // --- Media ---
-    Command { phrases: &["pon la musica"], name: "reproducir",
-              action: Action::Script("tell application \"Spotify\" to play") },
-    Command { phrases: &["para la musica"], name: "pausar",
-              action: Action::Script("tell application \"Spotify\" to pause") },
-    Command { phrases: &["pon la siguiente cancion", "siguiente cancion"], name: "canción siguiente",
-              action: Action::Script("tell application \"Spotify\" to next track") },
-    Command { phrases: &["pon la cancion anterior", "cancion anterior"], name: "canción anterior",
-              action: Action::Script("tell application \"Spotify\" to previous track") },
-
-    // --- Minion itself ---
-    Command { phrases: &["deja de escuchar", "duermete", "duerme", "silenciate",
-                         "apagate", "descansa", "callate"], name: "dormir",
-              action: Action::Sleep },
-];
+/// Browsers, for deciding where a link should open.
+///
+/// Stays in Rust rather than moving into `browsers.toml`: it is not a
+/// phrase anybody says, it is the rule that a link opens in the browser you
+/// are already working in.
+const BROWSERS: &[&str] = &["com.google.Chrome", "com.apple.Safari", "org.mozilla.firefox"];
 
 /// What was decided, before anything has been done about it.
 ///
@@ -722,7 +549,7 @@ fn browser_in_front(context: Option<&str>) -> Option<&'static str> {
 /// Finds a web address in the sentence.
 ///
 /// Two shapes: a spelled-out domain ("google com", "studiolxd punto es") or
-/// one of the sites in [`SITES`] named on its own.
+/// one of the sites in the vocabulary named on its own.
 /// A web address found in the sentence, and how it was written.
 enum Website {
     /// A spelled-out domain: unmistakable, so no verb is needed.
@@ -761,8 +588,8 @@ fn find_website(transcript: &str, words: &[String]) -> Option<Website> {
     // A site named without its domain.
     words
         .iter()
-        .find_map(|w| SITES.iter().find(|(name, _)| name == w))
-        .map(|(_, url)| Website::Named((*url).to_string()))
+        .find_map(|w| vocabulary().sites.iter().find(|site| site.name == w))
+        .map(|site| Website::Named(site.url.to_string()))
 }
 
 /// Whether the words of `alias` appear, in order, as whole words of the
@@ -857,7 +684,7 @@ fn find_app(rest: &str) -> Option<(&'static App, f32)> {
 fn names_a_site(words: &[String]) -> bool {
     words
         .iter()
-        .any(|word| SITES.iter().any(|(name, _)| name == word))
+        .any(|word| vocabulary().sites.iter().any(|site| site.name == word))
 }
 
 /// Works out what a transcription means with no application context.
@@ -904,7 +731,7 @@ pub fn decide_in(transcript: &str, context: Option<&str>) -> (Decision, f32) {
     // the most specific thing that can match.
     if let Some(bundle) = context {
         let mut best_here: Option<(&ContextualCommand, f32)> = None;
-        for command in CONTEXTUAL_COMMANDS {
+        for command in &vocabulary().contextual {
             if !command.bundles.contains(&bundle) {
                 continue;
             }
@@ -923,7 +750,7 @@ pub fn decide_in(transcript: &str, context: Option<&str>) -> (Decision, f32) {
     // Table commands next: they are more specific than "open something".
     // The user's own are searched alongside the built-in ones.
     let mut best: Option<(&Command, f32)> = None;
-    for command in COMMANDS.iter().chain(USER_COMMANDS.get().into_iter().flatten()) {
+    for command in &vocabulary().commands {
         for phrase in command.phrases {
             let score = similarity(rest, phrase);
             if score >= threshold() && best.is_none_or(|(_, b)| score > b) {
@@ -959,7 +786,8 @@ pub fn decide_in(transcript: &str, context: Option<&str>) -> (Decision, f32) {
         } else if let Some(bundle) = context {
             // A contextual command only exists where it applies, so this
             // is the one place it can be reached by name.
-            if CONTEXTUAL_COMMANDS
+            if vocabulary()
+                .contextual
                 .iter()
                 .any(|c| c.name == *name && c.bundles.contains(&bundle))
             {
@@ -1072,7 +900,8 @@ pub fn perform(decision: &Decision) -> Option<Done> {
         Decision::Browse { url, in_browser } => Some(Done {
             description: match in_browser {
                 Some(bundle_id) => {
-                    let name = APPS
+                    let name = vocabulary()
+                        .apps
                         .iter()
                         .find(|a| a.bundle_id == *bundle_id)
                         .map_or(*bundle_id, |a| a.name);
@@ -1100,17 +929,14 @@ pub fn perform(decision: &Decision) -> Option<Done> {
             outcome: actions::type_text(text),
         }),
         Decision::RunHere(name) => {
-            let command = CONTEXTUAL_COMMANDS.iter().find(|c| c.name == *name)?;
+            let command = vocabulary().contextual.iter().find(|c| c.name == *name)?;
             Some(Done {
                 description: (*name).to_string(),
                 outcome: run_action(command.action),
             })
         }
         Decision::Run(name) => {
-            let command = COMMANDS
-                .iter()
-                .chain(USER_COMMANDS.get().into_iter().flatten())
-                .find(|c| c.name == *name)?;
+            let command = vocabulary().commands.iter().find(|c| c.name == *name)?;
             Some(Done {
                 description: (*name).to_string(),
                 outcome: run_action(command.action),
@@ -1126,6 +952,8 @@ fn run_action(action: Action) -> Result<(), String> {
         Action::Volume(delta) => actions::adjust_volume(delta),
         Action::Mute(muted) => actions::set_muted(muted),
         Action::Script(script) => actions::applescript(script),
+        Action::Type(text) => actions::type_text(text),
+        Action::Open(url) => actions::open_url(url, None),
         Action::Sleep => Ok(()),
     }
 }
@@ -1144,7 +972,7 @@ pub fn closest_command(phrase: &str) -> Option<(&'static str, f32)> {
     let normalised = normalise(phrase);
     let rest = strip_wake_word(&normalised).unwrap_or(&normalised);
     let mut best: Option<(&'static str, f32)> = None;
-    for command in COMMANDS {
+    for command in &vocabulary().commands {
         for candidate in command.phrases {
             let score = similarity(rest, candidate);
             if best.is_none_or(|(_, b)| score > b) {
@@ -1160,9 +988,26 @@ pub fn closest_command(phrase: &str) -> Option<(&'static str, f32)> {
 /// Generated from the tables rather than kept alongside them: a list of
 /// commands that has to be updated by hand is a list that goes stale, and
 /// the first thing anyone needs is to know what they can say.
+/// The categories present in a list of entries, in the order they first
+/// appear — which is the order the vocabulary files were loaded in.
+fn categories_of<'a, T: 'a>(
+    entries: impl Iterator<Item = &'a T>,
+    category: impl Fn(&T) -> &'static str,
+) -> Vec<&'static str> {
+    let mut seen: Vec<&'static str> = Vec::new();
+    for entry in entries {
+        let name = category(entry);
+        if !seen.contains(&name) {
+            seen.push(name);
+        }
+    }
+    seen
+}
+
 pub fn catalogue() -> String {
     use std::fmt::Write as _;
     let wake = wake_words().first().copied().unwrap_or("minion");
+    let vocabulary = vocabulary();
     let mut out = String::new();
 
     let _ = writeln!(
@@ -1175,43 +1020,67 @@ pub fn catalogue() -> String {
     let _ = writeln!(out, "── APLICACIONES ─────────────────────\n");
     let _ = writeln!(
         out,
-        "Para abrir: {}\nPara cerrar: {}\nO solo el nombre: «{wake}, Spotify»\n",
+        "Para abrir: {}\nPara cerrar: {}\nO solo el nombre: «{wake}, Spotify»",
         APP_VERBS.join(", "),
         QUIT_VERBS.join(", ")
     );
-    for app in all_apps() {
-        let _ = writeln!(out, "  {:<22} {}", app.name, app.aliases.join(" · "));
+    for category in categories_of(vocabulary.apps.iter(), |a| a.category) {
+        let _ = writeln!(out, "\n  {category}");
+        for app in vocabulary.apps.iter().filter(|a| a.category == category) {
+            let _ = writeln!(out, "    {:<20} {}", app.name, app.aliases.join(" · "));
+        }
     }
 
-    let _ = writeln!(out, "\n── ÓRDENES ──────────────────────────\n");
-    for command in COMMANDS.iter().chain(USER_COMMANDS.get().into_iter().flatten()) {
-        let _ = writeln!(
-            out,
-            "  {:<22} {}",
-            command.name,
-            command.phrases.join(" · ")
-        );
+    let _ = writeln!(out, "\n── ÓRDENES ──────────────────────────");
+    for category in categories_of(vocabulary.commands.iter(), |c| c.category) {
+        let _ = writeln!(out, "\n  {category}");
+        for command in vocabulary.commands.iter().filter(|c| c.category == category) {
+            let _ = writeln!(
+                out,
+                "    {:<20} {}",
+                command.name,
+                command.phrases.join(" · ")
+            );
+        }
     }
 
-    let _ = writeln!(out, "\n── SEGÚN DÓNDE ESTÉS ────────────────\n");
-    for command in CONTEXTUAL_COMMANDS {
-        let apps: Vec<&str> = command
-            .bundles
-            .iter()
-            .map(|bundle| {
-                APPS.iter()
-                    .find(|a| a.bundle_id == *bundle)
-                    .map_or(*bundle, |a| a.name)
-            })
-            .collect();
-        let _ = writeln!(
-            out,
-            "  {:<22} {}\n  {:<22} en {}",
-            command.name,
-            command.phrases.join(" · "),
-            "",
-            apps.join(", ")
-        );
+    let _ = writeln!(out, "\n── SEGÚN DÓNDE ESTÉS ────────────────");
+    for category in categories_of(vocabulary.contextual.iter(), |c| c.category) {
+        let _ = writeln!(out, "\n  {category}");
+        for command in vocabulary.contextual.iter().filter(|c| c.category == category) {
+            let apps: Vec<&str> = command
+                .bundles
+                .iter()
+                .map(|bundle| {
+                    vocabulary
+                        .apps
+                        .iter()
+                        .find(|a| a.bundle_id == *bundle)
+                        .map_or(*bundle, |a| a.name)
+                })
+                .collect();
+            let _ = writeln!(
+                out,
+                "    {:<20} {}\n    {:<20} en {}",
+                command.name,
+                command.phrases.join(" · "),
+                "",
+                apps.join(", ")
+            );
+        }
+    }
+
+    if !vocabulary.sites.is_empty() {
+        let _ = writeln!(out, "\n── PÁGINAS POR SU NOMBRE ────────────");
+        for category in categories_of(vocabulary.sites.iter(), |s| s.category) {
+            let names: Vec<&str> = vocabulary
+                .sites
+                .iter()
+                .filter(|s| s.category == category)
+                .map(|s| s.name)
+                .collect();
+            let _ = writeln!(out, "\n  {category}\n    «{wake}, abre …»  {}", names.join(" · "));
+        }
     }
 
     let _ = writeln!(
@@ -1235,7 +1104,7 @@ pub fn catalogue() -> String {
 
 /// Total number of distinct phrases understood, for the startup banner.
 pub fn phrase_count() -> usize {
-    let from_commands: usize = COMMANDS.iter().map(|c| c.phrases.len()).sum();
+    let from_commands: usize = vocabulary().commands.iter().map(|c| c.phrases.len()).sum();
     let from_apps: usize = all_apps()
         .map(|a| a.aliases.len() * (APP_VERBS.len() + 1))
         .sum();
@@ -1414,7 +1283,8 @@ mod tests {
             ("selecciona todo", "seleccionar todo"),
         ];
         for (canonical, spoken) in cases {
-            let expected = COMMANDS
+            let expected = vocabulary()
+                .commands
                 .iter()
                 .find(|c| c.phrases.contains(canonical))
                 .unwrap_or_else(|| panic!("«{canonical}» is not in the table"));
@@ -1615,7 +1485,7 @@ mod tests {
 
     #[test]
     fn every_contextual_command_recognises_itself() {
-        for command in CONTEXTUAL_COMMANDS {
+        for command in &vocabulary().contextual {
             for phrase in command.phrases {
                 let spoken = format!("minion {phrase}");
                 let bundle = command.bundles[0];
@@ -1860,19 +1730,28 @@ mod tests {
 
     #[test]
     fn an_alias_target_is_resolved_before_it_is_trusted() {
-        let own = [Command {
-            phrases: &["haz lo mio"],
-            name: "lo mío",
-            action: Action::Key(key::A, Mods::CMD),
-        }];
-        assert_eq!(resolve_target("guardar", &own), Target::Global);
-        assert_eq!(resolve_target("lo mío", &own), Target::User);
-        assert_eq!(resolve_target("interrumpir", &own), Target::Contextual);
+        // A command of the user\'s own is merged into the vocabulary like
+        // any other, so it resolves the same way a built-in one does.
+        let config: Config = toml::from_str(
+            r#"
+            [[commands]]
+            name = "lo mío"
+            phrases = ["haz lo mío"]
+            keys = "cmd-a"
+            "#,
+        )
+        .expect("config should parse");
+        let mut own = Vocabulary::built_in();
+        own.merge_config(&config);
+
+        assert_eq!(resolve_target(&own, "guardar"), Target::Global);
+        assert_eq!(resolve_target(&own, "lo mío"), Target::Global);
+        assert_eq!(resolve_target(&own, "interrumpir"), Target::Contextual);
         // The whole point: a name that resolves to nothing is found now,
         // not in silence at the microphone.
-        assert_eq!(resolve_target("atras", &own), Target::Unknown);
-        assert_eq!(resolve_target("atrás", &own), Target::Global);
-        assert_eq!(resolve_target("lo mio", &own), Target::Unknown);
+        assert_eq!(resolve_target(&own, "atras"), Target::Unknown);
+        assert_eq!(resolve_target(&own, "atrás"), Target::Global);
+        assert_eq!(resolve_target(&own, "lo mio"), Target::Unknown);
     }
 
     #[test]
@@ -1880,7 +1759,7 @@ mod tests {
         // Sharing a phrase between commands makes the winner depend on table
         // order, which is a latent bug rather than a choice.
         let mut seen = std::collections::HashMap::new();
-        for command in COMMANDS {
+        for command in &vocabulary().commands {
             for phrase in command.phrases {
                 if let Some(other) = seen.insert(*phrase, command.name) {
                     panic!("«{phrase}» belongs to both «{other}» and «{}»", command.name);
@@ -1892,8 +1771,8 @@ mod tests {
     #[test]
     fn every_command_recognises_itself() {
         // Each declared phrase must reach its own command. Catches entries
-        // shadowed by a similar one elsewhere in the table.
-        for command in COMMANDS {
+        // shadowed by a similar one elsewhere in the vocabulary.
+        for command in &vocabulary().commands {
             for phrase in command.phrases {
                 let spoken = format!("minion {phrase}");
                 match decide(&spoken).0 {
@@ -1901,6 +1780,23 @@ mod tests {
                     other => panic!("«{spoken}» should be «{}», got {other:?}", command.name),
                 }
             }
+        }
+    }
+
+    #[test]
+    fn the_catalogue_is_grouped_by_where_the_vocabulary_came_from() {
+        // The point of the categories: the list is long enough that an
+        // undivided one is unreadable.
+        let catalogue = catalogue();
+        for category in ["macOS", "Navegadores", "Ofimática", "Música", "Desarrollo", "Webs"] {
+            assert!(catalogue.contains(category), "«{category}» should have a heading");
+        }
+        // And it is still generated, not written by hand.
+        for app in all_apps() {
+            assert!(catalogue.contains(app.name), "{} should be listed", app.name);
+        }
+        for command in &vocabulary().commands {
+            assert!(catalogue.contains(command.name), "{} should be listed", command.name);
         }
     }
 
