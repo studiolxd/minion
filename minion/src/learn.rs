@@ -91,30 +91,171 @@ pub fn apply(lesson: &Lesson) -> Result<usize, String> {
     if lesson.teachable.is_empty() {
         return Ok(0);
     }
+    let mut addition = String::from("\n# Aprendido del registro con `minion learn`.\n");
+    for candidate in &lesson.teachable {
+        addition.push_str(&alias_entry(&without_wake_word(&candidate.phrase), &candidate.command));
+    }
+    append(&addition).map(|()| lesson.teachable.len())
+}
+
+/// Teaches one phrase, as `minion learn` would teach a whole log's worth.
+///
+/// The wake word is stripped, since that is not part of what an alias
+/// matches, and the phrase reaches the file through the config writer's
+/// quoting — a phrase learned by ear is whatever the recogniser wrote,
+/// quotation marks and backslashes included.
+pub fn teach(phrase: &str, command: &str) -> Result<(), String> {
+    append(&format!(
+        "\n# Aprendido al preguntar en voz alta.\n{}",
+        alias_entry(&without_wake_word(phrase), command)
+    ))
+}
+
+/// Teaches one more way the recogniser writes an application's name.
+///
+/// An application is not reached through `[[aliases]]` — those point at
+/// commands — so what is written is the whole `[[apps]]` entry, its
+/// existing aliases and the new one. That entry then replaces the built-in
+/// one by name, which is the price of this route: later versions of Minion
+/// can add aliases to the shipped table without them being seen here.
+fn teach_app(app: &str, spoken: &str) -> Result<(), String> {
+    let known = commands::vocabulary()
+        .apps
+        .iter()
+        .find(|a| a.name == app)
+        .ok_or_else(|| format!("No hay ninguna aplicación llamada «{app}»."))?;
+    let spoken = crate::text::normalise(spoken);
+    if spoken.is_empty() || known.aliases.contains(&spoken.as_str()) {
+        return Ok(());
+    }
+    let mut aliases: Vec<&str> = known.aliases.to_vec();
+    aliases.push(&spoken);
+    append(&format!(
+        "\n# Aprendido al preguntar en voz alta.\n{}",
+        app_entry(known.name, known.bundle_id, &aliases)
+    ))
+}
+
+/// One `[[apps]]` entry, quoted so that whatever was heard parses.
+fn app_entry(name: &str, bundle_id: &str, aliases: &[&str]) -> String {
+    let aliases: Vec<String> = aliases.iter().map(|a| config::toml_string(a)).collect();
+    format!(
+        "\n[[apps]]\nname = {}\nbundle_id = {}\naliases = [{}]\n",
+        config::toml_string(name),
+        config::toml_string(bundle_id),
+        aliases.join(", ")
+    )
+}
+
+/// One `[[aliases]]` entry, quoted so that whatever was said parses.
+fn alias_entry(phrase: &str, command: &str) -> String {
+    format!(
+        "\n[[aliases]]\ncommand = {}\nphrase = {}\n",
+        config::toml_string(command),
+        config::toml_string(phrase)
+    )
+}
+
+/// Appends to `config.toml`, but only if the result still parses.
+///
+/// The file is the one thing Minion cannot start without — a stray
+/// character in it and every setting reverts — so what would be written is
+/// read back as a `Config` first, and a file that would not survive the
+/// round trip is left exactly as it was.
+fn append(addition: &str) -> Result<(), String> {
+    // Tests must never reach the real configuration, neither to read it
+    // nor to write it: `appended` is the whole of what they need, and it
+    // is pure.
+    if cfg!(test) {
+        return Ok(());
+    }
     let path = config::path().ok_or("No se encuentra el archivo de configuración.")?;
+    let contents = appended(&fs::read_to_string(&path).unwrap_or_default(), addition)?;
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-
-    let mut addition = String::from("\n# Aprendido del registro con `minion learn`.\n");
-    for candidate in &lesson.teachable {
-        let phrase = without_wake_word(&candidate.phrase);
-        // Quoted by the config writer, not by hand: a phrase learned from
-        // the log is whatever the recogniser wrote, quotation marks and
-        // backslashes included, and one of those in a hand-written
-        // `"{...}"` leaves a file that no longer parses.
-        let _ = write!(
-            addition,
-            "\n[[aliases]]\ncommand = {}\nphrase = {}\n",
-            config::toml_string(&candidate.command),
-            config::toml_string(&phrase)
-        );
-    }
-
-    let existing = fs::read_to_string(&path).unwrap_or_default();
-    fs::write(&path, existing + &addition)
-        .map(|()| lesson.teachable.len())
+    fs::write(&path, contents)
         .map_err(|e| format!("No se pudo escribir {}: {e}", path.display()))
+}
+
+/// The configuration with the addition on the end, if it still parses.
+fn appended(existing: &str, addition: &str) -> Result<String, String> {
+    let candidate = existing.to_string() + addition;
+    toml::from_str::<config::Config>(&candidate)
+        .map(|_| candidate)
+        .map_err(|e| format!("Lo aprendido dejaría la configuración sin poder leerse: {e}"))
+}
+
+/// How close a guess has to be before Minion asks about it out loud.
+///
+/// Lower than [`SUGGEST_ABOVE`]: a question costs nothing but a moment and
+/// is answered by the person who knows, while an alias written into the
+/// configuration from a report nobody read has to be right on its own.
+pub const ASK_ABOVE: f32 = 0.5;
+
+/// What a phrase was probably meant to be: what to do about it, how to say
+/// so, and what to remember if the guess turns out to be right.
+#[derive(Clone, Debug)]
+pub struct Suggestion {
+    pub decision: commands::Decision,
+    /// As the log and the question both word it: "abrir Safari".
+    pub description: String,
+    pub score: f32,
+    lesson: Remember,
+}
+
+/// What accepting a suggestion would write down.
+#[derive(Clone, Debug)]
+enum Remember {
+    /// Another way of saying a command in the table.
+    Phrase { command: String, phrase: String },
+    /// Another way the recogniser writes an application's name.
+    AppName { app: String, spoken: String },
+}
+
+/// What a phrase that was not understood most likely meant.
+///
+/// Both halves of the vocabulary are asked — the commands and the
+/// applications — and the better answer wins. `None` means nothing came
+/// close enough to be worth putting to anyone.
+pub fn suggest(phrase: &str) -> Option<Suggestion> {
+    let command = commands::closest_command(phrase).map(|(name, score)| Suggestion {
+        decision: commands::Decision::Run(name),
+        description: name.to_string(),
+        score,
+        lesson: Remember::Phrase {
+            command: name.to_string(),
+            phrase: phrase.to_string(),
+        },
+    });
+    let app = commands::closest_app(phrase).map(|guess| Suggestion {
+        description: match guess.decision {
+            commands::Decision::Quit { .. } => format!("cerrar {}", guess.app),
+            _ => format!("abrir {}", guess.app),
+        },
+        decision: guess.decision,
+        score: guess.score,
+        lesson: Remember::AppName {
+            app: guess.app.to_string(),
+            spoken: guess.spoken,
+        },
+    });
+
+    [command, app]
+        .into_iter()
+        .flatten()
+        .filter(|suggestion| suggestion.score >= ASK_ABOVE)
+        .max_by(|a, b| a.score.total_cmp(&b.score))
+}
+
+impl Suggestion {
+    /// Remembers the guess, now that it has been confirmed out loud.
+    pub fn learn(&self) -> Result<(), String> {
+        match &self.lesson {
+            Remember::Phrase { command, phrase } => teach(phrase, command),
+            Remember::AppName { app, spoken } => teach_app(app, spoken),
+        }
+    }
 }
 
 /// Reads the phrases the log recorded as not understood.
@@ -257,6 +398,39 @@ mod tests {
         let known = [without_wake_word("Minion. Deshacer.")];
         assert!(known.contains(&without_wake_word("Minion deshacer")));
         assert!(!known.contains(&without_wake_word("Minion rehacer")));
+    }
+
+    #[test]
+    fn what_is_learned_is_quoted_before_it_is_written() {
+        // Whatever the recogniser wrote, quotation marks included: the
+        // entry has to survive being read back.
+        let entry = alias_entry(r#"di "hola" \ adios"#, "guardar");
+        let written = appended("speak = true\n", &entry).expect("should still parse");
+        let config: config::Config = toml::from_str(&written).expect("should parse");
+        assert_eq!(config.aliases.len(), 1);
+        assert_eq!(config.aliases[0].phrase, r#"di "hola" \ adios"#);
+        assert_eq!(config.aliases[0].command, "guardar");
+    }
+
+    #[test]
+    fn learning_a_name_writes_the_whole_application_back() {
+        // An application is not reached through `[[aliases]]`, so what is
+        // written is the entry itself: the aliases it had, and the new one.
+        let entry = app_entry("Safari", "com.apple.Safari", &["safari", "fari"]);
+        let written = appended("", &entry).expect("should still parse");
+        let config: config::Config = toml::from_str(&written).expect("should parse");
+        let app = &config.extra_apps()[0];
+        assert_eq!(app.name, "Safari");
+        assert_eq!(app.bundle_id, "com.apple.Safari");
+        assert_eq!(app.aliases, ["safari", "fari"]);
+    }
+
+    #[test]
+    fn a_configuration_that_would_stop_parsing_is_not_written() {
+        // The one file Minion cannot start without. Anything that would
+        // leave it unreadable is refused, and the file stays as it was.
+        let broken = appended("speak = true\n", "\n[[aliases]]\ncommand = \"guardar\"\n");
+        assert!(broken.is_err(), "an alias with no phrase must not be written");
     }
 
     #[test]

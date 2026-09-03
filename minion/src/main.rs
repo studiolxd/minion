@@ -53,7 +53,7 @@ use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::TrayIconBuilder;
 
 use commands::Decision;
-use session::{Outcome, Session, Undoable};
+use session::{Outcome, Reply, Session, Undoable};
 
 /// What the tooltip says when there is nothing more particular to report.
 const TOOLTIP_IDLE: &str = "Minion — control por voz";
@@ -508,6 +508,9 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
     // utterance to the next. That memory, and the rules that go with it,
     // are in `session`; what follows only carries them out.
     let mut session = Session::new();
+    // Whether a phrase that was nearly understood is worth a question.
+    // Read here rather than passed in: it is only ever wanted by the loop.
+    session.asks_before_learning(config::load().ask_before_learning);
     // Built fresh each time dictation starts, so its state (the pending
     // capital, an open quote) never spans two dictation sessions, and a
     // vocabulary edited while Minion was running takes effect right away.
@@ -538,6 +541,13 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
     note!("Listening. Say: «{wake}, abre Chrome»");
 
     loop {
+        // A question waits six seconds for its answer, and silence is one
+        // of the answers it can get. Checked here as well as on the next
+        // utterance, so the log says so when it happens rather than
+        // whenever somebody next speaks.
+        if let Some(phrase) = session.question_timed_out(Instant::now()) {
+            note!("declined «{phrase}»  ->  no answer");
+        }
         // A bounded wait, so idleness can be noticed while nothing is being
         // said. A plain recv() would block until the next utterance, and
         // the model would stay loaded through an empty afternoon.
@@ -749,6 +759,65 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
             // have changed which application that is.
             let context = actions::frontmost_app();
             let now = Instant::now();
+            if let Some(phrase) = session.question_timed_out(now) {
+                note!("declined «{phrase}»  ->  no answer");
+            }
+            // A question that is still open takes precedence over
+            // everything else, the conversation window included: what was
+            // just said is an answer to it, or it is not an answer at all
+            // and the question is dropped rather than left hanging.
+            match session.answer_question(&part, now) {
+                Some(Reply::Yes { phrase, suggestion }) => {
+                    // Through `interpret` like anything else, so that what
+                    // was learned can be repeated with "otra vez" and taken
+                    // back with "deshaz".
+                    let outcome =
+                        session.interpret(&phrase, suggestion.decision.clone(), context.as_deref());
+                    let (decision, repeats) = match outcome {
+                        Outcome::Perform { decision, repeats } => (decision, repeats),
+                        _ => (suggestion.decision.clone(), 1),
+                    };
+                    let ran = report(
+                        &phrase,
+                        &decision,
+                        suggestion.score,
+                        repeats,
+                        &Reporting {
+                            seconds,
+                            elapsed_ms,
+                            log_ignored_speech: log_ignored_speech.load(Ordering::Relaxed),
+                            play_sounds: play_sounds.load(Ordering::Relaxed),
+                            acted: &acted,
+                            status: &status,
+                        },
+                    );
+                    match ran {
+                        // Refused by macOS: nothing happened, so there is
+                        // nothing to undo.
+                        Ran::Blocked => session.forget_undo(),
+                        Ran::Yes if !hold_mode => {
+                            session.open_window(now, conversation_window);
+                            window_open.store(session.window_open(now), Ordering::Relaxed);
+                        }
+                        _ => {}
+                    }
+                    match suggestion.learn() {
+                        Ok(()) => note!("taught   «{phrase}»  ->  {}", suggestion.description),
+                        Err(reason) => note!("error    could not learn «{phrase}»: {reason}"),
+                    }
+                    continue;
+                }
+                Some(Reply::No { phrase, answered }) => {
+                    note!("declined «{phrase}»");
+                    // A "no" was the answer and is spent. Anything else was
+                    // somebody carrying on talking, and still has to be
+                    // listened to on its own terms.
+                    if answered {
+                        continue;
+                    }
+                }
+                None => {}
+            }
             // Push-to-talk: every utterance heard was, by definition, said
             // while the shortcut was held, so none of it needs the wake
             // word — there is no window to time out or to log about.
@@ -942,6 +1011,38 @@ fn listen_and_obey(setup: Listening) -> Result<()> {
                         }
                         Ran::Yes => {}
                         Ran::Nothing => {}
+                    }
+
+                    // Not understood, but nearly something. Ask, once,
+                    // and only if there is a voice to ask with: a question
+                    // that arrives as a silent banner has nobody waiting
+                    // for the answer, so it is left as a notice.
+                    if decision == Decision::Unrecognised {
+                        if let Some(question) = session.ask_about(&part) {
+                            note!("asking   «{part}»  ->  {}?", question.description);
+                            match &voice_reply {
+                                Some(settings) => {
+                                    speaking.store(true, Ordering::Relaxed);
+                                    speech::say(
+                                        &question.text,
+                                        settings.voice.as_deref(),
+                                        settings.rate,
+                                        settings.device.as_deref(),
+                                        &deaf,
+                                        speech_tail,
+                                    );
+                                    speaking.store(false, Ordering::Relaxed);
+                                    // Its own voice came back in while it
+                                    // was talking; none of that is an answer.
+                                    while listener.utterances.try_recv().is_ok() {}
+                                    // Timed from here, not from before it
+                                    // spoke: the six seconds are the ones
+                                    // the person has to answer in.
+                                    session.open_question(&part, question, Instant::now());
+                                }
+                                None => notify::post("Minion", &question.text),
+                            }
+                        }
                     }
 
                     if commands::is_sleep(&decision) {

@@ -58,6 +58,13 @@
 # Stays quiet for commands either way. On by default.
 # speak = true
 
+# Ask out loud about a phrase that was nearly understood ("¿Querías decir
+# «abrir Safari»?") and remember the answer, so the same mishearing works
+# next time. Answered with «sí» or «no» within six seconds, no wake word
+# needed. On by default; false says nothing and only writes the failure to
+# the log, for `minion learn` to pick up later.
+# ask_before_learning = true
+
 # Post a Notification Center banner for answers (when speak = false),
 # finished timers and blocked commands. On by default.
 # notifications = true

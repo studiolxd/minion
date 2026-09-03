@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use crate::answers;
 use crate::commands::{self, Decision, EditIntent};
+use crate::learn;
 
 /// Something Minion did that it knows how to take back.
 ///
@@ -73,6 +74,67 @@ pub struct Session {
     window_opened_at: Option<Instant>,
     /// When it closes. `None` means it is not open.
     window_deadline: Option<Instant>,
+    /// A guess put to the user out loud, waiting for a yes or a no.
+    pending: Option<Pending>,
+    /// Whether to ask at all. Off is what Minion did before there was
+    /// anything to ask: say nothing and write the failure down.
+    asks: bool,
+}
+
+/// How long a question waits for its answer.
+///
+/// Long enough to think about, short enough that a "sí" meant for someone
+/// else in the room has usually stopped being plausible by then.
+const QUESTION_SECONDS: Duration = Duration::from_secs(6);
+
+/// A question Minion asked and has not had an answer to yet.
+#[derive(Debug)]
+struct Pending {
+    /// What was not understood, as it will be written down.
+    phrase: String,
+    suggestion: learn::Suggestion,
+    deadline: Instant,
+}
+
+/// A question to put to the user, and what saying yes would mean.
+#[derive(Debug)]
+pub struct Question {
+    /// The wording, for the synthesiser or a notification.
+    pub text: String,
+    /// What it is a guess at: "abrir Safari".
+    pub description: String,
+    suggestion: learn::Suggestion,
+}
+
+/// What an utterance did to a question that was waiting.
+#[derive(Debug)]
+pub enum Reply {
+    /// Yes: do it, and remember it.
+    Yes { phrase: String, suggestion: learn::Suggestion },
+    /// No, or something that was not an answer at all. `answered` tells
+    /// the two apart, because only the first has used up the utterance —
+    /// anything else still has to be listened to on its own terms.
+    No { phrase: String, answered: bool },
+}
+
+/// Whether a phrase is a yes, a no, or neither.
+///
+/// Short and whole: an answer to a yes-or-no question is one or two words.
+/// A long sentence containing "vale" is somebody talking, and a phrase
+/// with a "no" anywhere in it is a no whatever else it has in it — "eso
+/// no" must not be read as the "eso" it also contains.
+fn answer_in(phrase: &str) -> Option<bool> {
+    const YES: &[&str] = &["si", "vale", "eso", "exacto", "correcto", "claro", "ese"];
+    const NO: &[&str] = &["no", "nada", "dejalo", "olvidalo", "ninguno"];
+    let normalised = crate::text::normalise(phrase);
+    let words: Vec<&str> = normalised.split_whitespace().collect();
+    if words.is_empty() || words.len() > 3 {
+        return None;
+    }
+    if words.iter().any(|word| NO.contains(word)) {
+        return Some(false);
+    }
+    words.iter().any(|word| YES.contains(word)).then_some(true)
 }
 
 /// What to run a decision through, once the conversation window has had a
@@ -238,6 +300,78 @@ impl Session {
         commands::decide_in(&prefixed, context)
     }
 
+    /// Whether to ask about a phrase that was not understood.
+    ///
+    /// Read from `ask_before_learning`, and set by the caller rather than
+    /// defaulted here: a `Session` that has not been told stays silent,
+    /// which is what Minion did before it could ask anything.
+    pub fn asks_before_learning(&mut self, on: bool) {
+        self.asks = on;
+    }
+
+    /// The question worth asking about a phrase that was not understood,
+    /// if there is one.
+    ///
+    /// Pure: asking it out loud, and opening the window for the answer,
+    /// are the caller's to do — and it only does the second if it managed
+    /// the first, since a question nobody heard must not swallow the next
+    /// thing said.
+    pub fn ask_about(&self, phrase: &str) -> Option<Question> {
+        if !self.asks || self.dictating {
+            return None;
+        }
+        let suggestion = learn::suggest(phrase)?;
+        Some(Question {
+            text: format!("¿Querías decir «{}»?", suggestion.description),
+            description: suggestion.description.clone(),
+            suggestion,
+        })
+    }
+
+    /// Starts waiting for the answer to a question that has been asked.
+    pub fn open_question(&mut self, phrase: &str, question: Question, now: Instant) {
+        // A question takes precedence over the conversation window: the
+        // next thing said is an answer, not a command without a wake word.
+        self.close_window();
+        self.pending = Some(Pending {
+            phrase: phrase.to_string(),
+            suggestion: question.suggestion,
+            deadline: now + QUESTION_SECONDS,
+        });
+    }
+
+    /// Whether a question is still waiting for its answer.
+    pub fn question_open(&self, now: Instant) -> bool {
+        self.pending.as_ref().is_some_and(|pending| now < pending.deadline)
+    }
+
+    /// Gives up on a question nobody answered, naming the phrase it was
+    /// about so the caller can write it down. Called on every utterance
+    /// and while waiting for one, so a silence times out on its own.
+    pub fn question_timed_out(&mut self, now: Instant) -> Option<String> {
+        if self.pending.as_ref().is_some_and(|pending| now >= pending.deadline) {
+            return self.pending.take().map(|pending| pending.phrase);
+        }
+        None
+    }
+
+    /// Reads an utterance as the answer to the question that is waiting.
+    ///
+    /// `None` when there is no question to answer, which is the usual
+    /// case: the utterance is then an ordinary one. Answered or not, the
+    /// question is over — Minion asks once and does not insist.
+    pub fn answer_question(&mut self, part: &str, now: Instant) -> Option<Reply> {
+        if self.dictating || !self.question_open(now) {
+            return None;
+        }
+        let pending = self.pending.take()?;
+        Some(match answer_in(part) {
+            Some(true) => Reply::Yes { phrase: pending.phrase, suggestion: pending.suggestion },
+            Some(false) => Reply::No { phrase: pending.phrase, answered: true },
+            None => Reply::No { phrase: pending.phrase, answered: false },
+        })
+    }
+
     /// Discards whatever "deshaz lo que has hecho" would currently undo.
     ///
     /// `interpret` records a command as undoable the moment it is decided,
@@ -287,6 +421,139 @@ mod tests {
                 session.interpret(&part, decision, None)
             })
             .collect()
+    }
+
+    /// A session that asks about what it did not understand.
+    fn asking() -> Session {
+        let mut session = Session::new();
+        session.asks_before_learning(true);
+        session
+    }
+
+    /// A phrase the recogniser really might produce for "abre Safari",
+    /// close enough to guess at and too far to act on.
+    const NEARLY: &str = "minion abreza fari";
+
+    #[test]
+    fn a_phrase_that_nearly_named_something_is_asked_about() {
+        // Nothing acted on it, which is the whole reason to ask.
+        assert_eq!(decide(NEARLY), Decision::Unrecognised);
+        let question = asking().ask_about(NEARLY).expect("worth asking about");
+        assert_eq!(question.description, "abrir Safari");
+        assert_eq!(question.text, "¿Querías decir «abrir Safari»?");
+    }
+
+    #[test]
+    fn a_weak_guess_is_not_worth_asking_about() {
+        // Nothing in the vocabulary is within reach of these, so a
+        // question would only be noise.
+        for phrase in ["minion de sad", "minion abrecron", "minion escribe"] {
+            assert!(asking().ask_about(phrase).is_none(), "«{phrase}» is not worth a question");
+        }
+        // And with the setting off, nothing is ever asked.
+        assert!(Session::new().ask_about(NEARLY).is_none());
+    }
+
+    #[test]
+    fn nothing_is_asked_while_dictating() {
+        let mut session = asking();
+        say(&mut session, "minion empieza a dictar");
+        assert!(session.ask_about(NEARLY).is_none(), "everything heard is text right now");
+    }
+
+    #[test]
+    fn saying_yes_runs_the_guess_and_remembers_it() {
+        let mut session = asking();
+        let now = Instant::now();
+        let question = session.ask_about(NEARLY).expect("worth asking about");
+        session.open_question(NEARLY, question, now);
+
+        let reply = session
+            .answer_question("sí", now + Duration::from_secs(2))
+            .expect("an answer was expected");
+        match reply {
+            Reply::Yes { phrase, suggestion } => {
+                assert_eq!(phrase, NEARLY);
+                assert_eq!(suggestion.description, "abrir Safari");
+                assert!(matches!(
+                    suggestion.decision,
+                    Decision::Launch { name: "Safari", .. }
+                ));
+            }
+            other => panic!("expected a yes, got {other:?}"),
+        }
+        // Asked once: the question is over either way.
+        assert!(!session.question_open(now));
+    }
+
+    #[test]
+    fn saying_no_declines_and_teaches_nothing() {
+        let mut session = asking();
+        let now = Instant::now();
+        let question = session.ask_about(NEARLY).expect("worth asking about");
+        session.open_question(NEARLY, question, now);
+
+        assert!(matches!(
+            session.answer_question("no", now),
+            Some(Reply::No { answered: true, .. })
+        ));
+        assert!(!session.question_open(now));
+        // "eso no" is a no, even though "eso" on its own is a yes.
+        let question = session.ask_about(NEARLY).expect("worth asking about");
+        session.open_question(NEARLY, question, now);
+        assert!(matches!(
+            session.answer_question("eso no", now),
+            Some(Reply::No { answered: true, .. })
+        ));
+    }
+
+    #[test]
+    fn a_question_nobody_answers_times_out() {
+        let mut session = asking();
+        let now = Instant::now();
+        let question = session.ask_about(NEARLY).expect("worth asking about");
+        session.open_question(NEARLY, question, now);
+
+        let later = now + Duration::from_secs(7);
+        assert!(!session.question_open(later));
+        assert_eq!(session.question_timed_out(later).as_deref(), Some(NEARLY));
+        // Said once, and only once: there is nothing left to time out.
+        assert_eq!(session.question_timed_out(later), None);
+        // An answer that arrives too late is not an answer.
+        assert!(session.answer_question("sí", later).is_none());
+    }
+
+    #[test]
+    fn something_that_is_not_an_answer_is_declined_and_still_obeyed() {
+        let mut session = asking();
+        let now = Instant::now();
+        let question = session.ask_about(NEARLY).expect("worth asking about");
+        session.open_question(NEARLY, question, now);
+
+        // Somebody carried on talking. The question is dropped, and what
+        // was said is still an instruction.
+        assert!(matches!(
+            session.answer_question("minion abre Chrome", now),
+            Some(Reply::No { answered: false, .. })
+        ));
+        assert!(!session.question_open(now));
+        assert!(matches!(
+            say(&mut session, "minion abre Chrome").as_slice(),
+            [Outcome::Perform { .. }]
+        ));
+    }
+
+    #[test]
+    fn a_question_takes_precedence_over_the_conversation_window() {
+        let mut session = asking();
+        let now = Instant::now();
+        session.open_window(now, Duration::from_secs(5));
+        let question = session.ask_about(NEARLY).expect("worth asking about");
+        session.open_question(NEARLY, question, now);
+        // Otherwise the next "sí" would be tried as a command without a
+        // wake word before it was tried as the answer it is.
+        assert!(!session.window_open(now));
+        assert!(session.question_open(now));
     }
 
     #[test]
