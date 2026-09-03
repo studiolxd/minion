@@ -803,22 +803,42 @@ fn run_together(word: &str, alias: &str) -> bool {
     is_word(head) && is_word(tail)
 }
 
+/// Whether a spoken word is one recogniser slip away from the alias.
+///
+/// Word against word, never against the sentence: that is what keeps
+/// "gmail" from being "mail" and "mallorca" from being "orca", which is
+/// how the old substring search read them. Bounded on both sides — a
+/// single edit, the same first two letters, and only for names long
+/// enough that one edit cannot turn them into a different word.
+fn near_alias(word: &str, alias: &str) -> bool {
+    const MIN_LENGTH: usize = 5;
+    if alias.contains(' ') || alias.chars().count() < MIN_LENGTH {
+        return false;
+    }
+    let same_start = word.chars().take(2).eq(alias.chars().take(2));
+    same_start && crate::text::edits_between(word, alias) <= 1
+}
+
 /// Finds an application named in the sentence, with its match score.
 ///
-/// Only whole words count. Fuzziness lives in the alias lists instead:
-/// what the recogniser really writes ("shafari", "cromo") is listed, which
-/// is explicit and cannot reach a word that merely contains a name.
+/// Whole words only, in three grades: named outright, run together with
+/// another word, or one slip away from the name. Bigger mangles stay in
+/// the alias lists — what the recogniser really writes ("shafari",
+/// "cromo") is listed, which is explicit and cannot spread.
 fn find_app(rest: &str) -> Option<(&'static App, f32)> {
     let words: Vec<&str> = rest.split_whitespace().collect();
     let mut best: Option<(&App, f32)> = None;
     for app in all_apps() {
         for alias in app.aliases {
-            // A plain mention beats a run-together one; longer aliases beat
-            // shorter ones, so "vs code" wins over a stray "code".
+            // A plain mention beats a run-together one, which beats a
+            // misheard one; longer aliases beat shorter ones, so "vs code"
+            // wins over a stray "code".
             let score = if names_alias(&words, alias) {
                 0.9 + (alias.len() as f32 / 100.0).min(0.09)
             } else if words.iter().any(|word| run_together(word, alias)) {
                 0.9
+            } else if words.iter().any(|word| near_alias(word, alias)) {
+                0.8
             } else {
                 0.0
             };
@@ -1492,12 +1512,30 @@ mod tests {
     }
 
     #[test]
+    fn one_slip_in_the_name_still_finds_the_app() {
+        // What the log is full of: the name almost right. A whole word
+        // one edit away is the limit, and it scores below a name said
+        // properly, so a real mention always wins.
+        launches("minion abre safary", "Safari");
+        launches("minion abre cromm", "Chrome");
+        launches("minion abre spotifi", "Spotify");
+        // Two edits is a different word, and so is a different opening.
+        assert_eq!(decision("minion abre sarasa"), Decision::Unrecognised);
+    }
+
+    #[test]
     fn an_app_name_inside_a_word_is_not_that_app() {
         // All three used to launch an application: "mail" is inside
         // "gmail", "orca" inside "mallorca", "editor" inside "editorial".
         browses("minion abre gmail", "https://mail.google.com");
         browses("minion ve a gmail punto com", "https://gmail.com");
         browses("minion ve a mallorca punto com", "https://mallorca.com");
+        // Neither can the misheard-name route bring them back: "gmail" is
+        // an insertion away from "mail" but starts elsewhere, and
+        // "mallorca" is four edits from "orca".
+        assert!(!near_alias("gmail", "mail"));
+        assert!(!near_alias("mallorca", "orca"));
+        assert!(!near_alias("editorial", "editor"));
         assert_eq!(decision("minion abre el editorial"), Decision::Unrecognised);
     }
 
