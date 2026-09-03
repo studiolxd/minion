@@ -120,7 +120,14 @@ fn failed_phrases() -> Vec<(String, usize)> {
     let Ok(contents) = fs::read_to_string(&path) else {
         return Vec::new();
     };
+    failed_phrases_in(&contents)
+}
 
+/// The same, over the text of a log: the parsing, with no file behind it.
+///
+/// The format is written in `main.rs` — `unknown  «…»` — and read here, so
+/// it is worth a test that does not depend on this machine's log.
+fn failed_phrases_in(contents: &str) -> Vec<(String, usize)> {
     let mut counts: HashMap<String, usize> = HashMap::new();
     for line in contents.lines() {
         let Some(rest) = line.split("unknown  ").nth(1) else {
@@ -182,15 +189,15 @@ fn candidates(config: &config::Config) -> Vec<Candidate> {
 }
 
 /// Strips the wake word so the stored alias is just the command phrasing.
+///
+/// The real stripper, not a copy of it: it also rejoins a wake word the
+/// recogniser split in two, and a copy that did not left aliases with a
+/// stray "on" at the front of every "mini on …" phrase.
 fn without_wake_word(phrase: &str) -> String {
     let normalised = crate::text::normalise(phrase);
-    let mut words = normalised.split_whitespace();
-    match words.next() {
-        Some(first) if commands::is_wake_word(first) => {
-            words.collect::<Vec<_>>().join(" ")
-        }
-        _ => normalised,
-    }
+    commands::strip_wake_word(&normalised)
+        .unwrap_or(&normalised)
+        .to_string()
 }
 
 /// Prints the report, and optionally writes the accepted aliases.
@@ -208,5 +215,39 @@ pub fn run(config: &config::Config, apply_now: bool) {
         Ok(0) => println!("Nothing close enough to add."),
         Ok(n) => println!("\nAdded {n} alias(es). Restart Minion for them to take effect."),
         Err(e) => eprintln!("\n{e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_the_failures_out_of_a_log() {
+        let log = "\
+12:00:01  ran      «Minion Chrome.»  ->  abrir Chrome  [100% · 1.6s audio · 142 ms]
+12:00:04  unknown  «Minion haz un pino.»  ->  not understood
+12:00:09  unknown  «Minion haz un pino.»  ->  not understood
+12:00:12  unknown  «Minion ponme un café.»  ->  not understood
+12:00:15  heard    1.5s of speech, not addressed to me
+12:00:18  unknown  «»  ->  not understood
+";
+        assert_eq!(
+            failed_phrases_in(log),
+            vec![
+                ("Minion haz un pino.".to_string(), 2),
+                ("Minion ponme un café.".to_string(), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_alias_keeps_no_half_of_the_wake_word() {
+        // "Mini on" is the wake word split in two; both halves must go,
+        // or the alias learned from it can never match.
+        assert_eq!(without_wake_word("Mini on guarda esto"), "guarda esto");
+        assert_eq!(without_wake_word("Minion, guarda esto."), "guarda esto");
+        // Nothing to strip: the phrase is kept whole.
+        assert_eq!(without_wake_word("guarda esto"), "guarda esto");
     }
 }

@@ -569,7 +569,7 @@ fn sounds_like_wake_word(word: &str) -> bool {
 /// Handles the wake word arriving as two words. The recogniser splits
 /// "Minion" into "Mini on" often enough to matter, and the stray half then
 /// sits at the front of the command and stops it matching anything.
-fn strip_wake_word(phrase: &str) -> Option<&str> {
+pub fn strip_wake_word(phrase: &str) -> Option<&str> {
     let mut words = phrase.split_whitespace();
     let first = words.next()?;
     let rest = phrase[first.len()..].trim();
@@ -1130,11 +1130,6 @@ pub fn closest_command(phrase: &str) -> Option<(&'static str, f32)> {
         }
     }
     best
-}
-
-/// Whether a word is one of the wake words in force.
-pub fn is_wake_word(word: &str) -> bool {
-    sounds_like_wake_word(word)
 }
 
 /// The whole vocabulary, written out for someone to read.
