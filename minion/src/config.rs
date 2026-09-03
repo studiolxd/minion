@@ -222,6 +222,15 @@ pub struct Config {
     /// a timer or a "¿qué suena?" would otherwise have nowhere to land.
     #[serde(default = "yes")]
     pub notifications: bool,
+
+    /// Keep the "what did it hear" HUD panel on screen all the time,
+    /// instead of only around an utterance — see `hud.rs`.
+    ///
+    /// Off by default: the panel already appears on its own whenever
+    /// there is something to show, and pinning it is for someone who
+    /// wants a permanent caption of what Minion is hearing.
+    #[serde(default)]
+    pub show_hud: bool,
 }
 
 /// How Minion decides when to listen.
@@ -336,6 +345,7 @@ impl Default for Config {
             ask_before_learning: true,
             disambiguation_margin: None,
             notifications: true,
+            show_hud: false,
         }
     }
 }
@@ -1012,6 +1022,14 @@ mod tests {
         assert!(default.notifications);
         let quiet: Config = toml::from_str("notifications = false").expect("should parse");
         assert!(!quiet.notifications);
+    }
+
+    #[test]
+    fn the_hud_is_off_by_default_and_can_be_pinned() {
+        let default: Config = toml::from_str("").expect("empty config should parse");
+        assert!(!default.show_hud);
+        let pinned: Config = toml::from_str("show_hud = true").expect("should parse");
+        assert!(pinned.show_hud);
     }
 
     #[test]

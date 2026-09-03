@@ -69,6 +69,11 @@
 # finished timers and blocked commands. On by default.
 # notifications = true
 
+# Keep the "what did it hear" HUD panel on screen all the time, instead of
+# only around an utterance or while dictating. Off by default; also
+# toggled by voice — "muestra lo que oyes" / "esconde lo que oyes".
+# show_hud = false
+
 # Which system voice to use. Empty picks a Spanish one automatically.
 # voice = "Mónica"
 

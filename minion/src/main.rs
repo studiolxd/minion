@@ -18,6 +18,7 @@ mod dictation;
 mod enroll;
 mod fbank;
 mod hotkey;
+mod hud;
 mod icon;
 mod journal;
 mod learn;
@@ -1522,6 +1523,10 @@ fn run_menu_bar(
     // not stack another one behind it.
     let panel = Rc::new(preferences::Preferences::new(mtm));
 
+    // The "what did it hear" HUD — see hud.rs. Starts pinned exactly as
+    // the settings window already read `show_hud` at construction.
+    let hud = Rc::new(hud::Hud::new(mtm, panel.show_hud_on()));
+
     // On a fresh install there is nothing to discover from a menu bar icon
     // and a wake word nobody has been told about, so the window opens once
     // by itself. The marker goes in the configuration file, which is also
@@ -1619,6 +1624,7 @@ fn run_menu_bar(
     let acted_for_timer = Arc::clone(&acted);
     let blink_until: Cell<Option<std::time::Instant>> = Cell::new(None);
     let panel_for_timer = Rc::clone(&panel);
+    let hud_for_timer = Rc::clone(&hud);
     let open_for_timer = Arc::clone(&open_requested);
     let learn_for_timer = Arc::clone(&learn_requested);
     let training_for_timer = Arc::clone(&training);
@@ -1730,6 +1736,29 @@ fn run_menu_bar(
         if !watched && !on_schedule(throttle_tick, UI_THROTTLE_TICKS) {
             return;
         }
+
+        // The HUD's own visibility (a four-second countdown since the last
+        // thing worth showing) needs checking every throttled tick, not
+        // only when the menu bar's own face changes — see hud.rs.
+        let hud_now = std::time::Instant::now();
+        hud_for_timer.set_pinned(panel_for_timer.show_hud_on());
+        hud_for_timer.set_dictating(dictating_for_timer.load(Ordering::Relaxed));
+        let hud_awake =
+            active_for_timer.load(Ordering::Relaxed) && !downloading_for_timer.load(Ordering::Relaxed);
+        hud_for_timer.set_face(if !hud_awake {
+            hud::Face::Asleep
+        } else if speaking_for_timer.load(Ordering::Relaxed) {
+            hud::Face::Speaking
+        } else if thinking_for_timer.load(Ordering::Relaxed) {
+            hud::Face::Thinking
+        } else if dictating_for_timer.load(Ordering::Relaxed) {
+            hud::Face::Dictating
+        } else if window_open_for_timer.load(Ordering::Relaxed) {
+            hud::Face::Acting
+        } else {
+            hud::Face::Awake
+        });
+        hud_for_timer.tick(hud_now);
 
         if open_for_timer.swap(false, Ordering::Relaxed) {
             panel_for_timer.show();
@@ -1950,6 +1979,7 @@ fn run_menu_bar(
                 // addressed to it at all, so it is not an order to keep.
                 if let Some((text, outcome)) = parse_last_utterance(&wanted) {
                     if outcome != "no era para mí" {
+                        hud_for_timer.note_heard(hud_now, &text, &outcome);
                         let mut queue = history.borrow_mut();
                         if queue.len() == HISTORY_LEN {
                             queue.pop_back();

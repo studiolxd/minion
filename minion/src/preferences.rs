@@ -525,6 +525,7 @@ pub struct Preferences {
     spoken_punctuation: Switch,
     auto_capitalise: Switch,
     notifications: Switch,
+    show_hud: Switch,
     search_engine: Popup,
     shortcut: Retained<NSButton>,
     /// The shortcut as stored, e.g. "alt-space".
@@ -850,6 +851,14 @@ impl Preferences {
             "Notificaciones del sistema para respuestas y temporizadores",
             settings.notifications,
         );
+        let show_hud = layout.checkbox("Mostrar siempre lo que oye", settings.show_hud);
+        layout.hint(
+            "Un panel junto a la esquina superior derecha con la cara y la \
+             última frase. Sin esto, solo aparece unos segundos tras oír \
+             algo — también se dice: «muestra lo que oyes» / «esconde lo \
+             que oyes».",
+            INDENT,
+        );
 
         layout.heading("Búsqueda");
         layout.field_label("Motor para «busca X» sin nombrar uno");
@@ -977,6 +986,7 @@ impl Preferences {
             spoken_punctuation,
             auto_capitalise,
             notifications,
+            show_hud,
             search_engine,
             shortcut,
             shortcut_value: std::cell::RefCell::new(current_shortcut),
@@ -1172,6 +1182,11 @@ impl Preferences {
         // Read fresh for every answer, timer and blocked command — live.
         if let Some(on) = self.notifications.toggled() {
             save("notifications", if on { "true" } else { "false" });
+            changed = true;
+        }
+        // Read fresh every tick by the HUD itself — no restart needed.
+        if let Some(on) = self.show_hud.toggled() {
+            save("show_hud", if on { "true" } else { "false" });
             changed = true;
         }
         // Read once at startup into a `OnceLock` (`commands::configure`).
@@ -1395,6 +1410,10 @@ impl Preferences {
 
     pub fn log_voices_on(&self) -> bool {
         self.log_voices.on()
+    }
+
+    pub fn show_hud_on(&self) -> bool {
+        self.show_hud.on()
     }
 }
 
