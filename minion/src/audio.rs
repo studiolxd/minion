@@ -911,14 +911,19 @@ pub fn start(
                 let utterance = segmenter.push_unless_deaf(block, speaking_now);
                 // Announced while it is still being spoken, not when it
                 // ends: whoever is waiting has work it can start now.
-                if segmenter.speaking {
+                // Only once Silero has approved it (or there is no Silero):
+                // energy alone opens an utterance for a cough or a system
+                // sound too, and that woke the model and the HUD for
+                // nothing during the 200 ms Silero takes to veto it.
+                let confirmed = segmenter.speaking && segmenter.approved;
+                if confirmed {
                     segment_started.store(true, Ordering::Relaxed);
                 }
                 // Continuous, unlike `segment_started` above: true exactly
-                // while an utterance is open, so the HUD can tell "still
-                // talking" apart from "closed, now transcribing" without
-                // its own copy of the segmenter's state.
-                segment_open.store(segmenter.speaking, Ordering::Relaxed);
+                // while a confirmed utterance is open, so the HUD can tell
+                // "still talking" apart from "closed, now transcribing"
+                // without its own copy of the segmenter's state.
+                segment_open.store(confirmed, Ordering::Relaxed);
                 if let Some(utterance) = utterance {
                     if send.send(utterance).is_err() {
                         return; // nobody is listening any more
